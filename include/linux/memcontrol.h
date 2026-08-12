@@ -66,11 +66,6 @@ struct mem_cgroup_reclaim_cookie {
 
 #define MEM_CGROUP_ID_SHIFT	16
 
-struct mem_cgroup_private_id {
-	int id;
-	refcount_t ref;
-};
-
 struct memcg_vmstats_percpu;
 struct memcg1_events_percpu;
 struct memcg_vmstats;
@@ -173,6 +168,7 @@ struct obj_cgroup {
 	struct percpu_ref refcnt;
 	struct mem_cgroup *memcg;
 	atomic_t nr_charged_bytes;
+	refcount_t private_id_refcnt;
 	union {
 		struct list_head list; /* protected by objcg_lock */
 		struct rcu_head rcu;
@@ -189,8 +185,8 @@ struct obj_cgroup {
 struct mem_cgroup {
 	struct cgroup_subsys_state css;
 
-	/* Private memcg ID. Used to ID objects that outlive the cgroup */
-	struct mem_cgroup_private_id id;
+	/* The objcg holding private memcg ID. */
+	struct obj_cgroup *private_id_objcg;
 
 	/* Accounted resources */
 	struct page_counter memory;		/* Both v1 & v2 */
@@ -254,6 +250,9 @@ struct mem_cgroup {
 	seqlock_t		socket_pressure_seqlock;
 #endif
 	int kmemcg_id;
+
+	/* Private memcg ID. Used to ID objects that outlive the cgroup */
+	unsigned short private_id;
 
 #ifdef CONFIG_CGROUP_WRITEBACK
 	struct list_head cgwb_list;
@@ -811,8 +810,9 @@ static inline unsigned short mem_cgroup_private_id(struct mem_cgroup *memcg)
 	if (mem_cgroup_disabled())
 		return 0;
 
-	return memcg->id.id;
+	return memcg->private_id;
 }
+struct obj_cgroup *obj_cgroup_from_private_id(unsigned short id);
 struct mem_cgroup *mem_cgroup_from_private_id(unsigned short id);
 
 static inline u64 mem_cgroup_id(struct mem_cgroup *memcg)
@@ -1291,6 +1291,12 @@ static inline void mem_cgroup_scan_tasks(struct mem_cgroup *memcg,
 static inline unsigned short mem_cgroup_private_id(struct mem_cgroup *memcg)
 {
 	return 0;
+}
+
+static inline struct obj_cgroup *obj_cgroup_from_private_id(unsigned short id)
+{
+	WARN_ON_ONCE(id);
+	return NULL;
 }
 
 static inline struct mem_cgroup *mem_cgroup_from_private_id(unsigned short id)
