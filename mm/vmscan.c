@@ -1936,13 +1936,55 @@ static bool too_many_isolated(struct pglist_data *pgdat, int file,
 }
 
 /*
+ * Even though we have called folio_set_active() for rejected folios
+ * in evict_folios(), they may still be demoted or placed in the last
+ * populated generation since we can now scan all generations.
+ * Make sure these folios are neither demoted nor placed in the last
+ * populated generation, unless it is also the youngest generation
+ */
+#ifdef CONFIG_LRU_GEN
+static inline bool lru_gen_add_rejected_folio(struct lruvec *lruvec, struct folio *folio,
+		unsigned long scanned_seq)
+{
+	unsigned long seq;
+	unsigned long flags;
+	int gen;
+	int type = folio_is_file_lru(folio);
+	int zone = folio_zonenum(folio);
+	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+	unsigned long max_seq = READ_ONCE((lruvec)->lrugen.max_seq);
+
+	if (folio_test_unevictable(folio) || !lrugen->enabled)
+		return false;
+
+	seq = lru_gen_folio_seq(lruvec, folio, false);
+	seq = max(seq, min(scanned_seq + 1, max_seq));
+	gen = lru_gen_from_seq(seq);
+	flags = (gen + 1UL) << LRU_GEN_PGOFF;
+	/* see the comment on MIN_NR_GENS about PG_active */
+	set_mask_bits(folio_flags(folio, 0), LRU_GEN_MASK | BIT(PG_active), flags);
+
+	lru_gen_update_size(lruvec, folio, -1, gen);
+	list_add(&folio->lru, &lrugen->folios[gen][type][zone]);
+
+	return true;
+}
+#else
+static inline bool lru_gen_add_rejected_folio(struct lruvec *lruvec, struct folio *folio,
+		unsigned long scanned_seq)
+{
+	return false;
+}
+#endif
+
+/*
  * move_folios_to_lru() moves folios from private @list to appropriate LRU list.
  *
  * Returns the number of pages moved to the appropriate lruvec.
  *
  * Note: The caller must not hold any lruvec lock.
  */
-static unsigned int move_folios_to_lru(struct list_head *list)
+static unsigned int move_folios_to_lru(struct list_head *list, unsigned long seq)
 {
 	int nr_pages, nr_moved = 0;
 	struct lruvec *lruvec = NULL;
@@ -1988,8 +2030,8 @@ static unsigned int move_folios_to_lru(struct list_head *list)
 
 			continue;
 		}
-
-		lruvec_add_folio(lruvec, folio);
+		if (!seq || !lru_gen_add_rejected_folio(lruvec, folio, seq))
+			lruvec_add_folio(lruvec, folio);
 		nr_pages = folio_nr_pages(folio);
 		nr_moved += nr_pages;
 		if (folio_test_active(folio))
@@ -2106,7 +2148,7 @@ static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false,
 					 lruvec_memcg(lruvec));
 
-	move_folios_to_lru(&folio_list);
+	move_folios_to_lru(&folio_list, 0);
 
 	mod_lruvec_state(lruvec, PGDEMOTE_KSWAPD + reclaimer_offset(sc),
 					stat.nr_demoted);
@@ -2217,8 +2259,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
 	/*
 	 * Move folios back to the lru list.
 	 */
-	nr_activate = move_folios_to_lru(&l_active);
-	nr_deactivate = move_folios_to_lru(&l_inactive);
+	nr_activate = move_folios_to_lru(&l_active, 0);
+	nr_deactivate = move_folios_to_lru(&l_inactive, 0);
 
 	count_vm_events(PGDEACTIVATE, nr_deactivate);
 	count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
@@ -4866,7 +4908,8 @@ static bool isolate_folio(struct lruvec *lruvec, struct folio *folio, struct sca
 
 static int scan_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 		       struct scan_control *sc, int type, int tier,
-		       struct list_head *list, int *isolatedp)
+		       struct list_head *list, int *isolatedp,
+		       unsigned long *scanned_seq)
 {
 	enum node_stat_item item;
 	int zone_idx;
@@ -4897,6 +4940,7 @@ static int scan_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 		seq = lrugen->max_seq;
 
 	seq = lruvec_populated_min_seq(lruvec, type, sc->reclaim_idx + 1, seq);
+	*scanned_seq = seq;
 	gen = lru_gen_from_seq(seq);
 	max_gen = lru_gen_from_seq(max_seq);
 
@@ -5095,6 +5139,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 	int tier, scanned, reclaimed;
 	int isolated = 0, nr_isolated = 0;
 	unsigned long total_reclaimed = 0;
+	unsigned long scanned_seq;
 	bool skip_retry = false;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
@@ -5106,7 +5151,7 @@ static int evict_folios(unsigned long nr_to_scan, struct lruvec *lruvec,
 
 	tier = get_tier_idx(lruvec, type);
 	scanned = scan_folios(nr_to_scan, lruvec, sc,
-			      type, tier, &list, &isolated);
+			      type, tier, &list, &isolated, &scanned_seq);
 	nr_isolated = isolated;
 
 	/* Scanning may have emptied the oldest gen, flush it */
@@ -5129,8 +5174,6 @@ retry:
 			type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
 
 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
-		DEFINE_MIN_SEQ(lruvec);
-
 		/* move_folios_to_lru() culls unevictable folios via folio_putback_lru() */
 		if (!folio_evictable(folio))
 			continue;
@@ -5145,12 +5188,12 @@ retry:
 		/* See the comments on LRU_REFS_FLAGS */
 		folio_set_lru_refs(folio, 0);
 
-		/* don't add rejected folios to the oldest generation */
-		if (lru_gen_folio_seq(lruvec, folio, false) == min_seq[type])
+		 /* try to avoid placing rejected folios in the last populated generation */
+		if (lru_gen_folio_seq(lruvec, folio, false) <= scanned_seq)
 			folio_set_active(folio);
 	}
 
-	move_folios_to_lru(&list);
+	move_folios_to_lru(&list, scanned_seq);
 
 	walk = current->reclaim_state->mm_walk;
 	if (walk && walk->batched) {
