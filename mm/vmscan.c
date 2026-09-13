@@ -5020,6 +5020,17 @@ static int get_tier_idx(struct lruvec *lruvec, int type)
 	return tier - 1;
 }
 
+static inline bool lru_gen_trim_cache(struct lruvec *lruvec)
+{
+	unsigned long inactive_file = lruvec_page_state(lruvec, NR_INACTIVE_FILE);
+	unsigned long active_file = lruvec_page_state(lruvec, NR_ACTIVE_FILE);
+	unsigned long file = inactive_file + active_file;
+	unsigned long anon = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
+			     lruvec_page_state(lruvec, NR_ACTIVE_ANON);
+
+	return inactive_file > active_file && file > MAX_NR_GENS * anon;
+}
+
 /*
  * Balance the anon vs file scan budget using MGLRU's per-type refault
  * rates, where swappiness is the relative IO cost of anon vs file (see
@@ -5106,7 +5117,9 @@ static void lru_gen_balance_scan(struct lruvec *lruvec, struct scan_control *sc,
 		anon_factor = 0;
 	else
 		anon_factor = (u64)swappiness * refault_rate[LRU_GEN_FILE] * anon_weight;
-	if (swappiness == MAX_SWAPPINESS && sc->priority < DEF_PRIORITY / 2)
+
+	if (swappiness == MAX_SWAPPINESS &&
+	    sc->priority < (DEF_PRIORITY / 2 + lru_gen_trim_cache(lruvec)))
 		file_factor = refault_rate[LRU_GEN_ANON] * file_weight;
 	else
 		file_factor = (u64)(MAX_SWAPPINESS - swappiness) *
