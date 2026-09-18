@@ -4108,14 +4108,20 @@ static void __mem_cgroup_private_id_put(struct obj_cgroup *objcg,
 	}
 }
 
+/**
+ * mem_cgroup_private_id_put - put memcg private id reference
+ * @id: memory cgroup id
+ * @n: number of references to put
+ *
+ * Caller must hold rcu_read_lock().
+ */
 static inline void mem_cgroup_private_id_put(unsigned short id, unsigned int n)
 {
 	struct obj_cgroup *objcg;
+	lockdep_assert_in_rcu_read_lock();
 
-	rcu_read_lock();
 	objcg = obj_cgroup_from_private_id(id);
 	__mem_cgroup_private_id_put(objcg, id, n);
-	rcu_read_unlock();
 }
 
 static void mem_cgroup_private_id_kill(struct mem_cgroup *memcg)
