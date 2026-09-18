@@ -281,9 +281,6 @@ static bool lru_gen_test_recent(void *shadow, struct lruvec **lruvec,
 	unpack_shadow(shadow, &memcg_id, &pgdat, token, workingset);
 
 	memcg = mem_cgroup_from_private_id(memcg_id);
-	if (!memcg)
-		return false;
-
 	*lruvec = mem_cgroup_lruvec(memcg, pgdat);
 
 	max_seq = READ_ONCE((*lruvec)->lrugen.max_seq);
