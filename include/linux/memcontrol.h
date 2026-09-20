@@ -325,7 +325,7 @@ struct mem_cgroup {
 #endif
 
 	/* Private memcg ID. Used to ID objects that outlive the cgroup */
-	int private_id;
+	unsigned short private_id;
 
 	int kmemcg_id;
 
