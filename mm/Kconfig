@@ -1423,6 +1423,12 @@ config LRU_GEN_STATS
 config LRU_GEN_WALKS_MMU
 	def_bool y
 	depends on LRU_GEN && ARCH_HAS_HW_PTE_YOUNG
+
+config LRU_GEN_ASYNC_AGE
+	bool "Run async aging when appropriate"
+	depends on LRU_GEN
+	default y
+
 # }
 
 config LOCK_MM_AND_FIND_VMA

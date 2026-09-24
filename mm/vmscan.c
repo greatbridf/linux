@@ -5371,6 +5371,53 @@ static long evict_folio_lists(unsigned long nr_to_scan[], struct lruvec *lruvec,
 	return total_scanned;
 }
 
+#ifdef CONFIG_LRU_GEN_ASYNC_AGE
+
+struct workqueue_struct *age_wq __ro_after_init;
+
+static void run_aging_async(struct work_struct *work)
+{
+	struct lruvec *lruvec = container_of(work, struct lruvec, age_work);
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	int swappiness = mem_cgroup_swappiness(memcg);
+	bool need_rotate = false;
+	DEFINE_MAX_SEQ(lruvec);
+
+	if (try_to_inc_max_seq(lruvec, max_seq, swappiness, false))
+		need_rotate = true;
+
+	/* pair with css_get() in start_aging_async() */
+	mem_cgroup_put(memcg);
+}
+
+static void start_aging_async(struct lruvec *lruvec)
+{
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+
+	/* pair with mem_cgroup_put() in run_aging_async() */
+	css_get(&memcg->css);
+	queue_work(age_wq, &lruvec->age_work);
+}
+
+static int lru_gen_lruvec_init_async_age(struct lruvec *lruvec)
+{
+	INIT_WORK(&lruvec->age_work, run_aging_async);
+
+	return 0;
+}
+
+static int init_lru_gen_async_age(void)
+{
+	age_wq = alloc_workqueue("lrugen_age", WQ_UNBOUND, 0);
+
+	if (!age_wq)
+		return -ENOMEM;
+
+	return 0;
+}
+
+#endif
+
 /*
  * For future optimizations:
  * 1. Defer try_to_inc_max_seq() to workqueues to reduce latency for memcg
@@ -6249,6 +6296,10 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
 
 	if (mm_state)
 		mm_state->seq = MIN_NR_GENS;
+
+#ifdef CONFIG_LRU_GEN_ASYNC_AGE
+	lru_gen_lruvec_init_async_age(lruvec);
+#endif
 }
 
 #ifdef CONFIG_MEMCG
@@ -6295,8 +6346,14 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
 
 static int __init init_lru_gen(void)
 {
+	int ret;
+
 	BUILD_BUG_ON(MIN_NR_GENS + 1 >= MAX_NR_GENS);
 	BUILD_BUG_ON(BIT(LRU_GEN_WIDTH) <= MAX_NR_GENS);
+
+	ret = init_lru_gen_async_age();
+	if (ret)
+		return ret;
 
 	if (sysfs_create_group(mm_kobj, &lru_gen_attr_group))
 		pr_err("lru_gen: failed to create sysfs group\n");
