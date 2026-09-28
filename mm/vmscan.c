@@ -5254,6 +5254,12 @@ static inline unsigned long lruvec_gen_size(struct lru_gen_folio *lrugen,
 	return size;
 }
 
+enum {
+	AGE_SKIP,
+	AGE_ASYNC,
+	AGE_NOW,
+};
+
 static bool lru_gen_imbalanced(struct lruvec *lruvec, struct scan_control *sc,
 			       int swappiness)
 {
@@ -5277,26 +5283,29 @@ static bool lru_gen_imbalanced(struct lruvec *lruvec, struct scan_control *sc,
 	return youngest > old * MAX_NR_GENS;
 }
 
-static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
-			     struct scan_control *sc, int swappiness,
-			     bool do_balance)
+static int should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
+			    struct scan_control *sc, int swappiness,
+			    bool do_balance)
 {
 	DEFINE_MIN_SEQ(lruvec);
 
 	/* have to run aging, since eviction is not possible anymore */
 	if (evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS > max_seq)
-		return true;
+		return AGE_NOW;
 
 	/* try to avoid aging, do gentle reclaim at the default priority */
 	if (sc->priority == DEF_PRIORITY)
-		return false;
+		return AGE_SKIP;
 
 	/* better to run aging even though eviction is still possible */
 	if (evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq)
-		return true;
+		return AGE_ASYNC;
 
 	/* run aging when folios outside the youngest gen are rare */
-	return do_balance && lru_gen_imbalanced(lruvec, sc, swappiness);
+	if (do_balance && lru_gen_imbalanced(lruvec, sc, swappiness))
+		return AGE_ASYNC;
+
+	return AGE_SKIP;
 }
 
 static void lru_gen_prepare_scan(struct lruvec *lruvec, struct scan_control *sc,
@@ -5373,30 +5382,50 @@ static long evict_folio_lists(unsigned long nr_to_scan[], struct lruvec *lruvec,
 
 #ifdef CONFIG_LRU_GEN_ASYNC_AGE
 
-struct workqueue_struct *age_wq __ro_after_init;
+static struct workqueue_struct *age_wq __ro_after_init;
 
 static void run_aging_async(struct work_struct *work)
 {
 	struct lruvec *lruvec = container_of(work, struct lruvec, age_work);
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	struct reclaim_state rs = {};
+	int flags;
 	int swappiness = mem_cgroup_swappiness(memcg);
 	bool need_rotate = false;
 	DEFINE_MAX_SEQ(lruvec);
 
+	lru_add_drain();
+
+	set_task_reclaim_state(current, &rs);
+	flags = memalloc_noreclaim_save();
+	set_mm_walk(NULL, true);
+
 	if (try_to_inc_max_seq(lruvec, max_seq, swappiness, false))
 		need_rotate = true;
+
+	if (need_rotate)
+		lru_gen_rotate_memcg(lruvec, MEMCG_LRU_YOUNG);
+
+	clear_mm_walk();
+	memalloc_noreclaim_restore(flags);
+	set_task_reclaim_state(current, NULL);
 
 	/* pair with css_get() in start_aging_async() */
 	mem_cgroup_put(memcg);
 }
 
-static void start_aging_async(struct lruvec *lruvec)
+static bool start_aging_async(struct lruvec *lruvec)
 {
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 
 	/* pair with mem_cgroup_put() in run_aging_async() */
-	css_get(&memcg->css);
-	queue_work(age_wq, &lruvec->age_work);
+	if (!mem_cgroup_tryget(memcg))
+		return false;
+
+	if (!queue_work(age_wq, &lruvec->age_work))
+		mem_cgroup_put(memcg);
+
+	return true;
 }
 
 static int lru_gen_lruvec_init_async_age(struct lruvec *lruvec)
@@ -5408,7 +5437,7 @@ static int lru_gen_lruvec_init_async_age(struct lruvec *lruvec)
 
 static int init_lru_gen_async_age(void)
 {
-	age_wq = alloc_workqueue("lrugen_age", WQ_UNBOUND, 0);
+	age_wq = alloc_workqueue("lru_gen_age", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 
 	if (!age_wq)
 		return -ENOMEM;
@@ -5416,7 +5445,24 @@ static int init_lru_gen_async_age(void)
 	return 0;
 }
 
-#endif
+#else /* CONFIG_LRU_GEN_ASYNC_AGE */
+
+static inline bool start_aging_async(struct lruvec *lruvec)
+{
+	return false;
+}
+
+static inline int lru_gen_lruvec_init_async_age(struct lruvec *lruvec)
+{
+	return 0;
+}
+
+static inline int init_lru_gen_async_age(void)
+{
+	return 0;
+}
+
+#endif /* CONFIG_LRU_GEN_ASYNC_AGE */
 
 /*
  * For future optimizations:
@@ -5426,8 +5472,9 @@ static int init_lru_gen_async_age(void)
 static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
 	unsigned long nr[ANON_AND_FILE];
-	bool need_rotate = false, should_age = false;
+	bool need_rotate = false;
 	int swappiness = get_swappiness(lruvec, sc);
+	int should_age = AGE_SKIP;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	bool do_balance = (sc->priority <= DEF_PRIORITY / 2);
 
@@ -5454,10 +5501,22 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 			break;
 		}
 
-		if (should_run_aging(lruvec, max_seq, sc, swappiness, do_balance)) {
+		should_age = should_run_aging(lruvec, max_seq, sc, swappiness,
+					      do_balance);
+
+		switch (should_age) {
+		case AGE_ASYNC:
+			if (start_aging_async(lruvec))
+				break;
+			should_age = AGE_NOW;
+			fallthrough;
+		case AGE_NOW:
 			if (try_to_inc_max_seq(lruvec, max_seq, swappiness, false))
 				need_rotate = true;
-			should_age = true;
+			break;
+		case AGE_SKIP:
+		default:
+			break;
 		}
 		do_balance = false;
 
@@ -5471,7 +5530,7 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		 * Root reclaim needs rotation when low on cold folio for better
 		 * fairness. Cgroup reclaim gets fairness from the iterator.
 		 */
-		if (root_reclaim(sc) && should_age)
+		if (root_reclaim(sc) && should_age == AGE_NOW)
 			break;
 
 		cond_resched();
