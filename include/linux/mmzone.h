@@ -784,7 +784,12 @@ struct lruvec {
 #ifdef CONFIG_LRU_GEN
 	/* evictable pages divided into generations */
 	struct lru_gen_folio		lrugen;
+#ifdef CONFIG_LRU_GEN_ASYNC_AGE
+	/* a pending asynchronous aging request */
 	struct work_struct		age_work;
+	/* the swappiness of the reclaim that queued the aging */
+	int				age_swappiness;
+#endif
 #ifdef CONFIG_LRU_GEN_WALKS_MMU
 	/* to concurrently iterate lru_gen_mm_list */
 	struct lru_gen_mm_state		mm_state;
