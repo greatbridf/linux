@@ -1428,6 +1428,13 @@ config LRU_GEN_ASYNC_AGE
 	bool "Run async aging when appropriate"
 	depends on LRU_GEN
 	default y
+	help
+	  Run mglru aging from a workqueue when reclaim asks for aging
+	  only to keep the generations balanced, instead of walking page
+	  tables in the reclaiming context. Aging that reclaim needs to
+	  make progress still runs synchronously.
+
+	  Say N to always run aging synchronously.
 
 # }
 
