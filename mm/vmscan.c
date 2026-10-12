@@ -5447,7 +5447,7 @@ static int init_lru_gen_async_age(void)
 	return 0;
 }
 
-#else /* CONFIG_LRU_GEN_ASYNC_AGE */
+#else /* !CONFIG_LRU_GEN_ASYNC_AGE */
 
 static inline bool start_aging_async(struct lruvec *lruvec)
 {
