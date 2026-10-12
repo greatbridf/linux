@@ -5410,6 +5410,8 @@ static void run_aging_async(struct work_struct *work)
 	memalloc_noreclaim_restore(flags);
 	set_task_reclaim_state(current, NULL);
 
+	pr_info("lruvec=%p max_seq=%lu async aged", lruvec, max_seq);
+
 	/* pair with css_get() in start_aging_async() */
 	mem_cgroup_put(memcg);
 }
@@ -5503,6 +5505,9 @@ static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 
 		should_age = should_run_aging(lruvec, max_seq, sc, swappiness,
 					      do_balance);
+
+		trace_mm_should_run_aging(lruvec, max_seq, swappiness,
+					  do_balance, should_age);
 
 		switch (should_age) {
 		case AGE_ASYNC:

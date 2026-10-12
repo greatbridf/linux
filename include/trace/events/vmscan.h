@@ -392,6 +392,47 @@ TRACE_EVENT(mm_vmscan_lru_isolate,
 		__print_symbolic(__entry->lru, LRU_NAMES))
 );
 
+#define should_run_aging_ops		\
+	{0, "SKIP"},	\
+	{1, "ASYNC"},	\
+	{2, "NOW"}
+
+TRACE_EVENT(mm_should_run_aging,
+
+	TP_PROTO(
+		struct lruvec *lruvec,
+		unsigned long max_seq,
+		int swappiness,
+		bool do_balance,
+		int retval
+	),
+
+	TP_ARGS(lruvec, max_seq, swappiness, do_balance, retval),
+
+	TP_STRUCT__entry(
+		__field(struct lruvec *, lruvec)
+		__field(unsigned long, max_seq)
+		__field(int, swappiness)
+		__field(bool, do_balance)
+		__field(int, retval)
+	),
+
+	TP_fast_assign(
+		__entry->lruvec = lruvec;
+		__entry->max_seq = max_seq;
+		__entry->swappiness = swappiness;
+		__entry->do_balance = do_balance;
+		__entry->retval = retval;
+	),
+
+	TP_printk("lruvec=%p retval=%5s max_seq=%lu swappiness=%d do_balance=%d",
+		__entry->lruvec,
+		__print_symbolic(__entry->retval, should_run_aging_ops),
+		__entry->max_seq,
+		__entry->swappiness,
+		__entry->do_balance)
+);
+
 TRACE_EVENT(mm_vmscan_write_folio,
 
 	TP_PROTO(struct folio *folio),
