@@ -6361,9 +6361,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
 	if (mm_state)
 		mm_state->seq = MIN_NR_GENS;
 
-#ifdef CONFIG_LRU_GEN_ASYNC_AGE
 	lru_gen_lruvec_init_async_age(lruvec);
-#endif
 }
 
 #ifdef CONFIG_MEMCG
