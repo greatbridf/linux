@@ -131,6 +131,27 @@ config XSWAP
 	  array is backed by a sparse vmalloc area that grows and shrinks
 	  on demand, avoiding static pre-allocation overhead.
 
+config RSWAP
+	bool "Remote Swap (rswap) - HTTP KV store backend"
+	depends on XSWAP && NET
+	select CRYPTO
+	select CRYPTO_HASH
+	select CRYPTO_SHA256
+	help
+	  Adds support for remote swap (rswap) devices.  rswap implements the
+	  swap_ops interface to store swap pages in an external HTTP key-value
+	  store.  On swap-out the kernel sends an HTTP POST with the page data;
+	  on swap-in it sends an HTTP GET.
+
+	  The KV store server runs at 127.0.0.1:6789 and stores each page as
+	  a file named by the SHA-256 hash of the swap entry.
+
+	  To use:
+	    1. Build and start the KV server (tools/mm/kvswap_server.c)
+	    2. echo rswap > /sys/kernel/mm/xswap/create
+
+	  If unsure, say N.
+
 config ZSMALLOC
 	tristate
 

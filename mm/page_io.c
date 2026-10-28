@@ -235,6 +235,13 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
 	 */
 	swap_zeromap_folio_clear(folio);
 
+	/*
+	 * rswap: forward to the swap_ops backend (HTTP KV store).
+	 * Do not try zswap; the remote store is the only backing.
+	 */
+	if (unlikely(__swap_entry_to_info(folio->swap)->flags & SWP_RSWAP))
+		goto writeout;
+
 	if (zswap_store(folio)) {
 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
 		goto out_unlock;
@@ -249,13 +256,15 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
 	rcu_read_unlock();
 
 	/*
-	 * xswap has no backing store: keep the folio.  ctx->sis is not set
-	 * yet, so look the device up from the entry.
+	 * xswap (non-rswap) has no backing store: keep the folio.
+	 * ctx->sis is not set yet, so look the device up from the entry.
 	 */
 	if (unlikely(__swap_entry_to_info(folio->swap)->flags & SWP_XSWAP)) {
 		folio_mark_dirty(folio);
 		return AOP_WRITEPAGE_ACTIVATE;
 	}
+
+writeout:
 
 	__swap_writeout(ctx, folio);
 	return 0;
@@ -497,12 +506,17 @@ void swap_read_folio(struct swap_io_ctx *ctx, struct folio *folio)
 
 	if (unlikely(sis->flags & SWP_XSWAP)) {
 		/*
-		 * An xswap entry only ever lives in zswap, so zswap_load()
-		 * must have found it.  Unlock and let the caller retry.
+		 * Plain xswap (no rswap): entries live only in zswap, so
+		 * zswap_load() must have found it.  Unlock and let the caller
+		 * retry.
+		 *
+		 * For rswap the swap_ops path below handles the I/O.
 		 */
-		WARN_ON_ONCE(1);
-		folio_unlock(folio);
-		goto finish;
+		if (!(sis->flags & SWP_RSWAP)) {
+			WARN_ON_ONCE(1);
+			folio_unlock(folio);
+			goto finish;
+		}
 	}
 
 	/* We have to read from slower devices. Increase zswap protection. */
@@ -687,8 +701,15 @@ const struct swap_ops swap_bdev_ops = {
 void swap_fs_prepare_rw(struct swap_io_ctx *ctx, int rw, struct iov_iter *iter)
 {
 	struct swap_iocb *sio = ctx->sio;
+	struct file *swap_file = ctx->sis->swap_file;
 
-	init_sync_kiocb(&sio->iocb, ctx->sis->swap_file);
+	/*
+	 * Zero the kiocb first so the compiler does not speculate
+	 * loads from @swap_file (which can be NULL for virtual swap
+	 * devices such as xswap/rswap).
+	 */
+	memset(&sio->iocb, 0, sizeof(sio->iocb));
+	sio->iocb.ki_filp = swap_file;
 	sio->iocb.ki_pos = swap_dev_pos(bvec_folio(&sio->bvecs[0])->swap);
 	if (rw == WRITE)
 		sio->iocb.ki_complete = swap_fs_write_complete;
