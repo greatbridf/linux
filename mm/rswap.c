@@ -80,7 +80,7 @@ static struct socket *rswap_connect(void)
 		return ERR_PTR(-EINVAL);
 	}
 
-	ret = kernel_connect(sock, (struct sockaddr *)&sin, sizeof(sin), 0);
+	ret = kernel_connect(sock, (struct sockaddr_unsized *)&sin, sizeof(sin), 0);
 	if (ret < 0) {
 		pr_err_ratelimited("kernel_connect to %s:%d failed: %d\n",
 				   RSWAP_KV_HOST, RSWAP_KV_PORT, ret);
@@ -198,18 +198,27 @@ static int rswap_http_post(struct socket *sock, const char *sha256_hex,
 static int rswap_parse_response(struct socket *sock,
 				char *data, size_t datalen, bool is_read)
 {
-	char buf[4096];
+	/*
+	 * Heap-allocate the header buffer to keep stack usage under the
+	 * 2048-byte warning threshold.  Our responses are tiny.
+	 */
+	char *buf = kmalloc(2048, GFP_KERNEL);
 	int total = 0;
 	int status = 0;
 	char *body = NULL;
 	int body_len = 0;
 	int ret;
 
-	/* Read headers (up to 4KB). */
-	while (total < (int)sizeof(buf) - 1) {
+	if (!buf)
+		return -ENOMEM;
+
+	/* Read headers (up to 2KB). */
+	while (total < 2047) {
 		ret = rswap_recv(sock, buf + total, 1);
-		if (ret <= 0)
-			return -EIO;
+		if (ret <= 0) {
+			ret = -EIO;
+			goto out;
+		}
 		total += ret;
 		buf[total] = '\0';
 
@@ -218,22 +227,28 @@ static int rswap_parse_response(struct socket *sock,
 		    memcmp(buf + total - 4, "\r\n\r\n", 4) == 0)
 			break;
 	}
-	if (total >= (int)sizeof(buf) - 1)
-		return -ENOSPC;
-
-	buf[total] = '\0';
+	if (total >= 2047) {
+		ret = -ENOSPC;
+		goto out;
+	}
 
 	/* Parse "HTTP/1.x NNN ..." */
-	if (sscanf(buf, "HTTP/%*d.%*d %d", &status) != 1)
-		return -EPROTO;
-	if (status != 200)
-		return -EIO;
+	if (sscanf(buf, "HTTP/%*d.%*d %d", &status) != 1) {
+		ret = -EPROTO;
+		goto out;
+	}
+	if (status != 200) {
+		ret = -EIO;
+		goto out;
+	}
 
 	/* For reads, the body follows the headers. */
 	if (is_read) {
 		body = strstr(buf, "\r\n\r\n");
-		if (!body)
-			return -EPROTO;
+		if (!body) {
+			ret = -EPROTO;
+			goto out;
+		}
 		body += 4;
 		body_len = total - (body - buf);
 
@@ -258,7 +273,10 @@ static int rswap_parse_response(struct socket *sock,
 		}
 	}
 
-	return 0;
+	ret = 0;
+out:
+	kfree(buf);
+	return ret;
 }
 
 /* ---------- SHA-256 helpers ---------- */
