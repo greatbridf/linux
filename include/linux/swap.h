@@ -202,6 +202,7 @@ enum {
 	SWP_SYNCHRONOUS_IO = (1 << 12),	/* synchronous IO is efficient */
 	SWP_HIBERNATION = (1 << 13),	/* pinned for hibernation */
 	SWP_XSWAP	= (1 << 14),	/* extendable swap device */
+	SWP_RSWAP	= (1 << 15),	/* remote swap via HTTP KV store */
 					/* add others here before... */
 };
 
@@ -252,6 +253,10 @@ struct swap_info_struct {
 	atomic_long_t		xswap_grows;	/* grow operations so far */
 	atomic_long_t		xswap_shrinks;	/* shrink operations so far */
 #endif
+#ifdef CONFIG_RSWAP
+	struct dentry		*rswap_dentry;	/* debugfs directory */
+#endif /* CONFIG_RSWAP */
+
 	struct list_head free_clusters; /* free clusters list */
 	struct list_head full_clusters; /* full clusters list */
 	struct list_head nonfull_clusters[SWAP_NR_ORDERS];

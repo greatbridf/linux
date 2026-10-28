@@ -51,6 +51,7 @@
 #include "internal.h"
 #include <linux/debugfs.h>
 
+#include "rswap.h"
 #include "swap.h"
 #define DEF_SWAP_PRIO  -1
 
@@ -102,27 +103,36 @@ static void xswap_unmap_clusters(struct swap_info_struct *si,
 static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data);
 static void xswap_try_shrink(struct swap_info_struct *si);
 
-static int xswap_create(int prio);
 static int xswap_destroy(int type);
+
+static int xswap_create_common(int prio, bool is_rswap);
 
 static ssize_t xswap_create_store(struct kobject *kobj,
 				  struct kobj_attribute *attr,
 				  const char *buf, size_t count)
 {
 	int prio = DEF_XSWAP_PRIO;
+	bool is_rswap = false;
+	const char *s = skip_spaces(buf);
 	int err;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
+	/* Check for rswap prefix. */
+	if (strncmp(s, "rswap", 5) == 0) {
+		is_rswap = true;
+		s = skip_spaces(s + 5);
+	}
+
 	/* "[<prio>]" is optional; a lower one is allowed, not a higher. */
-	if (*skip_spaces(buf)) {
-		err = kstrtoint(buf, 10, &prio);
+	if (*s) {
+		err = kstrtoint(s, 10, &prio);
 		if (err)
 			return err;
 	}
 
-	err = xswap_create(prio);
+	err = xswap_create_common(prio, is_rswap);
 	if (err < 0)
 		return err;
 
@@ -3475,6 +3485,7 @@ static void free_swap_cluster_info(struct swap_info_struct *si)
 		/* free_vm_area() drops the mapping without freeing the pages. */
 		xswap_unmap_clusters(si, 0, si->nr_clusters_mapped);
 		xswap_debugfs_del(si);
+		rswap_debugfs_del(si);
 		free_vm_area(si->cluster_vm);
 		si->cluster_vm = NULL;
 		si->cluster_info = NULL;
@@ -3643,6 +3654,11 @@ static int __swapoff(struct swap_info_struct *p)
 	flush_work(&p->discard_work);
 	flush_work(&p->reclaim_work);
 	flush_percpu_swap_cluster(p);
+
+#ifdef CONFIG_RSWAP
+	if (p->flags & SWP_RSWAP)
+		rswap_swapoff(p);
+#endif
 
 	destroy_swap_extents(p, p->swap_file);
 
@@ -4653,7 +4669,7 @@ err:
 
 #ifdef CONFIG_XSWAP
 /* Create a file-less xswap device, sized at twice RAM. */
-static int xswap_create(int prio)
+static int xswap_create_common(int prio, bool is_rswap)
 {
 	struct swap_info_struct *si;
 	unsigned long maxpages;
@@ -4664,7 +4680,7 @@ static int xswap_create(int prio)
 		return -EINVAL;
 
 	/* xswap has no backing store, it relies on zswap. */
-	if (!zswap_is_enabled())
+	if (!is_rswap && !zswap_is_enabled())
 		return -EOPNOTSUPP;
 
 	/* Refuse rather than clamp: xswap.max= should give what was asked. */
@@ -4696,13 +4712,16 @@ static int xswap_create(int prio)
 
 	si->bdev = NULL;
 	si->flags |= SWP_XSWAP | SWP_SOLIDSTATE;
+	if (is_rswap)
+		si->flags |= SWP_RSWAP;
 	si->max = maxpages;
 	si->pages = maxpages - 1;
 	/*
 	 * No backing file: setup_swap_extents() is only reachable from the
 	 * file-backed swapon() path, so set ops here.  Only ops->flags is
 	 * used, by may_enter_fs(); the IO methods are never called because
-	 * swap_writeout()/swap_read_folio() short circuit xswap.
+	 * swap_writeout()/swap_read_folio() short circuit xswap (for plain
+	 * xswap) or invoke rswap (for rswap).
 	 */
 	si->ops = &swap_bdev_ops;
 
@@ -4716,9 +4735,19 @@ static int xswap_create(int prio)
 
 	xswap_debugfs_add(si);
 
-	error = zswap_swapon(si->type, si->max);
-	if (error)
-		goto bad_swap;
+#ifdef CONFIG_RSWAP
+	if (is_rswap) {
+		error = rswap_enable(si);
+		if (error)
+			goto bad_swap;
+		rswap_debugfs_add(si);
+	} else
+#endif
+	{
+		error = zswap_swapon(si->type, si->max);
+		if (error)
+			goto bad_swap;
+	}
 
 	mutex_lock(&swapon_mutex);
 	si->prio = prio;
@@ -4726,7 +4755,9 @@ static int xswap_create(int prio)
 	si->avail_list.prio = -si->prio;
 	/* si->swap_file stays NULL: this is a file-less device */
 	enable_swap_info(si);
-	pr_info("xswap: adding extendable swap type %d (prio %d, %lu pages)\n",
+	pr_info("%s: adding %s type %d (prio %d, %lu pages)\n",
+		is_rswap ? "rswap" : "xswap",
+		is_rswap ? "remote" : "extendable",
 		si->type, prio, si->pages);
 	mutex_unlock(&swapon_mutex);
 	atomic_inc(&proc_poll_event);
@@ -4735,6 +4766,10 @@ static int xswap_create(int prio)
 	return si->type;
 
 bad_swap:
+#ifdef CONFIG_RSWAP
+	rswap_debugfs_del(si);
+	rswap_disable(si);
+#endif
 	kfree(si->global_cluster);
 	si->global_cluster = NULL;
 	destroy_swap_extents(si, NULL);	/* safe: xswap never sets SWP_ACTIVATED */

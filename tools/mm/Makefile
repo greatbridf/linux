@@ -4,7 +4,7 @@
 include ../scripts/Makefile.include
 
 BUILD_TARGETS=page-types slabinfo page_owner_sort page_owner_filter
-BUILD_TARGETS += thp_swap_allocator_test gup_bench
+BUILD_TARGETS += thp_swap_allocator_test gup_bench kvswap_server
 INSTALL_TARGETS = $(BUILD_TARGETS) thpmaps
 
 LIB_DIR = ../lib/api
@@ -28,7 +28,7 @@ gup_bench: $(GUP_BENCH_OBJS) $(LIBS)
 	$(CC) $(CFLAGS) -o $@ $(GUP_BENCH_OBJS) $(LDFLAGS)
 
 clean:
-	$(RM) page-types slabinfo page_owner_sort page_owner_filter thp_swap_allocator_test gup_bench
+	$(RM) page-types slabinfo page_owner_sort page_owner_filter thp_swap_allocator_test gup_bench kvswap_server
 	make -C $(LIB_DIR) clean
 
 sbindir ?= /usr/sbin
