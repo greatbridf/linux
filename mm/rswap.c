@@ -63,7 +63,7 @@ static struct socket *rswap_connect(void)
 {
 	struct socket *sock;
 	struct sockaddr_in sin;
-	int ret;
+	int ret, val;
 
 	ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
 			       &sock);
@@ -71,6 +71,15 @@ static struct socket *rswap_connect(void)
 		pr_err_ratelimited("sock_create_kern failed: %d\n", ret);
 		return ERR_PTR(ret);
 	}
+
+	/* Set 1-second send and receive timeouts so we cannot block
+	 * indefinitely in the swap-out path. */
+	val = 1 * HZ;
+	sock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO_OLD,
+			KERNEL_SOCKPTR(&val), sizeof(val));
+	val = 1 * HZ;
+	sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO_OLD,
+			KERNEL_SOCKPTR(&val), sizeof(val));
 
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(RSWAP_KV_PORT);
@@ -202,7 +211,7 @@ static int rswap_parse_response(struct socket *sock,
 	 * Heap-allocate the header buffer to keep stack usage under the
 	 * 2048-byte warning threshold.  Our responses are tiny.
 	 */
-	char *buf = kmalloc(2048, GFP_KERNEL);
+	char *buf = kmalloc(2048, GFP_NOIO);
 	int total = 0;
 	int status = 0;
 	char *body = NULL;
@@ -295,7 +304,7 @@ static void rswap_entry_to_sha256(swp_entry_t entry, char *hex)
 	struct shash_desc *desc;
 	int ret;
 
-	tfm = crypto_alloc_shash("sha256", 0, 0);
+	tfm = crypto_alloc_shash("sha256", 0, GFP_NOIO);
 	if (IS_ERR(tfm)) {
 		/*
 		 * Fallback: derive a deterministic 256-bit value from the
@@ -312,7 +321,7 @@ static void rswap_entry_to_sha256(swp_entry_t entry, char *hex)
 		goto encode;
 	}
 
-	desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+	desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_NOIO);
 	if (!desc) {
 		crypto_free_shash(tfm);
 		memset(hash, 0, SHA256_DIGEST_SIZE);
@@ -353,6 +362,7 @@ static void rswap_submit_write(struct swap_io_ctx *ctx)
 	char sha256_hex[RSWAP_SHA256_HEXLEN + 1];
 	char *data;
 	int ret;
+	unsigned int noio_flags;
 
 	if (sio->nr_bvecs == 0) {
 		sio->iocb.ki_complete(&sio->iocb, 0);
@@ -370,6 +380,13 @@ static void rswap_submit_write(struct swap_io_ctx *ctx)
 		return;
 	}
 
+	/*
+	 * Mark the current context as NOIO so that every memory
+	 * allocation (socket buffers, skbs, crypto) implicitly strips
+	 * __GFP_IO and cannot recurse into the swap/block layer.
+	 */
+	noio_flags = memalloc_noio_save();
+
 	/* Prepare the iocb / iov_iter and set up the completion handler. */
 	swap_fs_prepare_rw(ctx, WRITE, &iter);
 
@@ -383,6 +400,7 @@ static void rswap_submit_write(struct swap_io_ctx *ctx)
 	sock = rswap_connect();
 	if (IS_ERR(sock)) {
 		kunmap_local(data);
+		memalloc_noio_restore(noio_flags);
 		sio->iocb.ki_complete(&sio->iocb, PTR_ERR(sock));
 		return;
 	}
@@ -396,6 +414,8 @@ static void rswap_submit_write(struct swap_io_ctx *ctx)
 	kernel_sock_shutdown(sock, SHUT_RDWR);
 	sock_release(sock);
 	kunmap_local(data);
+
+	memalloc_noio_restore(noio_flags);
 
 	if (ret < 0)
 		pr_debug_ratelimited("write %s failed: %d\n", sha256_hex, ret);
@@ -417,6 +437,7 @@ static void rswap_submit_read(struct swap_io_ctx *ctx)
 	char sha256_hex[RSWAP_SHA256_HEXLEN + 1];
 	char *data;
 	int ret;
+	unsigned int noio_flags;
 
 	if (sio->nr_bvecs == 0) {
 		sio->iocb.ki_complete(&sio->iocb, 0);
@@ -429,6 +450,8 @@ static void rswap_submit_read(struct swap_io_ctx *ctx)
 		return;
 	}
 
+	noio_flags = memalloc_noio_save();
+
 	/* Prepare the iocb / iov_iter and set up the completion handler. */
 	swap_fs_prepare_rw(ctx, READ, &iter);
 
@@ -439,6 +462,7 @@ static void rswap_submit_read(struct swap_io_ctx *ctx)
 	sock = rswap_connect();
 	if (IS_ERR(sock)) {
 		kunmap_local(data);
+		memalloc_noio_restore(noio_flags);
 		sio->iocb.ki_complete(&sio->iocb, PTR_ERR(sock));
 		return;
 	}
@@ -450,6 +474,8 @@ static void rswap_submit_read(struct swap_io_ctx *ctx)
 	kernel_sock_shutdown(sock, SHUT_RDWR);
 	sock_release(sock);
 	kunmap_local(data);
+
+	memalloc_noio_restore(noio_flags);
 
 	if (ret < 0)
 		pr_debug_ratelimited("read %s failed: %d\n", sha256_hex, ret);
@@ -471,7 +497,7 @@ static bool rswap_can_merge(struct folio *folio, struct folio *prev_folio,
 
 /* The rswap operations vector. */
 static const struct swap_ops kv_swap_ops = {
-	.flags		= 0,
+	.flags		= SWAP_OPS_F_REQUIRE_NOFS,
 	.submit_write	= rswap_submit_write,
 	.submit_read	= rswap_submit_read,
 	.can_merge	= rswap_can_merge,
@@ -481,14 +507,23 @@ static const struct swap_ops kv_swap_ops = {
 
 int rswap_enable(struct swap_info_struct *si)
 {
+	int ret;
+
 	if (!(si->flags & SWP_XSWAP))
 		return -EINVAL;
 
 	/*
 	 * Register our swap_ops.  From this point on, the swap core calls
 	 * rswap_submit_write / rswap_submit_read for I/O on this device.
+	 *
+	 * swap_fs_activate() returns the result of add_swap_extent(), which
+	 * returns 0 (merge) or 1 (new extent) on success.  Map both to 0 so
+	 * the caller can use the conventional if (ret < 0) error check.
 	 */
-	return swap_fs_activate(si, &kv_swap_ops);
+	ret = swap_fs_activate(si, &kv_swap_ops);
+	if (ret < 0)
+		return ret;
+	return 0;
 }
 
 void rswap_disable(struct swap_info_struct *si)
@@ -509,7 +544,7 @@ void rswap_debugfs_add(struct swap_info_struct *si)
 {
 	char name[32];
 	struct dentry *dentry;
-	u32 port = RSWAP_KV_PORT;
+	/* Keep a copy of the port in si for debugfs (no UAF). */
 
 	if (!rswap_debugfs_root) {
 		rswap_debugfs_root = debugfs_create_dir("rswap", NULL);
@@ -522,7 +557,15 @@ void rswap_debugfs_add(struct swap_info_struct *si)
 	if (IS_ERR_OR_NULL(dentry))
 		return;
 
-	debugfs_create_u32("kv_port", 0444, dentry, &port);
+	/*
+	 * Store the port in a heap-allocated variable so debugfs can
+	 * safely reference it.  Freed when the dentry is removed.
+	 */
+	si->rswap_kv_port = kmalloc(sizeof(u32), GFP_KERNEL);
+	if (si->rswap_kv_port) {
+		*si->rswap_kv_port = RSWAP_KV_PORT;
+		debugfs_create_u32("kv_port", 0444, dentry, si->rswap_kv_port);
+	}
 }
 
 void rswap_debugfs_del(struct swap_info_struct *si)
@@ -530,8 +573,12 @@ void rswap_debugfs_del(struct swap_info_struct *si)
 	char name[32];
 
 	if (!rswap_debugfs_root)
-		return;
+		goto free_port;
 
 	snprintf(name, sizeof(name), "type%d", si->type);
 	debugfs_lookup_and_remove(name, rswap_debugfs_root);
+
+free_port:
+	kfree(si->rswap_kv_port);
+	si->rswap_kv_port = NULL;
 }

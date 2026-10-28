@@ -4679,6 +4679,15 @@ static int xswap_create_common(int prio, bool is_rswap)
 	    (prio < 0 || prio > SWAP_FLAG_PRIO_MASK))
 		return -EINVAL;
 
+	/*
+	 * Ensure the swap I/O ioctx pool is initialized.  This is normally
+	 * done in generic_swapfile_activate(), but xswap devices skip that
+	 * path.  Safe to call multiple times (it's idempotent).
+	 */
+	error = sio_pool_init();
+	if (error)
+		return error;
+
 	/* xswap has no backing store, it relies on zswap. */
 	if (!is_rswap && !zswap_is_enabled())
 		return -EOPNOTSUPP;

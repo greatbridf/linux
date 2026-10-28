@@ -255,6 +255,7 @@ struct swap_info_struct {
 #endif
 #ifdef CONFIG_RSWAP
 	struct dentry		*rswap_dentry;	/* debugfs directory */
+	u32			*rswap_kv_port;	/* KV server port for debugfs */
 #endif /* CONFIG_RSWAP */
 
 	struct list_head free_clusters; /* free clusters list */
