@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Compile the actual backend functions with deterministic socket/page shims."""
+"""Compile actual backend and slot cleanup functions with deterministic shims."""
 
 import argparse
 import pathlib
@@ -251,6 +251,102 @@ int main(void)
 }
 """
 
+FREE_SHIMS = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#define SWP_BLKDEV (1 << 6)
+#define SWP_XSWAP (1 << 14)
+#define SWP_RSWAP (1 << 15)
+struct block_device;
+struct block_device_operations {
+    void (*swap_slot_free_notify)(struct block_device *, unsigned long);
+};
+struct gendisk { const struct block_device_operations *fops; };
+struct block_device { struct gendisk *bd_disk; };
+struct swap_info_struct {
+    unsigned int flags;
+    int type;
+    struct block_device *bdev;
+};
+static long nr_swap_pages;
+static unsigned long first_offset;
+static unsigned int count, arch_calls, notify_calls, zswap_calls;
+static bool remote, barrier_done;
+static void zswap_invalidate(int type, unsigned long offset, unsigned long nr)
+{
+    assert(type == 3 && offset == first_offset && nr == count);
+    assert(!arch_calls && !barrier_done);
+    zswap_calls++;
+}
+static void arch_swap_invalidate_page(int type, unsigned long offset)
+{
+    assert(type == 3 && offset == first_offset + arch_calls);
+    assert(!barrier_done);
+    arch_calls++;
+}
+static void notify(struct block_device *bdev, unsigned long offset)
+{
+    assert(bdev && offset == first_offset + notify_calls);
+    assert(arch_calls == notify_calls + 1 && !barrier_done);
+    notify_calls++;
+}
+static void smp_wmb(void)
+{
+    assert(arch_calls == count);
+    barrier_done = true;
+}
+static void atomic_long_add(unsigned int nr, long *value)
+{
+    assert(barrier_done && nr == count);
+    *value += nr;
+}
+static void swap_usage_sub(struct swap_info_struct *si, unsigned int nr)
+{
+    assert(si->type == 3 && nr == count);
+    assert(barrier_done && nr_swap_pages == count);
+}
+"""
+
+FREE_MAIN = r"""
+int main(void)
+{
+    struct block_device_operations ops = { .swap_slot_free_notify = notify };
+    struct gendisk disk = { .fops = &ops };
+    struct block_device bdev = { .bd_disk = &disk };
+    const unsigned int flags[] = {
+        SWP_XSWAP | SWP_RSWAP, SWP_XSWAP, 0, SWP_BLKDEV, SWP_BLKDEV,
+    };
+    unsigned int i, nr;
+    int failures = 0;
+
+    for (i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        for (nr = 1; nr <= 4; nr *= 4) {
+            struct swap_info_struct si = {
+                .flags = flags[i], .type = 3,
+                .bdev = flags[i] & SWP_BLKDEV ? &bdev : NULL,
+            };
+            ops.swap_slot_free_notify = i == 4 ? NULL : notify;
+            first_offset = 1023;
+            count = nr;
+            remote = flags[i] & SWP_RSWAP;
+            nr_swap_pages = 0;
+            arch_calls = notify_calls = zswap_calls = 0;
+            barrier_done = false;
+            swap_range_free(&si, first_offset, nr);
+            if (zswap_calls != (remote ? 0 : 1)) {
+                puts("FAIL: slot cleanup calls zswap for a tree-less remote device");
+                failures++;
+            }
+            assert(notify_calls == ((flags[i] & SWP_BLKDEV) && i != 4 ? nr : 0));
+        }
+    }
+    if (!failures)
+        puts("PASS: actual slot cleanup bypasses rswap zswap invalidation only");
+    return !!failures;
+}
+"""
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -261,17 +357,24 @@ def main():
         source = subprocess.check_output(
             ["git", "show", f"{args.revision}:mm/rswap.c"],
             cwd=root, text=True)
+        swapfile = subprocess.check_output(
+            ["git", "show", f"{args.revision}:mm/swapfile.c"],
+            cwd=root, text=True)
     else:
         source = (root / "mm/rswap.c").read_text()
+        swapfile = (root / "mm/swapfile.c").read_text()
     response = source[source.index("static int rswap_parse_response("):
                       source.index("/* ---------- SHA-256 helpers")]
     start = ("static void rswap_submit(" if "static void rswap_submit(" in source
              else "static void rswap_submit_write(")
     submit = source[source.index(start):source.index(
         "/*\n * rswap_can_merge")]
+    free = swapfile[swapfile.index("static void swap_range_free("):
+                    swapfile.index("static bool get_swap_device_info(")]
     snippets = {
         "response": SHIMS + response + PARSER_MAIN,
         "folio": SHIMS + BACKEND_RESPONSE + submit + BACKEND_MAIN,
+        "free": FREE_SHIMS + free + FREE_MAIN,
     }
     failures = 0
     with tempfile.TemporaryDirectory(prefix="rswap-backend-") as directory:

@@ -1,11 +1,88 @@
 # Remote Swap Investigation
 
 Date: October 29, 2026.
-Source baseline: `5749184e2c994e4f3f7d4c680d5aa7f406b56971`.
-Running kernel: `7.3.0-rust-17051-gd189377a39c6-dirty`, ARM64,
+Initial source baseline: `5749184e2c994e4f3f7d4c680d5aa7f406b56971`.
+Post-reboot source baseline: `7048ca1cab502`.
+Running kernel: `7.3.0-rust-17053-g7048ca1cab50 #48.tl4`, ARM64,
 16 KiB base pages, approximately 16 GiB RAM.
 
-## Findings
+## Post-Reboot Findings and Tests
+
+**High: freeing remote swap slots crashes after zswap has been enabled.**
+Remote device setup deliberately skips `zswap_swapon()`, leaving its
+`zswap_trees[type]` NULL. `swap_range_free()` nevertheless calls
+`zswap_invalidate()` unconditionally. Once zswap has ever been enabled,
+that function dereferences the missing tree. Turning zswap back off does
+not restore the `zswap_never_enabled()` fast path.
+
+Reproducer on the rebooted kernel: make rswap the only active swap device,
+enable global zswap, and run the bounded 8 MiB verifier for five rounds
+with `memory.zswap.max=0`. Every round evicted all 512 pages and matched
+all bytes, but final `munmap()` caused this Oops at uptime 203.129 seconds:
+
+```text
+Unable to handle kernel NULL pointer dereference at virtual address 0000000000000008
+pc : zswap_invalidate+0x78/0xa0
+Call trace:
+ zswap_invalidate
+ __swap_cluster_free_entries
+ __swap_cache_do_del_folio
+ swap_cache_del_folio
+ folio_free_swap
+ free_pages_and_swap_cache
+ tlb_flush_mmu
+ tlb_finish_mmu
+ unmap_region
+ ...
+ __arm64_sys_munmap
+```
+
+Fix: skip zswap invalidation only for `SWP_RSWAP`, matching the existing
+store/load bypasses. Architecture invalidation, block-device notification,
+cleanup ordering, and swap accounting remain unchanged. The regression
+compiles the actual `swap_range_free()` source with shims and covers
+single/multiple slots on rswap, ordinary xswap, file-backed swap, and block
+swap with/without a notification callback. It fails on `7048ca1cab502`
+and passes with the guard. This is not runtime validation of the new fix.
+
+Before enabling global zswap, all of these live tests exited successfully
+and left zero test-cgroup swap usage:
+
+| Workload | Rounds | Result |
+| --- | --- | --- |
+| 8 MiB base pages | 10 | All bytes match; 512/512 pages evicted each round |
+| 8 MiB, `memory.zswap.max=0` | 5 | All bytes match; allocation-gate fix validated |
+| Confirmed 32 MiB THP mapping | 1 | All bytes match; 2,048/2,048 pages evicted |
+| 64 MiB base pages | 3 | All bytes match; 4,096/4,096 pages evicted each round |
+| Four concurrent 8 MiB workloads | 3 each | All bytes match; one round evicted 510/512 pages, others 512/512 |
+
+These are **31 clean rounds, 440 MiB compared**, with 28,158 base pages
+observed evicted. THPs are split before swap-out because `CONFIG_THP_SWAP`
+is disabled; unsplit large-folio validation remains outstanding.
+The global-zswap test compared another 40 MiB over five rounds without
+mismatches, but is a **failed test** because cleanup crashed.
+No remote read errors appeared in dmesg during this reboot's tests.
+Protocol tests pass 11/11; actual parser, submit-path, and new slot-cleanup
+regressions pass. `make -C tools/mm rswap_test kvswap_server` and
+`make O=build LLVM=1 -j12 Image` succeed without new warnings.
+Checkpatch reports zero errors/warnings; `git diff --check` passes.
+
+Live artifacts are in `/tmp/rswap-reboot-zzlzix_d` (root-owned), including
+per-workload logs and server storage under `kv/`. The initial dmesg
+snapshots predate the crash; `oops-dmesg.txt` captures the later Oops.
+The crashed verifier remains in uninterruptible `exit_mmap` as PID 1304839,
+and the kernel is tainted 128. Further live swap tests and remote swapoff
+were stopped. Global zswap is back to `N`, and the original zram swap was
+restored through `dev-zram0.swap` at priority 100. Remote type 0 remains
+active with 8,224 KiB used; server PID 1304803 is deliberately left running
+on `127.0.0.1:6789` with that backing storage.
+
+**Another reboot into the newly rebuilt image is required.** The cleanup
+fix is not installed or running. Do not stop this server, destroy its
+backing data, or attempt remote swapoff on the Oops-tainted kernel.
+Turning zswap off alone does not make continued remote swapping safe.
+
+## Initial Investigation Findings
 
 1. **Critical: silent page-content corruption.**
    `tools/mm/kvswap_server.c:339` previously read a request once into an
@@ -61,7 +138,10 @@ The previous `swap_fs_prepare_rw()` change also removed file-backed
 kiocb flags and I/O priority. Restore `init_sync_kiocb()` for non-NULL
 backing files, retaining zero initialization for file-less devices.
 
-## Verification
+## Pre-Reboot Verification
+
+The following results were obtained before booting `7048ca1cab502`, on
+`7.3.0-rust-17051-gd189377a39c6-dirty`.
 
 - Original server: initial eight-test suite had five failures and one
   error; 4 KiB and missing-key tests passed.
@@ -99,24 +179,24 @@ sudo python3 tools/mm/rswap_run_test.py --size-kib 32768 --rounds 1 --huge
 sudo python3 tools/mm/rswap_run_test.py --disable-zswap
 ```
 
-The final command currently reproduces the allocation failure on the old
-running kernel; repeat after booting the rebuilt kernel to validate the gate
-fix. The runner requires that every active swap device is an rswap device,
+Run live commands only after booting the cleanup fix and configuring a
+fresh rswap backend as the only active swap device. The allocation-gate
+fix passed after the first reboot. Repeat with global zswap enabled, then
+disabled after having been enabled, to validate slot cleanup in both states.
+The runner requires that every active swap device is an rswap device,
 creates a bounded cgroup, and reclaims only that cgroup's pages. It reports
 SKIP (exit 4) if no pages leave RAM, avoiding a false integrity pass.
 
 ## Remaining Limitations
 
 - The rebuilt image is `build/arch/arm64/boot/Image`. It has not been
-  installed or booted; no host reboot or swap-device destruction was done.
-  Full-kernel timeout, failure-injection, zswap-enabled, swapoff, and
-  unsplit large-folio validation remain outstanding.
-- The fixed server is running as PID 498991 on `127.0.0.1:6789`, using
-  the original `/tmp/rswap-test-O28izO` directory. Its log is
-  `/tmp/rswap-fixed-srv.log`; its binary is `/tmp/kvswap-server-fixed`.
-  No existing objects were deleted. Restarting it cannot restore missing
-  bytes in already-truncated pages; a successful fresh-data test does not
-  establish the integrity of old live swap entries.
+  installed or booted for the new slot-cleanup fix; the preceding I/O
+  fixes were booted and tested. Full-kernel timeout, failure-injection,
+  fixed zswap-enabled/ever-enabled cleanup, swapoff, and unsplit large-folio
+  validation remain outstanding.
+- This reboot used fresh server storage, not the old truncated objects.
+  A successful fresh-data test does not establish integrity of old live
+  swap entries or restore bytes already lost by the old implementation.
 - The SHA-256 key hashes the swap entry, not the payload. Exact-length
   checks and these comparisons do not provide a payload checksum, network
   authentication, persistence across server crashes, or cross-client key
