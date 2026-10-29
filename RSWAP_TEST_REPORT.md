@@ -3,10 +3,57 @@
 Date: October 29, 2026.
 Initial source baseline: `5749184e2c994e4f3f7d4c680d5aa7f406b56971`.
 Post-reboot source baseline: `7048ca1cab502`.
-Running kernel: `7.3.0-rust-17053-g7048ca1cab50 #48.tl4`, ARM64,
+Current tested source: `f457cbea357a8`.
+Running kernel: `7.3.0-rust-17054-gf457cbea357a #51.tl4`, ARM64,
 16 KiB base pages, approximately 16 GiB RAM.
 
-## Post-Reboot Findings and Tests
+## Second-Reboot Results
+
+The remote-swap-only test matrix passes on the current kernel. Zswap-specific
+tests were excluded at the user's request; no zswap settings were changed.
+The temporary server used fresh storage and rswap was the only active swap
+device during the integrity tests.
+
+| Workload | Rounds | Result |
+| --- | --- | --- |
+| 8 MiB base pages | 20 | All bytes match; 512/512 pages evicted each round |
+| Fresh 32 MiB THP mappings | 3 separate processes | All bytes match; each mapping confirmed entirely THP-backed before reclaim |
+| 64 MiB base pages | 5 | All bytes match; first round evicted 4,091/4,096 pages, others 4,096/4,096 |
+| 128 MiB base pages | 3 | All bytes match; 8,192/8,192 pages evicted each round |
+| Four concurrent 16 MiB workloads | 5 each | All bytes match; 1,024/1,024 pages evicted each round |
+
+The complete matrix performed **51 successful rounds, comparing 1,280 MiB**
+and observing **81,915/81,920 base pages evicted**. Every 64-bit word was
+compared with its original generated pattern, including the tail of each
+16 KiB page. All ten verifier processes exited successfully, and every test
+cgroup had zero swap usage after exit.
+
+- No remote read errors, Oops, or new kernel warnings appeared in dmesg.
+- All 21,548 server objects checked were exactly 16,384 bytes.
+- Protocol tests pass 11/11; actual-source backend regressions pass.
+- The temporary remote device was successfully destroyed after verification.
+- The server stopped, test cgroups were removed, and the original
+  `/dev/zram0` swap was restored at priority 100 with zero usage.
+- Kernel taint remained 0; no verifier task was left behind.
+
+The initial attempt passed another 20 serial rounds and the first THP round,
+but the reused THP mapping had zero `AnonHugePages` in round two, so the
+verifier returned SKIP (exit 4). This is not a data mismatch or remote I/O
+failure. Repeating the THP test in three fresh processes verified huge-page
+backing and integrity each time. With `CONFIG_THP_SWAP` disabled on this
+16 KiB-page kernel, reclaim still splits THPs before swap-out; these tests
+do not establish unsplit large-folio swap-out correctness.
+
+Complete-run artifacts are in `/tmp/rswap-reboot-z2nhygxq` (root-owned):
+`results.json`, per-workload logs, `object-sizes.json`, `new-dmesg.txt`, and
+before/after kernel snapshots. Preliminary-run artifacts, including the
+THP skip, are in `/tmp/rswap-reboot-y6vc5q8j`. No kernel code was changed
+during this rerun.
+
+## First-Reboot Findings and Tests
+
+These historical results were obtained on
+`7.3.0-rust-17053-g7048ca1cab50 #48.tl4`, before the current cleanup fix.
 
 **High: freeing remote swap slots crashes after zswap has been enabled.**
 Remote device setup deliberately skips `zswap_swapon()`, leaving its
@@ -70,17 +117,17 @@ Checkpatch reports zero errors/warnings; `git diff --check` passes.
 Live artifacts are in `/tmp/rswap-reboot-zzlzix_d` (root-owned), including
 per-workload logs and server storage under `kv/`. The initial dmesg
 snapshots predate the crash; `oops-dmesg.txt` captures the later Oops.
-The crashed verifier remains in uninterruptible `exit_mmap` as PID 1304839,
-and the kernel is tainted 128. Further live swap tests and remote swapoff
+At the end of that run, the crashed verifier remained in uninterruptible
+`exit_mmap` as PID 1304839, and the kernel was tainted 128.
+Further live swap tests and remote swapoff
 were stopped. Global zswap is back to `N`, and the original zram swap was
 restored through `dev-zram0.swap` at priority 100. Remote type 0 remains
 active with 8,224 KiB used; server PID 1304803 is deliberately left running
 on `127.0.0.1:6789` with that backing storage.
 
-**Another reboot into the newly rebuilt image is required.** The cleanup
-fix is not installed or running. Do not stop this server, destroy its
-backing data, or attempt remote swapoff on the Oops-tainted kernel.
-Turning zswap off alone does not make continued remote swapping safe.
+That run required another reboot into the cleanup fix; stopping its server
+or attempting remote swapoff was unsafe on the Oops-tainted kernel.
+The second reboot cleared that state, and its results are recorded above.
 
 ## Initial Investigation Findings
 
@@ -176,24 +223,22 @@ python3 tools/mm/kvswap_test.py
 python3 tools/mm/rswap_backend_test.py
 sudo python3 tools/mm/rswap_run_test.py --size-kib 8192 --rounds 5
 sudo python3 tools/mm/rswap_run_test.py --size-kib 32768 --rounds 1 --huge
-sudo python3 tools/mm/rswap_run_test.py --disable-zswap
 ```
 
-Run live commands only after booting the cleanup fix and configuring a
-fresh rswap backend as the only active swap device. The allocation-gate
-fix passed after the first reboot. Repeat with global zswap enabled, then
-disabled after having been enabled, to validate slot cleanup in both states.
+Run live commands with a fresh rswap backend as the only active swap device.
+Use a fresh process for each THP repetition, since the mapping may no longer
+be huge-page-backed after swap-in.
 The runner requires that every active swap device is an rswap device,
 creates a bounded cgroup, and reclaims only that cgroup's pages. It reports
 SKIP (exit 4) if no pages leave RAM, avoiding a false integrity pass.
 
 ## Remaining Limitations
 
-- The rebuilt image is `build/arch/arm64/boot/Image`. It has not been
-  installed or booted for the new slot-cleanup fix; the preceding I/O
-  fixes were booted and tested. Full-kernel timeout, failure-injection,
-  fixed zswap-enabled/ever-enabled cleanup, swapoff, and unsplit large-folio
-  validation remain outstanding.
+- The cleanup fix and preceding I/O fixes are now booted and tested for
+  the remote-only matrix. Full-kernel timeout, failure-injection,
+  active-page swapoff, and unsplit large-folio validation remain outstanding.
+  Empty-device destruction passed. Zswap-specific validation was excluded
+  from the latest rerun.
 - This reboot used fresh server storage, not the old truncated objects.
   A successful fresh-data test does not establish integrity of old live
   swap entries or restore bytes already lost by the old implementation.
