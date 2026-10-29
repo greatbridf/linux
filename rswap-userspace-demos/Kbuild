@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Kbuild file for building the kernel module within the kernel tree.
+obj-m := page_hash_test_mod.o
