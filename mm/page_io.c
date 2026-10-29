@@ -501,7 +501,7 @@ void swap_read_folio(struct swap_io_ctx *ctx, struct folio *folio)
 		goto finish;
 	}
 
-	if (zswap_load(folio) != -ENOENT)
+	if (!(sis->flags & SWP_RSWAP) && zswap_load(folio) != -ENOENT)
 		goto finish;
 
 	if (unlikely(sis->flags & SWP_XSWAP)) {
@@ -703,13 +703,10 @@ void swap_fs_prepare_rw(struct swap_io_ctx *ctx, int rw, struct iov_iter *iter)
 	struct swap_iocb *sio = ctx->sio;
 	struct file *swap_file = ctx->sis->swap_file;
 
-	/*
-	 * Zero the kiocb first so the compiler does not speculate
-	 * loads from @swap_file (which can be NULL for virtual swap
-	 * devices such as xswap/rswap).
-	 */
-	memset(&sio->iocb, 0, sizeof(sio->iocb));
-	sio->iocb.ki_filp = swap_file;
+	if (swap_file)
+		init_sync_kiocb(&sio->iocb, swap_file);
+	else
+		memset(&sio->iocb, 0, sizeof(sio->iocb));
 	sio->iocb.ki_pos = swap_dev_pos(bvec_folio(&sio->bvecs[0])->swap);
 	if (rw == WRITE)
 		sio->iocb.ki_complete = swap_fs_write_complete;

@@ -1643,7 +1643,8 @@ static bool swap_alloc_fast(struct folio *folio, bool may_zswap)
 		rcu_read_unlock();
 		return false;
 	}
-	if (!may_zswap && (si->flags & SWP_XSWAP)) {
+	if (!may_zswap && (si->flags & SWP_XSWAP) &&
+	    !(si->flags & SWP_RSWAP)) {
 		put_swap_device(si);
 		rcu_read_unlock();
 		return false;
@@ -1675,7 +1676,8 @@ start_over:
 		 * Do not rotate a skipped device: the walk follows the
 		 * rotation and would spin forever.
 		 */
-		if (!may_zswap && (si->flags & SWP_XSWAP))
+		if (!may_zswap && (si->flags & SWP_XSWAP) &&
+		    !(si->flags & SWP_RSWAP))
 			continue;
 		/* Rotate the device and switch to a new cluster */
 		plist_requeue(&si->avail_list, &swap_avail_head);

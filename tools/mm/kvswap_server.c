@@ -52,6 +52,7 @@
 #define MAX_HEADER	8192
 #define MAX_PATH	PATH_MAX
 #define SHA256_HEXLEN	64
+#define MAX_BODY		(64UL * 1024 * 1024)
 
 /* Global config, set from cmdline. */
 static struct {
@@ -119,6 +120,23 @@ static int ensure_dirs(const char *sha256)
 
 /* ---------- HTTP response helpers ---------- */
 
+static int write_all(int fd, const void *data, size_t len)
+{
+	const char *p = data;
+
+	while (len) {
+		ssize_t n = write(fd, p, len);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return -1;
+		p += n;
+		len -= n;
+	}
+	return 0;
+}
+
 static void send_200(int fd, const void *body, size_t bodylen)
 {
 	char hdr[256];
@@ -131,9 +149,8 @@ static void send_200(int fd, const void *body, size_t bodylen)
 		     "Connection: close\r\n"
 		     "\r\n",
 		     bodylen);
-	write(fd, hdr, n);
-	if (body && bodylen > 0)
-		write(fd, body, bodylen);
+	if (write_all(fd, hdr, n) == 0 && body && bodylen > 0)
+		write_all(fd, body, bodylen);
 }
 
 static void send_404(int fd)
@@ -143,7 +160,7 @@ static void send_404(int fd)
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";
-	write(fd, msg, sizeof(msg) - 1);
+	write_all(fd, msg, sizeof(msg) - 1);
 }
 
 static void send_400(int fd)
@@ -153,7 +170,7 @@ static void send_400(int fd)
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";
-	write(fd, msg, sizeof(msg) - 1);
+	write_all(fd, msg, sizeof(msg) - 1);
 }
 
 static void send_500(int fd)
@@ -163,7 +180,7 @@ static void send_500(int fd)
 		"Content-Length: 0\r\n"
 		"Connection: close\r\n"
 		"\r\n";
-	write(fd, msg, sizeof(msg) - 1);
+	write_all(fd, msg, sizeof(msg) - 1);
 }
 
 /* ---------- Request parsing ---------- */
@@ -235,7 +252,8 @@ static void handle_get(int fd, const char *sha256)
 		return;
 	}
 
-	if (fstat(f, &st) < 0) {
+	if (fstat(f, &st) < 0 || st.st_size < 0 ||
+	    (unsigned long long)st.st_size > MAX_BODY) {
 		close(f);
 		send_500(fd);
 		return;
@@ -249,12 +267,21 @@ static void handle_get(int fd, const char *sha256)
 	}
 
 	if (st.st_size > 0) {
-		ssize_t n = read(f, map, st.st_size);
-		if (n != st.st_size) {
-			free(map);
-			close(f);
-			send_500(fd);
-			return;
+		size_t total = 0;
+
+		while (total < (size_t)st.st_size) {
+			ssize_t n = read(f, (char *)map + total,
+					 st.st_size - total);
+
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n <= 0) {
+				free(map);
+				close(f);
+				send_500(fd);
+				return;
+			}
+			total += n;
 		}
 	}
 	close(f);
@@ -267,8 +294,8 @@ static void handle_post(int fd, const char *sha256,
 			const char *body, size_t bodylen)
 {
 	char fpath[MAX_PATH];
+	char temporary[MAX_PATH];
 	int f;
-	ssize_t written;
 
 	if (ensure_dirs(sha256) < 0) {
 		send_500(fd);
@@ -280,21 +307,30 @@ static void handle_post(int fd, const char *sha256,
 		return;
 	}
 
-	f = open(fpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (snprintf(temporary, sizeof(temporary), "%s.XXXXXX", fpath) >=
+	    (int)sizeof(temporary)) {
+		send_500(fd);
+		return;
+	}
+	f = mkstemp(temporary);
 	if (f < 0) {
 		send_500(fd);
 		return;
 	}
 
-	written = write(f, body, bodylen);
-	if (written != (ssize_t)bodylen) {
+	/* Publish only complete values; a failed update keeps the old value. */
+	if (write_all(f, body, bodylen) < 0) {
 		close(f);
-		unlink(fpath);
+		unlink(temporary);
 		send_500(fd);
 		return;
 	}
 
-	close(f);
+	if (close(f) < 0 || rename(temporary, fpath) < 0) {
+		unlink(temporary);
+		send_500(fd);
+		return;
+	}
 	send_200(fd, NULL, 0);
 }
 
@@ -307,22 +343,36 @@ static void handle_connection(int fd)
 	ssize_t n;
 	const char *body = NULL;
 	size_t bodylen = 0;
+	size_t total = 0;
+	char *payload = NULL;
+	char *header_end;
+	struct timeval timeout = { .tv_sec = 5 };
 
-	/* Read the HTTP request header. */
-	n = read(fd, buf, sizeof(buf) - 1);
-	if (n <= 0)
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+		       &timeout, sizeof(timeout)) < 0 ||
+	    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+		       &timeout, sizeof(timeout)) < 0)
 		goto done;
-	buf[n] = '\0';
-
-	/* Find end of headers. */
-	char *header_end = strstr(buf, "\r\n\r\n");
-	if (!header_end) {
-		send_400(fd);
-		goto done;
+	/* TCP may split the header, body, or both across arbitrary reads. */
+	for (;;) {
+		if (total == sizeof(buf) - 1) {
+			send_400(fd);
+			goto done;
+		}
+		n = read(fd, buf + total, sizeof(buf) - 1 - total);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto done;
+		total += n;
+		buf[total] = '\0';
+		header_end = strstr(buf, "\r\n\r\n");
+		if (header_end)
+			break;
 	}
 	*header_end = '\0';		/* terminate header at blank line */
 	body = header_end + 4;
-	bodylen = n - (body - buf);
+	bodylen = total - (body - buf);
 
 	/* Parse the request line. */
 	if (parse_request(buf, method, sizeof(method),
@@ -335,12 +385,69 @@ static void handle_connection(int fd)
 	if (strcmp(method, "GET") == 0 && strcmp(op, "read") == 0) {
 		handle_get(fd, sha256);
 	} else if (strcmp(method, "POST") == 0 && strcmp(op, "write") == 0) {
-		handle_post(fd, sha256, body, bodylen);
+		char *line = strstr(buf, "\r\n");
+		size_t content_length = 0;
+		int have_length = 0;
+
+		while (line) {
+			char *next;
+
+			line += 2;
+			next = strstr(line, "\r\n");
+			if (next)
+				*next = '\0';
+			if (!strncasecmp(line, "Content-Length:", 15)) {
+				char *end;
+				unsigned long long length;
+
+				line += 15;
+				while (*line == ' ' || *line == '\t')
+					line++;
+				errno = 0;
+				length = strtoull(line, &end, 10);
+				while (*end == ' ' || *end == '\t')
+					end++;
+				if (have_length || !isdigit((unsigned char)*line) ||
+				    end == line || *end || errno ||
+				    length > MAX_BODY) {
+					send_400(fd);
+					goto done;
+				}
+				content_length = length;
+				have_length = 1;
+			} else if (!strncasecmp(line, "Transfer-Encoding:", 18)) {
+				send_400(fd);
+				goto done;
+			}
+			line = next;
+		}
+		if (!have_length || bodylen > content_length) {
+			send_400(fd);
+			goto done;
+		}
+		payload = malloc(content_length ? content_length : 1);
+		if (!payload) {
+			send_500(fd);
+			goto done;
+		}
+		memcpy(payload, body, bodylen);
+		while (bodylen < content_length) {
+			n = read(fd, payload + bodylen, content_length - bodylen);
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n <= 0) {
+				send_400(fd);
+				goto done;
+			}
+			bodylen += n;
+		}
+		handle_post(fd, sha256, payload, content_length);
 	} else {
 		send_400(fd);
 	}
 
 done:
+	free(payload);
 	close(fd);
 }
 
