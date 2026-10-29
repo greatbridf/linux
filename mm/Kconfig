@@ -133,10 +133,8 @@ config XSWAP
 
 config RSWAP
 	bool "Remote Swap (rswap) - HTTP KV store backend"
-	depends on XSWAP && NET
-	select CRYPTO
-	select CRYPTO_HASH
-	select CRYPTO_SHA256
+	depends on XSWAP && INET
+	select CRYPTO_LIB_SHA256
 	help
 	  Adds support for remote swap (rswap) devices.  rswap implements the
 	  swap_ops interface to store swap pages in an external HTTP key-value

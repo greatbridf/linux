@@ -5,3 +5,4 @@ page_owner_sort
 thp_swap_allocator_test
 gup_bench
 kvswap_server
+rswap_test

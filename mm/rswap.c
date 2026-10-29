@@ -30,7 +30,6 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/highmem.h>
-#include <crypto/hash.h>
 #include <crypto/sha2.h>
 #include <linux/hex.h>
 #include <linux/socket.h>
@@ -63,7 +62,7 @@ static struct socket *rswap_connect(void)
 {
 	struct socket *sock;
 	struct sockaddr_in sin;
-	int ret, val;
+	int ret;
 
 	ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
 			       &sock);
@@ -72,15 +71,10 @@ static struct socket *rswap_connect(void)
 		return ERR_PTR(ret);
 	}
 
-	/* Set 1-second send and receive timeouts so we cannot block
-	 * indefinitely in the swap-out path. */
-	val = 1 * HZ;
-	sock_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO_OLD,
-			KERNEL_SOCKPTR(&val), sizeof(val));
-	val = 1 * HZ;
-	sock_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO_OLD,
-			KERNEL_SOCKPTR(&val), sizeof(val));
+	sock_set_sndtimeo(sock->sk, 1);
+	WRITE_ONCE(sock->sk->sk_rcvtimeo, HZ);
 
+	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
 	sin.sin_port = htons(RSWAP_KV_PORT);
 	if (in4_pton(RSWAP_KV_HOST, -1, (u8 *)&sin.sin_addr.s_addr, -1, NULL) == 0) {
@@ -109,11 +103,13 @@ static int rswap_send_request(struct socket *sock, const void *msg, size_t len)
 	struct kvec iov = { .iov_base = (void *)msg, .iov_len = len };
 	int ret;
 
-	ret = kernel_sendmsg(sock, &mhdr, &iov, 1, len);
-	if (ret < 0)
-		return ret;
-	if (ret != len)
-		return -EIO;
+	while (iov.iov_len) {
+		ret = kernel_sendmsg(sock, &mhdr, &iov, 1, iov.iov_len);
+		if (ret <= 0)
+			return ret ? ret : -EIO;
+		iov.iov_base = (char *)iov.iov_base + ret;
+		iov.iov_len -= ret;
+	}
 	return 0;
 }
 
@@ -123,21 +119,12 @@ static int rswap_send_request(struct socket *sock, const void *msg, size_t len)
 static int rswap_send_post(struct socket *sock, const void *hdr, size_t hlen,
 			   const void *body, size_t bodylen)
 {
-	struct msghdr mhdr = { .msg_flags = MSG_NOSIGNAL };
-	struct kvec iov[2];
 	int ret;
 
-	iov[0].iov_base = (void *)hdr;
-	iov[0].iov_len  = hlen;
-	iov[1].iov_base = (void *)body;
-	iov[1].iov_len  = bodylen;
-
-	ret = kernel_sendmsg(sock, &mhdr, iov, 2, hlen + bodylen);
+	ret = rswap_send_request(sock, hdr, hlen);
 	if (ret < 0)
 		return ret;
-	if (ret != hlen + bodylen)
-		return -EIO;
-	return 0;
+	return rswap_send_request(sock, body, bodylen);
 }
 
 /* Receive data into a buffer. */
@@ -214,8 +201,10 @@ static int rswap_parse_response(struct socket *sock,
 	char *buf = kmalloc(2048, GFP_NOIO);
 	int total = 0;
 	int status = 0;
-	char *body = NULL;
-	int body_len = 0;
+	char *line;
+	size_t content_length = 0;
+	size_t received = 0;
+	bool have_length = false;
 	int ret;
 
 	if (!buf)
@@ -225,7 +214,7 @@ static int rswap_parse_response(struct socket *sock,
 	while (total < 2047) {
 		ret = rswap_recv(sock, buf + total, 1);
 		if (ret <= 0) {
-			ret = -EIO;
+			ret = ret ? ret : -EIO;
 			goto out;
 		}
 		total += ret;
@@ -247,39 +236,45 @@ static int rswap_parse_response(struct socket *sock,
 		goto out;
 	}
 	if (status != 200) {
-		ret = -EIO;
+		ret = status == 404 ? -ENOENT : -EIO;
 		goto out;
 	}
 
-	/* For reads, the body follows the headers. */
-	if (is_read) {
-		body = strstr(buf, "\r\n\r\n");
-		if (!body) {
+	line = strstr(buf, "\r\n");
+	while (line) {
+		char *next;
+
+		line += 2;
+		next = strstr(line, "\r\n");
+		if (!next || next == line)
+			break;
+		*next = '\0';
+		if (!strncasecmp(line, "Content-Length:", 15)) {
+			char *value = skip_spaces(line + 15);
+
+			if (have_length || kstrtoul(value, 10, &content_length)) {
+				ret = -EPROTO;
+				goto out;
+			}
+			have_length = true;
+		} else if (!strncasecmp(line, "Transfer-Encoding:", 18)) {
 			ret = -EPROTO;
 			goto out;
 		}
-		body += 4;
-		body_len = total - (body - buf);
-
-		if (body_len > 0) {
-			size_t copy = min_t(size_t, body_len, datalen);
-			memcpy(data, body, copy);
+		line = next;
+	}
+	if (!have_length || content_length != (is_read ? datalen : 0)) {
+		ret = -EPROTO;
+		goto out;
+	}
+	while (received < content_length) {
+		ret = rswap_recv(sock, data + received,
+				 min_t(size_t, content_length - received, 65536));
+		if (ret <= 0) {
+			ret = ret ? ret : -EIO;
+			goto out;
 		}
-
-		/* If the body is larger than what fit in the header buffer. */
-		if (body_len < (int)datalen) {
-			int need = datalen - body_len;
-			char *p = data + body_len;
-
-			while (need > 0) {
-				ret = rswap_recv(sock, p, min(need, 65536));
-				if (ret <= 0)
-					break;
-				p += ret;
-				need -= ret;
-				body_len += ret;
-			}
-		}
+		received += ret;
 	}
 
 	ret = 0;
@@ -300,48 +295,9 @@ out:
 static void rswap_entry_to_sha256(swp_entry_t entry, char *hex)
 {
 	u8 hash[SHA256_DIGEST_SIZE];
-	struct crypto_shash *tfm;
-	struct shash_desc *desc;
-	int ret;
 
-	tfm = crypto_alloc_shash("sha256", 0, GFP_NOIO);
-	if (IS_ERR(tfm)) {
-		/*
-		 * Fallback: derive a deterministic 256-bit value from the
-		 * swap entry.  This is not cryptographic-grade but sufficient
-		 * for unique key generation.
-		 */
-		u64 v = entry.val;
-		int i;
-
-		for (i = 0; i < SHA256_DIGEST_SIZE; i++) {
-			v = v * 6364136223846793005ULL + 1442695040888963407ULL;
-			hash[i] = (v >> (i * 7)) & 0xff;
-		}
-		goto encode;
-	}
-
-	desc = kzalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_NOIO);
-	if (!desc) {
-		crypto_free_shash(tfm);
-		memset(hash, 0, SHA256_DIGEST_SIZE);
-		goto encode;
-	}
-
-	desc->tfm = tfm;
-	ret = crypto_shash_init(desc);
-	if (ret == 0)
-		ret = crypto_shash_update(desc, (u8 *)&entry.val,
-					  sizeof(entry.val));
-	if (ret == 0)
-		ret = crypto_shash_final(desc, hash);
-	else
-		memset(hash, 0, SHA256_DIGEST_SIZE);
-
-	kfree(desc);
-	crypto_free_shash(tfm);
-
-encode:
+	/* Key generation must not change when reclaim-time allocation fails. */
+	sha256((const u8 *)&entry.val, sizeof(entry.val), hash);
 	bin2hex(hex, hash, SHA256_DIGEST_SIZE);
 	hex[RSWAP_SHA256_HEXLEN] = '\0';
 }
@@ -349,79 +305,88 @@ encode:
 /* ---------- swap_ops implementations ---------- */
 
 /*
- * rswap_submit_write - Send folio data to the KV server via HTTP POST.
- *
- * Called from swap_write_submit().  Uses swap_fs_prepare_rw to set up
- * the completion callback, then sends the HTTP request synchronously.
+ * Submit each base page synchronously and complete the whole swap request.
  */
-static void rswap_submit_write(struct swap_io_ctx *ctx)
+static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 {
 	struct swap_iocb *sio = ctx->sio;
 	struct iov_iter iter;
-	struct socket *sock;
 	char sha256_hex[RSWAP_SHA256_HEXLEN + 1];
-	char *data;
-	int ret;
+	char *data = NULL;
+	int ret = 0;
+	int i;
 	unsigned int noio_flags;
 
-	if (sio->nr_bvecs == 0) {
-		sio->iocb.ki_complete(&sio->iocb, 0);
-		return;
-	}
-
-	/*
-	 * For now, only handle single-page folios.  Multi-page batching
-	 * would need multiple HTTP requests; fall back to an error so the
-	 * swap core retries differently.
-	 */
-	if (sio->nr_bvecs > 1) {
-		pr_debug_ratelimited("multi-page write not supported\n");
-		sio->iocb.ki_complete(&sio->iocb, -EOPNOTSUPP);
-		return;
-	}
-
-	/*
-	 * Mark the current context as NOIO so that every memory
-	 * allocation (socket buffers, skbs, crypto) implicitly strips
-	 * __GFP_IO and cannot recurse into the swap/block layer.
-	 */
 	noio_flags = memalloc_noio_save();
-
-	/* Prepare the iocb / iov_iter and set up the completion handler. */
-	swap_fs_prepare_rw(ctx, WRITE, &iter);
-
-	/* Map the folio data. */
-	data = kmap_local_folio(bvec_folio(&sio->bvecs[0]), 0);
-
-	/* Compute the SHA-256 key. */
-	rswap_entry_to_sha256(bvec_folio(&sio->bvecs[0])->swap, sha256_hex);
-
-	/* Connect and send POST. */
-	sock = rswap_connect();
-	if (IS_ERR(sock)) {
-		kunmap_local(data);
-		memalloc_noio_restore(noio_flags);
-		sio->iocb.ki_complete(&sio->iocb, PTR_ERR(sock));
-		return;
+	swap_fs_prepare_rw(ctx, rw, &iter);
+	data = kmalloc(PAGE_SIZE, GFP_NOIO);
+	if (!data) {
+		ret = -ENOMEM;
+		goto out;
 	}
 
-	ret = rswap_http_post(sock, sha256_hex, data, sio->len);
-	if (ret == 0) {
-		char resp[256];
-		ret = rswap_parse_response(sock, resp, sizeof(resp), false);
+	/*
+	 * Swap-in can split or combine the folios used at swap-out. Store
+	 * each base page under its own entry, independent of folio order.
+	 */
+	for (i = 0; i < sio->nr_bvecs; i++) {
+		struct bio_vec *bv = &sio->bvecs[i];
+		struct folio *folio = bvec_folio(bv);
+		size_t offset;
+
+		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE) {
+			swp_entry_t entry = folio->swap;
+			struct socket *sock;
+			void *mapped;
+
+			entry.val += (bv->bv_offset + offset) >> PAGE_SHIFT;
+			rswap_entry_to_sha256(entry, sha256_hex);
+			if (rw == WRITE) {
+				mapped = kmap_local_folio(folio,
+							 bv->bv_offset + offset);
+				memcpy(data, mapped, PAGE_SIZE);
+				kunmap_local(mapped);
+			}
+			sock = rswap_connect();
+			if (IS_ERR(sock)) {
+				ret = PTR_ERR(sock);
+				goto io_error;
+			}
+			if (rw == WRITE)
+				ret = rswap_http_post(sock, sha256_hex,
+						     data, PAGE_SIZE);
+			else
+				ret = rswap_http_get(sock, sha256_hex);
+			if (!ret)
+				ret = rswap_parse_response(sock, data,
+							   PAGE_SIZE, rw == READ);
+			kernel_sock_shutdown(sock, SHUT_RDWR);
+			sock_release(sock);
+			if (ret)
+				goto io_error;
+			if (rw == READ) {
+				mapped = kmap_local_folio(folio,
+							 bv->bv_offset + offset);
+				memcpy(mapped, data, PAGE_SIZE);
+				kunmap_local(mapped);
+			}
+			continue;
+io_error:
+			pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
+					   rw == WRITE ? "write" : "read",
+					   swp_type(entry), swp_offset(entry), ret);
+			goto out;
+		}
 	}
-
-	kernel_sock_shutdown(sock, SHUT_RDWR);
-	sock_release(sock);
-	kunmap_local(data);
-
+out:
+	kfree(data);
 	memalloc_noio_restore(noio_flags);
-
-	if (ret < 0)
-		pr_debug_ratelimited("write %s failed: %d\n", sha256_hex, ret);
-
-	/* Signal completion (calls swap_fs_write_complete internally). */
 	sio->iocb.ki_complete(&sio->iocb, ret < 0 ? ret : sio->len);
+}
+
+static void rswap_submit_write(struct swap_io_ctx *ctx)
+{
+	rswap_submit(ctx, WRITE);
 }
 
 /*
@@ -431,56 +396,7 @@ static void rswap_submit_write(struct swap_io_ctx *ctx)
  */
 static void rswap_submit_read(struct swap_io_ctx *ctx)
 {
-	struct swap_iocb *sio = ctx->sio;
-	struct iov_iter iter;
-	struct socket *sock;
-	char sha256_hex[RSWAP_SHA256_HEXLEN + 1];
-	char *data;
-	int ret;
-	unsigned int noio_flags;
-
-	if (sio->nr_bvecs == 0) {
-		sio->iocb.ki_complete(&sio->iocb, 0);
-		return;
-	}
-
-	if (sio->nr_bvecs > 1) {
-		pr_debug_ratelimited("multi-page read not supported\n");
-		sio->iocb.ki_complete(&sio->iocb, -EOPNOTSUPP);
-		return;
-	}
-
-	noio_flags = memalloc_noio_save();
-
-	/* Prepare the iocb / iov_iter and set up the completion handler. */
-	swap_fs_prepare_rw(ctx, READ, &iter);
-
-	data = kmap_local_folio(bvec_folio(&sio->bvecs[0]), 0);
-
-	rswap_entry_to_sha256(bvec_folio(&sio->bvecs[0])->swap, sha256_hex);
-
-	sock = rswap_connect();
-	if (IS_ERR(sock)) {
-		kunmap_local(data);
-		memalloc_noio_restore(noio_flags);
-		sio->iocb.ki_complete(&sio->iocb, PTR_ERR(sock));
-		return;
-	}
-
-	ret = rswap_http_get(sock, sha256_hex);
-	if (ret == 0)
-		ret = rswap_parse_response(sock, data, sio->len, true);
-
-	kernel_sock_shutdown(sock, SHUT_RDWR);
-	sock_release(sock);
-	kunmap_local(data);
-
-	memalloc_noio_restore(noio_flags);
-
-	if (ret < 0)
-		pr_debug_ratelimited("read %s failed: %d\n", sha256_hex, ret);
-
-	sio->iocb.ki_complete(&sio->iocb, ret < 0 ? ret : sio->len);
+	rswap_submit(ctx, READ);
 }
 
 /*

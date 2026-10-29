@@ -17773,10 +17773,15 @@ F:	include/linux/swap_ops.h
 F:	include/linux/swapfile.h
 F:	include/linux/swapops.h
 F:	mm/page_io.c
+F:	mm/rswap.c
+F:	mm/rswap.h
 F:	mm/swap.h
 F:	mm/swap_table.h
 F:	mm/swap_state.c
 F:	mm/swapfile.c
+F:	tools/mm/kvswap_server.c
+F:	tools/mm/kvswap_test.py
+F:	tools/mm/rswap*_test.*
 
 MEMORY MANAGEMENT - THP (TRANSPARENT HUGE PAGE)
 M:	Andrew Morton <akpm@linux-foundation.org>
