@@ -66,6 +66,7 @@ Currently, these files are in /proc/sys/vm:
 - panic_on_oom
 - panic_on_unrecoverable_memory_failure
 - percpu_pagelist_high_fraction
+- rswap/attach         (only if CONFIG_RSWAP=y)
 - stat_interval
 - stat_refresh
 - numa_stat
@@ -1027,6 +1028,27 @@ The initial value is zero. Kernel uses this value to set the high pcp->high
 mark based on the low watermark for the zone and the number of local
 online CPUs.  If the user writes '0' to this sysctl, it will revert to
 this default behavior.
+
+
+rswap/attach
+============
+
+This write-only interface is available when ``CONFIG_RSWAP`` is enabled.
+It attaches a SHA-256 digest to an anonymous page in the writing process:
+
+::
+
+    <virtual-address> <64 hexadecimal SHA-256 digits>
+
+The virtual address identifies a page in the caller's address space.  The
+digest must cover the contents of that base page.  rswap keeps the digest in
+page_ext until writeout, then stores it in the device's per-entry table and
+uses it as the remote key-value store key on swapin.
+
+Only users with ``CAP_SYS_ADMIN`` can write this interface.  Writing a new
+digest for the same page replaces the previous one.  The caller must write a
+new digest after modifying the page, otherwise the attached digest no longer
+matches the page contents.
 
 
 stat_interval

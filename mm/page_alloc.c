@@ -46,6 +46,7 @@
 #include <linux/migrate.h>
 #include <linux/sched/mm.h>
 #include <linux/page_owner.h>
+#include <linux/page_ext.h>
 #include <linux/page_table_check.h>
 #include <linux/memcontrol.h>
 #include <linux/ftrace.h>
@@ -1335,6 +1336,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	if (unlikely(PageHWPoison(page)) && !order) {
 		/* Do not let hwpoison pages hit pcplists/buddy */
 		reset_page_owner(page, order);
+		rswap_page_ext_reset(page, order);
 		page_table_check_free(page, order);
 		pgalloc_tag_sub(page, 1 << order);
 
@@ -1401,6 +1403,7 @@ static __always_inline bool __free_pages_prepare(struct page *page,
 	page->flags.f &= ~PAGE_FLAGS_CHECK_AT_PREP;
 	page->private = 0;
 	reset_page_owner(page, order);
+	rswap_page_ext_reset(page, order);
 	page_table_check_free(page, order);
 	pgalloc_tag_sub(page, 1 << order);
 

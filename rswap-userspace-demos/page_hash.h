@@ -1,20 +1,20 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * page_hash.h — Shared type definitions for the page-hash BPF demo
+ * page_hash.h - Definitions for the page-hash userspace tool and prototypes
  *
- * This header is designed to be included by both the BPF program
- * (page_hash_kern.bpf.c) and the userspace program (page_hash_user.c).
+ * The active userspace program attaches digests through the rswap sysctl.
+ * The BPF declarations are retained for the postponed eBPF prototype.
  */
 #ifndef __PAGE_HASH_H
 #define __PAGE_HASH_H
 
-/* SHA-256 produces 32 bytes */
-#define SHA256_DIGEST_LEN  32
+#define RSWAP_HASH_LEN		32
+#define RSWAP_HASH_HEXLEN	(RSWAP_HASH_LEN * 2)
+#define RSWAP_ATTACH_PATH	"/proc/sys/vm/rswap/attach"
 
-/* Compatibility alias for userspace code that still uses HASH_SIZE. */
-#ifndef HASH_SIZE
-#define HASH_SIZE  SHA256_DIGEST_LEN
-#endif
+/* Compatibility names used by the postponed BPF prototype. */
+#define SHA256_DIGEST_LEN	RSWAP_HASH_LEN
+#define HASH_SIZE		RSWAP_HASH_LEN
 
 /* ------------------------------------------------------------------ */
 /*  Per-page metadata (userspace bookkeeping)                          */
@@ -44,6 +44,36 @@ struct get_hash_args {
 	unsigned long long  ptr;
 	unsigned long long  page_size;
 	unsigned char       hash[SHA256_DIGEST_LEN];
+};
+
+/* ------------------------------------------------------------------ */
+/*  BPF hash-map layout                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The postponed BPF prototype uses a BPF_MAP_TYPE_HASH map named "hash_map":
+ *
+ *   key   -> page-aligned userspace address (u64)
+ *   value -> struct page_hash_val (the SHA-256 digest)
+ *
+ * The prototype userspace program computes the digests with OpenSSL and
+ * inserts them; the BPF program only does a map lookup.  Because no __user
+ * memory is ever dereferenced inside the BPF program, the lookup works from
+ * any calling context and is independent of current->mm.
+ */
+
+#define PAGE_HASH_MAP_NAME  "hash_map"
+#define PAGE_HASH_MAX_ENTRIES  65536
+
+/* bpffs paths used by the postponed prototype and its test module. */
+#define PAGE_HASH_PROG_PIN  "/sys/fs/bpf/page_hash_prog"
+#define PAGE_HASH_MAP_PIN   "/sys/fs/bpf/page_hash_map"
+
+/* debugfs trigger file exported by the kernel test module. */
+#define PAGE_HASH_DEBUGFS_RUN  "/sys/kernel/debug/page_hash_test/run"
+
+struct page_hash_val {
+	unsigned char hash[SHA256_DIGEST_LEN];
 };
 
 #endif /* __PAGE_HASH_H */

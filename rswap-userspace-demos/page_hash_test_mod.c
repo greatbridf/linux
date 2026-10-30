@@ -10,8 +10,8 @@
  *   1. Reads the pinned BPF program path (module param or debugfs).
  *   2. Retrieves the BPF program via bpf_prog_get_type_path().
  *   3. Exposes a debugfs file so that userspace can write a page address
- *      and trigger an on-the-spot hash computation.
- *   4. Writes the computed SHA-256 (and a comparison with the user-supplied
+ *      and trigger an on-the-spot hash lookup.
+ *   4. Writes the returned SHA-256 (and a comparison with the user-supplied
  *      expected hash) to the kernel log.
  *
  * == Usage ==
@@ -19,15 +19,16 @@
  *   # Load the module (the BPF program must already be pinned):
  *   insmod page_hash_test_mod.ko prog_path=/sys/fs/bpf/page_hash_prog
  *
- *   # Trigger a test from the process that owns the mmap'd region:
+ *   # Trigger a test (from any process):
  *   echo <page-addr> [expected-hex-hash] > /sys/kernel/debug/page_hash_test/run
  *
  *   # Check kernel log for the result:
  *   dmesg | tail
  *
- * The write handler runs in the context of the calling process, so
- * bpf_probe_read_user() inside the BPF program sees the correct
- * task->mm and can read the page data.
+ * The BPF program only looks the address up in its "hash_map", which
+ * userspace fills from OpenSSL-computed digests.  It never dereferences
+ * user memory, so the result is independent of current->mm and the write
+ * handler may run in the context of any process (or none at all).
  *
  * == Build ==
  *
@@ -65,10 +66,9 @@ MODULE_PARM_DESC(prog_path, "Path to the pinned BPF program in bpffs");
 /* Context struct passed to the SEC("syscall") entry point.
  * Must be identical to struct get_hash_args in page_hash.h.
  */
-/* Must be identical to struct get_hash_args in page_hash.h */
 struct get_hash_args {
 	unsigned long long  ptr;
-	unsigned long long  page_size;  /* ignored by current BPF prog (hardcoded 4096) */
+	unsigned long long  page_size;  /* used to page-align @ptr for the lookup */
 	unsigned char       hash[SHA256_DIGEST_LEN];
 };
 
@@ -146,7 +146,7 @@ static void hex_string(const unsigned char *data, size_t len, char *out)
 static int run_test(unsigned long addr,
 		    const unsigned char *expected, size_t expected_len)
 {
-	struct get_hash_args args = { .ptr = addr };
+	struct get_hash_args args = { .ptr = addr, .page_size = PAGE_SIZE };
 	int ret;
 
 	if (!test_prog) {

@@ -242,8 +242,8 @@ SKIP (exit 4) if no pages leave RAM, avoiding a false integrity pass.
 - This reboot used fresh server storage, not the old truncated objects.
   A successful fresh-data test does not establish integrity of old live
   swap entries or restore bytes already lost by the old implementation.
-- The SHA-256 key hashes the swap entry, not the payload. Exact-length
-  checks and these comparisons do not provide a payload checksum, network
+- The SHA-256 key is supplied by userspace and is not recomputed by the
+  kernel. Exact-length checks and these comparisons do not provide network
   authentication, persistence across server crashes, or cross-client key
   isolation. The endpoint is still hardcoded to loopback.
 - The single-threaded server is not pinned in RAM. Heavy global reclaim
