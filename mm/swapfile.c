@@ -1582,6 +1582,8 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 	/* Remote swap never allocates a zswap tree. */
 	if (!(si->flags & SWP_RSWAP))
 		zswap_invalidate(si->type, offset, nr_entries);
+	else
+		rswap_hash_invalidate(si, offset, nr_entries);
 
 	if (si->flags & SWP_BLKDEV)
 		swap_slot_free_notify =

@@ -5,8 +5,16 @@
  * rswap implements the swap_ops interface to perform swap I/O through an
  * external HTTP key-value store.  On write-out the kernel sends an HTTP
  * POST with the page data; on read-in it sends an HTTP GET.  The KV store
- * key is the SHA-256 hash of the swap entry value, encoded as a hex
- * string.
+ * key is a SHA-256 digest, encoded as a hex string.
+ *
+ * == Keys ==
+ *
+ * The digest is supplied by user space, which knows what a page holds and
+ * attaches the digest to it through /proc/sys/vm/rswap/attach.  The digest
+ * is kept in page_ext until writeout, then copied into a per-device table
+ * indexed by swap offset.  Swapin uses that table entry as the KV key, so
+ * the key does not depend on the page remaining in the swap cache.  Pages
+ * with no attached digest fall back to a digest of the swap entry.
  *
  * == Data flow ==
  *
@@ -40,6 +48,12 @@
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/debugfs.h>
+#include <linux/page_ext.h>
+#include <linux/sysctl.h>
+#include <linux/capability.h>
+#include <linux/sched.h>
+#include <linux/spinlock.h>
+#include <linux/uaccess.h>
 #include <linux/uio.h>
 #include <net/sock.h>
 
@@ -283,23 +297,211 @@ out:
 	return ret;
 }
 
-/* ---------- SHA-256 helpers ---------- */
+/* ---------- Per-page digests (page_ext) ---------- */
 
 /*
- * Compute the SHA-256 hash of the swap entry value and encode it as
- * a hexadecimal string.
- *
- * @entry: the swap entry
- * @hex: output buffer, must be at least RSWAP_SHA256_HEXLEN + 1 bytes
+ * User space attaches a SHA-256 digest to a base page.  Storing it in
+ * page_ext means it follows the folio around: the same page that is
+ * written out is the one kept in the swap cache and read back in, so the
+ * digest survives the round trip without any side table.
  */
-static void rswap_entry_to_sha256(swp_entry_t entry, char *hex)
+struct rswap_page_ext {
+	u8	hash[SHA256_DIGEST_SIZE];
+	bool	valid;
+};
+
+struct rswap_hash_entry {
+	u8	hash[SHA256_DIGEST_SIZE];
+	u8	valid;
+};
+
+static bool need_rswap_page_ext(void)
+{
+	return true;
+}
+
+struct page_ext_operations rswap_page_ext_ops = {
+	.size	= sizeof(struct rswap_page_ext),
+	.need	= need_rswap_page_ext,
+};
+
+static DEFINE_SPINLOCK(rswap_hash_lock);
+
+/* Copy the attached digest out of @page.  False if none is attached. */
+static bool rswap_page_get_hash(struct page *page, u8 *hash)
+{
+	struct page_ext *page_ext = page_ext_get(page);
+	struct rswap_page_ext *re;
+	bool attached = false;
+	unsigned long flags;
+
+	if (!page_ext)
+		return false;
+
+	re = page_ext_data(page_ext, &rswap_page_ext_ops);
+	spin_lock_irqsave(&rswap_hash_lock, flags);
+	if (re->valid) {
+		memcpy(hash, re->hash, SHA256_DIGEST_SIZE);
+		attached = true;
+	}
+	spin_unlock_irqrestore(&rswap_hash_lock, flags);
+	page_ext_put(page_ext);
+	return attached;
+}
+
+/* Attach @hash to @page. */
+static int rswap_page_set_hash(struct page *page, const u8 *hash)
+{
+	struct page_ext *page_ext = page_ext_get(page);
+	struct rswap_page_ext *re;
+	unsigned long flags;
+
+	if (!page_ext)
+		return -ENODEV;
+
+	re = page_ext_data(page_ext, &rswap_page_ext_ops);
+	spin_lock_irqsave(&rswap_hash_lock, flags);
+	memcpy(re->hash, hash, SHA256_DIGEST_SIZE);
+	WRITE_ONCE(re->valid, true);
+	spin_unlock_irqrestore(&rswap_hash_lock, flags);
+	page_ext_put(page_ext);
+	return 0;
+}
+
+/*
+ * page_ext is associated with the physical page, so stale digests must be
+ * cleared when the page returns to the allocator and copied on migration.
+ */
+void rswap_page_ext_reset(struct page *page, unsigned int order)
+{
+	struct page_ext_iter iter;
+	struct page_ext *page_ext;
+	struct rswap_page_ext *re;
+	unsigned long flags;
+
+	rcu_read_lock();
+	for_each_page_ext(page, 1UL << order, page_ext, iter) {
+		re = page_ext_data(page_ext, &rswap_page_ext_ops);
+		if (!READ_ONCE(re->valid))
+			continue;
+		spin_lock_irqsave(&rswap_hash_lock, flags);
+		WRITE_ONCE(re->valid, false);
+		spin_unlock_irqrestore(&rswap_hash_lock, flags);
+	}
+	rcu_read_unlock();
+}
+
+void rswap_page_ext_copy(struct folio *newfolio, struct folio *folio)
+{
+	unsigned long i;
+	unsigned long nr_pages = folio_nr_pages(folio);
+
+	if (WARN_ON_ONCE(folio_nr_pages(newfolio) != nr_pages))
+		return;
+
+	for (i = 0; i < nr_pages; i++) {
+		struct page_ext *old_ext = page_ext_get(folio_page(folio, i));
+		struct page_ext *new_ext;
+		struct rswap_page_ext *new_re;
+		struct rswap_page_ext *old_re;
+		unsigned long flags;
+
+		if (!old_ext)
+			continue;
+
+		old_re = page_ext_data(old_ext, &rswap_page_ext_ops);
+		if (!READ_ONCE(old_re->valid)) {
+			page_ext_put(old_ext);
+			continue;
+		}
+
+		new_ext = page_ext_get(folio_page(newfolio, i));
+		if (!new_ext) {
+			page_ext_put(old_ext);
+			continue;
+		}
+
+		new_re = page_ext_data(new_ext, &rswap_page_ext_ops);
+		spin_lock_irqsave(&rswap_hash_lock, flags);
+		if (old_re->valid) {
+			memcpy(new_re->hash, old_re->hash, SHA256_DIGEST_SIZE);
+			WRITE_ONCE(new_re->valid, true);
+		} else {
+			WRITE_ONCE(new_re->valid, false);
+		}
+		spin_unlock_irqrestore(&rswap_hash_lock, flags);
+		page_ext_put(old_ext);
+		page_ext_put(new_ext);
+	}
+}
+
+static struct rswap_hash_entry *rswap_hash_slot(struct swap_info_struct *si,
+						swp_entry_t entry)
+{
+	unsigned long offset = swp_offset(entry);
+
+	if (!si->rswap_hashes || offset >= si->max)
+		return NULL;
+	return &si->rswap_hashes[offset];
+}
+
+static int rswap_hash_store(struct swap_info_struct *si, swp_entry_t entry,
+			    const u8 *hash)
+{
+	struct rswap_hash_entry *slot = rswap_hash_slot(si, entry);
+
+	if (!slot)
+		return -ENOENT;
+
+	memcpy(slot->hash, hash, SHA256_DIGEST_SIZE);
+	/* Publish the digest before marking the slot valid. */
+	smp_store_release(&slot->valid, 1);
+	return 0;
+}
+
+static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
+			    u8 *hash)
+{
+	struct rswap_hash_entry *slot = rswap_hash_slot(si, entry);
+
+	/* Pair with rswap_hash_store() before reading the digest. */
+	if (!slot || !smp_load_acquire(&slot->valid))
+		return false;
+
+	memcpy(hash, slot->hash, SHA256_DIGEST_SIZE);
+	return true;
+}
+
+/*
+ * rswap_page_key - KV key for one base page, as a hex string.
+ *
+ * @page:  base page of the folio being written or read
+ * @entry: swap entry that backs @page
+ * @hex:   output buffer, at least RSWAP_SHA256_HEXLEN + 1 bytes
+ *
+ * On write, use the digest attached to @page or fall back to a digest of
+ * @entry, then persist it in the device table.  On read, use the persisted
+ * digest so the key does not depend on the page still being in swap cache.
+ */
+static int rswap_page_key(struct swap_info_struct *si, struct page *page,
+			  swp_entry_t entry, int rw, char *hex)
 {
 	u8 hash[SHA256_DIGEST_SIZE];
+	int ret;
 
-	/* Key generation must not change when reclaim-time allocation fails. */
-	sha256((const u8 *)&entry.val, sizeof(entry.val), hash);
+	if (rw == WRITE) {
+		if (!rswap_page_get_hash(page, hash))
+			sha256((const u8 *)&entry.val, sizeof(entry.val), hash);
+		ret = rswap_hash_store(si, entry, hash);
+		if (ret)
+			return ret;
+	} else if (!rswap_hash_load(si, entry, hash)) {
+		return -ENOENT;
+	}
+
 	bin2hex(hex, hash, SHA256_DIGEST_SIZE);
 	hex[RSWAP_SHA256_HEXLEN] = '\0';
+	return 0;
 }
 
 /* ---------- swap_ops implementations ---------- */
@@ -335,15 +537,22 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 		size_t offset;
 
 		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE) {
-			swp_entry_t entry = folio->swap;
+			size_t folio_offset =
+				folio_page_idx(folio, bv->bv_page) * PAGE_SIZE +
+				bv->bv_offset + offset;
+			unsigned int idx = folio_offset / PAGE_SIZE;
+			struct page *page = folio_page(folio, idx);
+			swp_entry_t entry = folio_swap_entry(folio, idx);
+			struct swap_info_struct *si =
+				__swap_entry_to_info(entry);
 			struct socket *sock;
 			void *mapped;
 
-			entry.val += (bv->bv_offset + offset) >> PAGE_SHIFT;
-			rswap_entry_to_sha256(entry, sha256_hex);
+			ret = rswap_page_key(si, page, entry, rw, sha256_hex);
+			if (ret)
+				goto io_error;
 			if (rw == WRITE) {
-				mapped = kmap_local_folio(folio,
-							 bv->bv_offset + offset);
+				mapped = kmap_local_page(page);
 				memcpy(data, mapped, PAGE_SIZE);
 				kunmap_local(mapped);
 			}
@@ -365,8 +574,7 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 			if (ret)
 				goto io_error;
 			if (rw == READ) {
-				mapped = kmap_local_folio(folio,
-							 bv->bv_offset + offset);
+				mapped = kmap_local_page(page);
 				memcpy(mapped, data, PAGE_SIZE);
 				kunmap_local(mapped);
 			}
@@ -419,7 +627,132 @@ static const struct swap_ops kv_swap_ops = {
 	.can_merge	= rswap_can_merge,
 };
 
+/* ---------- sysctl: attach digests to pages ---------- */
+
+static int rswap_attach_page(unsigned long vaddr, const u8 *hash)
+{
+	struct page *pinned_page;
+	struct folio *folio;
+	struct page *page;
+	int got;
+	int ret;
+
+	vaddr = untagged_addr(vaddr) & PAGE_MASK;
+	got = pin_user_pages_fast(vaddr, 1, 0, &pinned_page);
+	if (got != 1)
+		return got < 0 ? got : -EFAULT;
+
+	folio = page_folio(pinned_page);
+	if (is_zero_page(pinned_page) || !folio_test_anon(folio)) {
+		ret = -EINVAL;
+		goto unpin;
+	}
+
+	page = folio_page(folio, folio_page_idx(folio, pinned_page));
+	ret = rswap_page_set_hash(page, hash);
+unpin:
+	unpin_user_page(pinned_page);
+	return ret;
+}
+
+/*
+ * echo "<vaddr> <sha256>" > /proc/sys/vm/rswap/attach
+ */
+static int rswap_attach_sysctl(const struct ctl_table *table, int write,
+			       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	char *str;
+	char *line;
+	char *hash_str;
+	unsigned long vaddr;
+	u8 hash[SHA256_DIGEST_SIZE];
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	if (!write || *ppos)
+		return -EINVAL;
+	if (*lenp >= PAGE_SIZE)
+		return -EINVAL;
+
+	str = kstrndup(buffer, *lenp, GFP_KERNEL);
+	if (!str)
+		return -ENOMEM;
+
+	line = strim(str);
+	hash_str = strpbrk(line, " \t");
+	if (!hash_str) {
+		ret = -EINVAL;
+		goto out;
+	}
+	*hash_str++ = '\0';
+	hash_str = strim(hash_str);
+
+	if (kstrtoul(line, 16, &vaddr) ||
+	    strlen(hash_str) != RSWAP_SHA256_HEXLEN ||
+	    hex2bin(hash, hash_str, SHA256_DIGEST_SIZE)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = rswap_attach_page(vaddr, hash);
+	if (ret)
+		goto out;
+
+	*ppos += *lenp;
+out:
+	kfree(str);
+	return ret;
+}
+
+static const struct ctl_table rswap_sysctls[] = {
+	{
+		.procname	= "attach",
+		.mode		= 0200,
+		.proc_handler	= rswap_attach_sysctl,
+	},
+};
+
+static int __init rswap_sysctl_init(void)
+{
+	register_sysctl_init("vm/rswap", rswap_sysctls);
+	return 0;
+}
+late_initcall(rswap_sysctl_init);
+
 /* ---------- Device setup / teardown ---------- */
+
+static int rswap_hashes_alloc(struct swap_info_struct *si)
+{
+	si->rswap_hashes = kvcalloc(si->max, sizeof(*si->rswap_hashes),
+				    GFP_KERNEL);
+	if (!si->rswap_hashes)
+		return -ENOMEM;
+	return 0;
+}
+
+static void rswap_hashes_free(struct swap_info_struct *si)
+{
+	kvfree(si->rswap_hashes);
+	si->rswap_hashes = NULL;
+}
+
+void rswap_hash_invalidate(struct swap_info_struct *si, unsigned long offset,
+			   unsigned int nr_entries)
+{
+	unsigned long end;
+
+	if (!si->rswap_hashes)
+		return;
+	if (offset >= si->max)
+		return;
+
+	end = offset + min_t(unsigned long, nr_entries, si->max - offset);
+	for (; offset < end; offset++) {
+		/* Pair with rswap_hash_load() as the swap entry is released. */
+		smp_store_release(&si->rswap_hashes[offset].valid, 0);
+	}
+}
 
 int rswap_enable(struct swap_info_struct *si)
 {
@@ -427,6 +760,10 @@ int rswap_enable(struct swap_info_struct *si)
 
 	if (!(si->flags & SWP_XSWAP))
 		return -EINVAL;
+
+	ret = rswap_hashes_alloc(si);
+	if (ret)
+		return ret;
 
 	/*
 	 * Register our swap_ops.  From this point on, the swap core calls
@@ -437,14 +774,16 @@ int rswap_enable(struct swap_info_struct *si)
 	 * the caller can use the conventional if (ret < 0) error check.
 	 */
 	ret = swap_fs_activate(si, &kv_swap_ops);
-	if (ret < 0)
+	if (ret < 0) {
+		rswap_hashes_free(si);
 		return ret;
+	}
 	return 0;
 }
 
 void rswap_disable(struct swap_info_struct *si)
 {
-	/* Nothing to do for now. */
+	rswap_hashes_free(si);
 }
 
 void rswap_swapoff(struct swap_info_struct *si)

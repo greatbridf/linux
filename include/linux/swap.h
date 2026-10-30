@@ -235,6 +235,10 @@ struct swap_sequential_cluster {
 /*
  * The in-memory structure used to track swap areas.
  */
+#ifdef CONFIG_RSWAP
+struct rswap_hash_entry;
+#endif
+
 struct swap_info_struct {
 	struct percpu_ref users;	/* indicate and keep swap device valid. */
 	unsigned long	flags;		/* SWP_USED etc: see above */
@@ -256,6 +260,7 @@ struct swap_info_struct {
 #ifdef CONFIG_RSWAP
 	struct dentry		*rswap_dentry;	/* debugfs directory */
 	u32			*rswap_kv_port;	/* KV server port for debugfs */
+	struct rswap_hash_entry	*rswap_hashes;	/* digest indexed by swap offset */
 #endif /* CONFIG_RSWAP */
 
 	struct list_head free_clusters; /* free clusters list */

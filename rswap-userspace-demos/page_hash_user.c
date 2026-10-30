@@ -1,83 +1,44 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * page_hash_user.c — Userspace program for page-hashing demo
+ * page_hash_user.c - attach SHA-256 digests to mapped pages
  *
- * == Overview ==
+ * The program maps anonymous memory, fills it with a deterministic pattern,
+ * hashes every base page, and writes each digest to the rswap sysctl:
  *
- * This program performs the four requested steps:
+ *   <virtual-address> <sha256-hex>
  *
- *   1. mmap a block of anonymous memory and write a deterministic data
- *      pattern to each page.
- *   2. Allocate per-page metadata (struct page_meta) storing the page
- *      address.
- *   3. Compute the SHA-256 hash of every page using libcrypto (OpenSSL)
- *      and store it in the metadata array.
- *   4. Load the pre-compiled BPF program (page_hash_kern.bpf.o), then
- *      invoke it on each page via BPF_PROG_TEST_RUN and verify that the
- *      hash computed on-the-fly by the BPF program (using
- *      bpf_probe_read_user() to fetch page data from userspace) matches
- *      the OpenSSL-computed hash.
- *
- * The BPF program itself implements:
- *
- *   bool get_hash_for_addr(void *__user ptr, char out_hash[32]);
- *
- * See page_hash_kern.bpf.c for the full implementation.
- *
- * == Usage ==
- *
- *   ./page_hash_user [size_MiB]
- *
- *   size_MiB  — size of the mmap region in mebibytes (default 8)
- *
- * The program must be run as root (or with CAP_BPF) to load the BPF
- * program and execute BPF_PROG_TEST_RUN.
- *
- * == Build ==
- *
- *   make all
- *
- * Requires: clang (BPF target), libssl-dev, libelf-dev, libz-dev, libbpf.
+ * The mapping remains resident until the program is interrupted so the
+ * attached page_ext metadata can be exercised by rswap.
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <sys/mman.h>
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
+#include <unistd.h>
+
 #include <openssl/evp.h>
 
 #include "page_hash.h"
 
-/* ------------------------------------------------------------------ */
-/*  Constants                                                         */
-/* ------------------------------------------------------------------ */
+#define DEFAULT_SIZE_MIB	8
+#define MIB_TO_BYTES		(1024UL * 1024UL)
+#define ATTACH_LINE_SIZE	(2 * sizeof(unsigned long) + \
+				 RSWAP_HASH_HEXLEN + 6)
 
-#define DEFAULT_SIZE_MIB  8
-
-/* ------------------------------------------------------------------ */
-/*  Signal handling                                                   */
-/* ------------------------------------------------------------------ */
-
-static volatile bool keep_running = true;
+static volatile sig_atomic_t keep_running = 1;
 
 static void handle_signal(int sig)
 {
 	(void)sig;
-	keep_running = false;
+	keep_running = 0;
 }
-
-/* ------------------------------------------------------------------ */
-/*  Deterministic pattern (same pattern as tools/mm/rswap_test.c)     */
-/* ------------------------------------------------------------------ */
 
 static uint64_t pattern(uint64_t word, uint64_t seed)
 {
@@ -88,298 +49,184 @@ static uint64_t pattern(uint64_t word, uint64_t seed)
 	return value ^ (value >> 31);
 }
 
-/* ------------------------------------------------------------------ */
-/*  SHA-256 via OpenSSL                                               */
-/* ------------------------------------------------------------------ */
-
-static bool sha256_page(const unsigned char *page_data, size_t page_size,
-			unsigned char out_hash[HASH_SIZE])
+static bool sha256_page(EVP_MD_CTX *ctx, const unsigned char *data,
+			size_t len, unsigned char out[RSWAP_HASH_LEN])
 {
-	EVP_MD_CTX *mdctx;
-	unsigned int md_len;
-	bool ok = false;
+	unsigned int out_len;
 
-	mdctx = EVP_MD_CTX_new();
-	if (!mdctx)
+	return EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+	       EVP_DigestUpdate(ctx, data, len) == 1 &&
+	       EVP_DigestFinal_ex(ctx, out, &out_len) == 1 &&
+	       out_len == RSWAP_HASH_LEN;
+}
+
+static void hash_to_hex(const unsigned char hash[RSWAP_HASH_LEN],
+			char hex[RSWAP_HASH_HEXLEN + 1])
+{
+	static const char digits[] = "0123456789abcdef";
+	size_t i;
+
+	for (i = 0; i < RSWAP_HASH_LEN; i++) {
+		hex[i * 2] = digits[hash[i] >> 4];
+		hex[i * 2 + 1] = digits[hash[i] & 0xf];
+	}
+	hex[RSWAP_HASH_HEXLEN] = '\0';
+}
+
+static bool attach_hash(int fd, unsigned long addr,
+			const unsigned char hash[RSWAP_HASH_LEN])
+{
+	char hex[RSWAP_HASH_HEXLEN + 1];
+	char line[ATTACH_LINE_SIZE];
+	ssize_t written;
+	size_t len;
+
+	hash_to_hex(hash, hex);
+	len = snprintf(line, sizeof(line), "%#lx %s\n", addr, hex);
+	if (len >= sizeof(line)) {
+		errno = EOVERFLOW;
 		return false;
+	}
 
-	if (EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL) == 1 &&
-	    EVP_DigestUpdate(mdctx, page_data, page_size) == 1 &&
-	    EVP_DigestFinal_ex(mdctx, out_hash, &md_len) == 1 &&
-	    md_len == HASH_SIZE)
-		ok = true;
+	do {
+		written = write(fd, line, len);
+	} while (written < 0 && errno == EINTR);
 
-	EVP_MD_CTX_free(mdctx);
-	return ok;
+	if (written < 0)
+		return false;
+	if ((size_t)written != len) {
+		errno = EIO;
+		return false;
+	}
+	return true;
 }
 
-/* Print a hash to stderr as hex. */
-static void print_hash(const unsigned char h[HASH_SIZE])
+static int parse_size_mib(int argc, char **argv, size_t *size_mib)
 {
-	for (int i = 0; i < HASH_SIZE; i++)
-		fprintf(stderr, "%02x", h[i]);
-}
+	unsigned long long value;
+	char *end;
 
-/* Compare two hashes; return true if identical. */
-static bool hash_eq(const unsigned char a[HASH_SIZE],
-		    const unsigned char b[HASH_SIZE])
-{
-	return memcmp(a, b, HASH_SIZE) == 0;
-}
+	value = DEFAULT_SIZE_MIB;
+	if (argc > 2) {
+		fprintf(stderr, "Usage: %s [size_MiB]\n", argv[0]);
+		return -1;
+	}
 
-/* ------------------------------------------------------------------ */
-/*  Main                                                              */
-/* ------------------------------------------------------------------ */
+	if (argc == 2) {
+		errno = 0;
+		value = strtoull(argv[1], &end, 10);
+		if (errno || end == argv[1] || *end || !value ||
+		    value > SIZE_MAX / MIB_TO_BYTES) {
+			fprintf(stderr, "Invalid size: %s\n", argv[1]);
+			return -1;
+		}
+	}
+
+	*size_mib = value;
+	return 0;
+}
 
 int main(int argc, char **argv)
 {
-	size_t size_mib  = argc > 1 ? strtoul(argv[1], NULL, 10) : DEFAULT_SIZE_MIB;
-	const size_t page_size   = sysconf(_SC_PAGESIZE);
-	const size_t nr_pages    = (size_mib << 20) / page_size;
-	const size_t region_size = nr_pages * page_size;
-
-	unsigned char *mapping  = NULL;
-	struct page_meta *meta  = NULL;
-	struct bpf_object *obj  = NULL;
-	int prog_fd             = -1;
-	int ret                 = 0;
+	unsigned char *mapping = MAP_FAILED;
+	unsigned char first_hash[RSWAP_HASH_LEN] = { 0 };
+	EVP_MD_CTX *ctx = NULL;
+	size_t size_mib;
+	long page_size;
+	size_t nr_pages;
+	size_t region_size;
+	uint64_t seed;
 	size_t i;
+	int attach_fd = -1;
+	int ret = 1;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	setvbuf(stderr, NULL, _IOLBF, 0);
 
-	signal(SIGINT,  handle_signal);
-	signal(SIGTERM, handle_signal);
+	if (parse_size_mib(argc, argv, &size_mib))
+		return 1;
 
-	printf("=== Page Hash BPF Demo (on-the-fly SHA-256) ===\n");
-	printf("  Region size : %zu MiB (%zu pages, %zu KiB total)\n",
-	       size_mib, nr_pages, region_size / 1024);
-	printf("  Page size   : %zu bytes\n", page_size);
+	page_size = sysconf(_SC_PAGESIZE);
+	if (page_size <= 0) {
+		perror("sysconf(_SC_PAGESIZE)");
+		return 1;
+	}
 
-	/* --------------------------------------------------------------- */
-	/*  1. mmap anonymous memory and fill with pattern                  */
-	/* --------------------------------------------------------------- */
+	nr_pages = size_mib * MIB_TO_BYTES / (size_t)page_size;
+	region_size = nr_pages * (size_t)page_size;
+	printf("=== rswap page hash attach ===\n");
+	printf("  Region      : %zu MiB (%zu pages, %ld-byte pages)\n",
+	       size_mib, nr_pages, page_size);
+	printf("  Sysctl      : %s\n", RSWAP_ATTACH_PATH);
+
+	attach_fd = open(RSWAP_ATTACH_PATH, O_WRONLY);
+	if (attach_fd < 0) {
+		fprintf(stderr, "Cannot open %s: %s\n",
+			RSWAP_ATTACH_PATH, strerror(errno));
+		goto out;
+	}
 
 	mapping = mmap(NULL, region_size, PROT_READ | PROT_WRITE,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (mapping == MAP_FAILED) {
 		perror("mmap");
-		return 1;
+		goto out;
 	}
-	printf("  Mapping     : %p .. %p\n", (void *)mapping,
-	       (void *)((unsigned char *)mapping + region_size - 1));
+	printf("  Mapping     : %p .. %p\n", mapping,
+	       mapping + region_size - 1);
 
-	/* Lock so pages stay resident. */
 	if (mlock(mapping, region_size))
-		perror("  (mlock non-fatal)");
+		fprintf(stderr, "  Warning: mlock: %s\n", strerror(errno));
 
-	const uint64_t seed = (uint64_t)getpid() ^ (uint64_t)0xdeadbeefcafeULL;
-	for (size_t j = 0; j < region_size / sizeof(uint64_t); j++)
-		((uint64_t *)mapping)[j] = pattern(j, seed);
+	seed = (uint64_t)getpid() ^ UINT64_C(0xdeadbeefcafe);
+	for (i = 0; i < region_size / sizeof(uint64_t); i++)
+		((uint64_t *)mapping)[i] = pattern(i, seed);
+	printf("  Pattern     : seeded with %#llx\n",
+	       (unsigned long long)seed);
 
-	printf("  Data written: deterministic pattern (seed=%#lx)\n", seed);
-
-	/* --------------------------------------------------------------- */
-	/*  2–3. Allocate metadata and compute SHA-256 with OpenSSL        */
-	/* --------------------------------------------------------------- */
-
-	meta = calloc(nr_pages, sizeof(*meta));
-	if (!meta) {
-		perror("calloc");
-		ret = 1;
-		goto cleanup;
+	ctx = EVP_MD_CTX_new();
+	if (!ctx) {
+		fprintf(stderr, "Cannot allocate an OpenSSL digest context\n");
+		goto out;
 	}
 
-	printf("  Computing SHA-256 (userspace, OpenSSL)... ");
-	fflush(stdout);
-	/* We hash a fixed 4096-byte window per page (matching the BPF
-	 * program's HASH_WINDOW).  This avoids verifier loop-limit issues
-	 * on systems with 16K or 64K pages.
-	 */
-#define HASH_WINDOW  4096ul
-
+	printf("  Attaching   : 0/%zu", nr_pages);
 	for (i = 0; i < nr_pages; i++) {
-		meta[i].addr = (unsigned long)(mapping + i * page_size);
-		if (!sha256_page(mapping + i * page_size, HASH_WINDOW,
-				 meta[i].hash)) {
-			fprintf(stderr, "\n  ERROR: SHA-256 failed at page %zu\n", i);
-			ret = 1;
-			goto cleanup;
+		unsigned char hash[RSWAP_HASH_LEN];
+		unsigned long addr = (unsigned long)(mapping + i * page_size);
+
+		if (!sha256_page(ctx, mapping + i * page_size, page_size, hash)) {
+			fprintf(stderr, "\nCannot hash page %zu\n", i);
+			goto out;
 		}
-	}
-	printf("done.\n");
-
-	fprintf(stderr, "  Hash[0]     : ");
-	print_hash(meta[0].hash);
-	fprintf(stderr, "\n");
-
-	/* --------------------------------------------------------------- */
-	/*  4. Load BPF program and verify on-the-fly computation          */
-	/* --------------------------------------------------------------- */
-
-	obj = bpf_object__open_file("page_hash_kern.bpf.o", NULL);
-	if (!obj) {
-		fprintf(stderr, "ERROR: cannot open page_hash_kern.bpf.o\n");
-		ret = 1;
-		goto cleanup;
-	}
-
-	ret = bpf_object__load(obj);
-	if (ret) {
-		fprintf(stderr, "ERROR: bpf_object__load: %s\n", strerror(-ret));
-		ret = 1;
-		goto cleanup;
-	}
-	printf("  BPF object  : loaded successfully\n");
-
-	{
-		struct bpf_program *prog;
-
-		prog = bpf_object__find_program_by_name(obj, "lookup_hash_entry");
-		if (!prog) {
-			fprintf(stderr, "ERROR: cannot find prog 'lookup_hash_entry'\n");
-			ret = 1;
-			goto cleanup;
+		if (!attach_hash(attach_fd, addr, hash)) {
+			fprintf(stderr, "\nCannot attach page %zu at %#lx: %s\n",
+				i, addr, strerror(errno));
+			goto out;
 		}
-		prog_fd = bpf_program__fd(prog);
+		if (!i)
+			memcpy(first_hash, hash, sizeof(first_hash));
 	}
-	printf("  BPF prog fd : %d\n", prog_fd);
+	printf("\r  Attached    : %zu/%zu pages\n", nr_pages, nr_pages);
 
-	/* --------------------------------------------------------------- */
-	/*  Verify — call the BPF program on every page and compare hashes  */
-	/* --------------------------------------------------------------- */
+	printf("  Hash[0]     : ");
+	for (i = 0; i < RSWAP_HASH_LEN; i++)
+		printf("%02x", first_hash[i]);
+	printf("\n");
 
-	printf("\n  Verifying BPF on-the-fly hash vs OpenSSL...\n");
-	fflush(stdout);
-
-	int           errors  = 0;
-
-	for (i = 0; i < nr_pages; i++) {
-		/* Prepare test-run context.
-		 *
-		 * IMPORTANT: bpf_prog_test_run_syscall() rejects any test run
-		 * that sets ctx_out, duration, repeat, flags, or batch_size.
-		 * It writes the context back to *ctx_in* in-place (the same
-		 * buffer).  So we use one buffer for both input and output.
-		 */
-		struct get_hash_args args = {
-			.ptr      = meta[i].addr,
-			.page_size = HASH_WINDOW,
-		};
-		struct bpf_test_run_opts opts = {
-			.sz           = sizeof(opts),
-			.ctx_in       = &args,
-			.ctx_size_in  = sizeof(args),
-			.ctx_out      = NULL,
-			.ctx_size_out = 0,
-			.repeat       = 0,
-		};
-		unsigned char bpf_hash[HASH_SIZE];
-		int bpf_ret;
-
-		/* Run the BPF program. */
-		ret = bpf_prog_test_run_opts(prog_fd, &opts);
-		if (ret) {
-			fprintf(stderr, "\n  ERROR: BPF_PROG_TEST_RUN failed at "
-				"page %zu: %s\n", i, strerror(-ret));
-			errors++;
-			continue;
-		}
-
-		bpf_ret = opts.retval;
-		/* The hash was written back into args.hash (same buffer). */
-		memcpy(bpf_hash, args.hash, HASH_SIZE);
-
-		/* Compare. */
-		if (bpf_ret != 0) {
-			fprintf(stderr, "\n  ERROR: BPF prog returned %d at "
-				"page %zu (should be 0)\n", bpf_ret, i);
-			errors++;
-			continue;
-		}
-
-		if (!hash_eq(bpf_hash, meta[i].hash)) {
-			fprintf(stderr, "\n  MISMATCH at page %zu:\n"
-				"    OpenSSL  : ", i);
-			print_hash(meta[i].hash);
-			fprintf(stderr, "\n    BPF      : ");
-			print_hash(bpf_hash);
-			fprintf(stderr, "\n");
-			errors++;
-			if (errors >= 3) {
-				fprintf(stderr, "  (too many errors, aborting)\n");
-				ret = 1;
-				goto cleanup;
-			}
-		}
-
-		if (i < 5 || i == nr_pages - 1) {
-			printf("  Page %5zu @ %#lx: %s\n",
-			       i, meta[i].addr,
-			       hash_eq(bpf_hash, meta[i].hash) ? "MATCH" : "MISMATCH");
-		}
-	}
-	if (nr_pages > 5)
-		printf("  ... (first 5 pages shown, %zu total)\n", nr_pages);
-
-	/* --------------------------------------------------------------- */
-	/*  Summary                                                        */
-	/* --------------------------------------------------------------- */
-
-	printf("\n  === Results ===\n");
-	if (errors == 0) {
-		printf("  All %zu pages: BPF on-the-fly SHA-256 matches OpenSSL.\n",
-		       nr_pages);
-	} else {
-		printf("  %d / %zu pages had mismatches.\n", errors, nr_pages);
-		ret = 1;
-	}
-
-	/* --------------------------------------------------------------- */
-	/*  Done — keep the mapping alive until Ctrl+C                     */
-	/* --------------------------------------------------------------- */
-
-	/* Also write a test to the kernel module's debugfs file (if loaded).
-	 * This exercises the kernel-module path from the correct process context
-	 * so that bpf_probe_read_user() can access our mmap'd pages.
-	 */
-	{
-		char cmd[512];
-		int dbg_fd = open("/sys/kernel/debug/page_hash_test/run", O_WRONLY);
-
-		if (dbg_fd >= 0) {
-			/* Format: "<addr> <expected-hex-hash>" */
-			snprintf(cmd, sizeof(cmd), "%#lx %s\n",
-				 meta[0].addr, "" /* filled below */);
-			/* Append the hex hash. */
-			{
-				char *p = cmd + strlen(cmd);
-				for (int i = 0; i < 32; i++)
-					p += sprintf(p, "%02x", meta[0].hash[i]);
-				*p++ = '\n';
-				*p = '\0';
-			}
-			ret = write(dbg_fd, cmd, strlen(cmd));
-			if (ret < 0)
-				perror("  WARNING: debugfs write");
-			else
-				printf("  Debugfs test  : written (check dmesg)\n");
-			close(dbg_fd);
-		}
-	}
-
-	printf("\n  Press Ctrl+C to release memory and cleanup.\n");
-	fflush(stdout);
+	signal(SIGINT, handle_signal);
+	signal(SIGTERM, handle_signal);
+	printf("Press Ctrl+C to release the mapping.\n");
 	while (keep_running)
-		pause();
+		sleep(1);
 
-cleanup:
-	printf("\n  Cleaning up...\n");
-	if (obj)
-		bpf_object__close(obj);
-	free(meta);
-	if (mapping && mapping != MAP_FAILED)
+	ret = 0;
+out:
+	if (ctx)
+		EVP_MD_CTX_free(ctx);
+	if (mapping != MAP_FAILED)
 		munmap(mapping, region_size);
-	printf("  Done.\n");
+	if (attach_fd >= 0)
+		close(attach_fd);
 	return ret;
 }

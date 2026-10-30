@@ -37,6 +37,7 @@
 #include <linux/gfp.h>
 #include <linux/page_idle.h>
 #include <linux/page_owner.h>
+#include <linux/page_ext.h>
 #include <linux/sched/mm.h>
 #include <linux/ptrace.h>
 #include <linux/memory.h>
@@ -856,6 +857,7 @@ void folio_migrate_flags(struct folio *newfolio, struct folio *folio)
 		folio_set_readahead(newfolio);
 
 	folio_copy_owner(newfolio, folio);
+	rswap_page_ext_copy(newfolio, folio);
 	pgalloc_tag_swap(newfolio, folio);
 
 	mem_cgroup_migrate(folio, newfolio);

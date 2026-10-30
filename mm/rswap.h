@@ -4,7 +4,10 @@
  *
  * rswap is a swap backend that implements the swap_ops interface to
  * store swap pages in an external key-value store reachable over HTTP.
- * The KV store key is the SHA-256 hash of the swap entry value.
+ * The KV store key is a SHA-256 hash attached by user space through
+ * /proc/sys/vm/rswap/attach.  The hash is copied into a per-device table
+ * indexed by swap offset at writeout and reused at swapin.  For unattached
+ * pages, a hash of the swap entry value is stored in the same table.
  *
  * == Setup ==
  *
@@ -33,6 +36,8 @@
 int  rswap_enable(struct swap_info_struct *si);
 void rswap_disable(struct swap_info_struct *si);
 void rswap_swapoff(struct swap_info_struct *si);
+void rswap_hash_invalidate(struct swap_info_struct *si, unsigned long offset,
+			   unsigned int nr_entries);
 
 /* debugfs */
 void rswap_debugfs_add(struct swap_info_struct *si);
@@ -43,6 +48,9 @@ void rswap_debugfs_del(struct swap_info_struct *si);
 static inline int  rswap_enable(struct swap_info_struct *si) { return -EOPNOTSUPP; }
 static inline void rswap_disable(struct swap_info_struct *si) { }
 static inline void rswap_swapoff(struct swap_info_struct *si) { }
+static inline void rswap_hash_invalidate(struct swap_info_struct *si,
+					 unsigned long offset,
+					 unsigned int nr_entries) { }
 static inline void rswap_debugfs_add(struct swap_info_struct *si) { }
 static inline void rswap_debugfs_del(struct swap_info_struct *si) { }
 

@@ -133,16 +133,26 @@ config XSWAP
 
 config RSWAP
 	bool "Remote Swap (rswap) - HTTP KV store backend"
-	depends on XSWAP && INET
+	depends on XSWAP && INET && SYSCTL
 	select CRYPTO_LIB_SHA256
+	select PAGE_EXTENSION
 	help
 	  Adds support for remote swap (rswap) devices.  rswap implements the
 	  swap_ops interface to store swap pages in an external HTTP key-value
 	  store.  On swap-out the kernel sends an HTTP POST with the page data;
 	  on swap-in it sends an HTTP GET.
 
+	  The KV store is keyed by a SHA-256 digest that user space attaches
+	  to a page through /proc/sys/vm/rswap/attach.  The digest is kept in
+	  page_ext until writeout and then stored in a per-device table for
+	  swapin.  Pages without an attached digest use a digest of the swap
+	  entry.
+
+	  The attach file accepts:
+	    <virtual-address> <64 hexadecimal SHA-256 digits>
+
 	  The KV store server runs at 127.0.0.1:6789 and stores each page as
-	  a file named by the SHA-256 hash of the swap entry.
+	  a file named by the SHA-256 digest.
 
 	  To use:
 	    1. Build and start the KV server (tools/mm/kvswap_server.c)
