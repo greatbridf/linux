@@ -96,6 +96,11 @@ extern struct page_ext *page_ext_from_phys(phys_addr_t phys);
 extern void page_ext_put(struct page_ext *page_ext);
 extern struct page_ext *page_ext_lookup(unsigned long pfn);
 
+#ifdef CONFIG_RSWAP
+/* Per-page SHA-256 digests attached by user space for remote swap. */
+extern struct page_ext_operations rswap_page_ext_ops;
+#endif
+
 static inline void *page_ext_data(struct page_ext *page_ext,
 				  struct page_ext_operations *ops)
 {
