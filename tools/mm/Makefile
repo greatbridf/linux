@@ -27,6 +27,9 @@ $(LIBS):
 gup_bench: $(GUP_BENCH_OBJS) $(LIBS)
 	$(CC) $(CFLAGS) -o $@ $(GUP_BENCH_OBJS) $(LDFLAGS)
 
+rswap_test: rswap_test.c $(LIBS)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lcrypto
+
 clean:
 	$(RM) $(BUILD_TARGETS)
 	make -C $(LIB_DIR) clean
