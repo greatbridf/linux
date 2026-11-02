@@ -14,7 +14,7 @@
  * is kept in page_ext until writeout, then copied into a per-device table
  * indexed by swap offset.  Swapin uses that table entry as the KV key, so
  * the key does not depend on the page remaining in the swap cache.  Pages
- * with no attached digest fall back to a digest of the swap entry.
+ * without an attached digest cannot be written to rswap.
  *
  * == Data flow ==
  *
@@ -479,9 +479,9 @@ static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
  * @entry: swap entry that backs @page
  * @hex:   output buffer, at least RSWAP_SHA256_HEXLEN + 1 bytes
  *
- * On write, use the digest attached to @page or fall back to a digest of
- * @entry, then persist it in the device table.  On read, use the persisted
- * digest so the key does not depend on the page still being in swap cache.
+ * On write, persist the digest attached to @page in the device table.  On
+ * read, use the persisted digest so the key does not depend on the page
+ * still being in swap cache.
  */
 static int rswap_page_key(struct swap_info_struct *si, struct page *page,
 			  swp_entry_t entry, int rw, char *hex)
@@ -491,7 +491,7 @@ static int rswap_page_key(struct swap_info_struct *si, struct page *page,
 
 	if (rw == WRITE) {
 		if (!rswap_page_get_hash(page, hash))
-			sha256((const u8 *)&entry.val, sizeof(entry.val), hash);
+			return -ENODATA;
 		ret = rswap_hash_store(si, entry, hash);
 		if (ret)
 			return ret;
@@ -670,7 +670,7 @@ static int rswap_attach_sysctl(const struct ctl_table *table, int write,
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	if (!write || *ppos)
+	if (!write)
 		return -EINVAL;
 	if (*lenp >= PAGE_SIZE)
 		return -EINVAL;

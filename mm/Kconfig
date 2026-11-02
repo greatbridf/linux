@@ -145,8 +145,8 @@ config RSWAP
 	  The KV store is keyed by a SHA-256 digest that user space attaches
 	  to a page through /proc/sys/vm/rswap/attach.  The digest is kept in
 	  page_ext until writeout and then stored in a per-device table for
-	  swapin.  Pages without an attached digest use a digest of the swap
-	  entry.
+	  swapin.  Pages without an attached digest cannot be written to the
+	  remote device.
 
 	  The attach file accepts:
 	    <virtual-address> <64 hexadecimal SHA-256 digits>

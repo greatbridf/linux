@@ -1043,7 +1043,9 @@ It attaches a SHA-256 digest to an anonymous page in the writing process:
 The virtual address identifies a page in the caller's address space.  The
 digest must cover the contents of that base page.  rswap keeps the digest in
 page_ext until writeout, then stores it in the device's per-entry table and
-uses it as the remote key-value store key on swapin.
+uses it as the remote key-value store key on swapin.  rswap rejects writeout
+for a page with no attached digest; it never derives a key from the swap
+entry.
 
 Only users with ``CAP_SYS_ADMIN`` can write this interface.  Writing a new
 digest for the same page replaces the previous one.  The caller must write a
