@@ -92,6 +92,7 @@ int main(int argc, char **argv)
 	size_t page_size = sysconf(_SC_PAGESIZE);
 	unsigned int rounds = 3;
 	uint64_t *data;
+	uint64_t base_seed;
 	unsigned char *resident;
 	unsigned int round;
 	int huge = argc > 3 && !strcmp(argv[3], "huge");
@@ -146,9 +147,15 @@ int main(int argc, char **argv)
 	printf("Testing %zu KiB, %zu-byte pages, %u rounds, %s\n",
 	       size / 1024, page_size, rounds, huge ? "THP" : "base pages");
 
+	/*
+	 * One base seed per process, mixed once per round.  Deriving the round
+	 * seed as (base ^ round) collides when the clock ticks between rounds
+	 * (T + 1 ^ 1 == T), which silently repeats the previous round's page
+	 * contents and therefore its backend keys.
+	 */
+	base_seed = ((uint64_t)getpid() << 32) ^ (uint64_t)time(NULL);
 	for (round = 0; round < rounds; round++) {
-		uint64_t seed = ((uint64_t)getpid() << 32) ^
-				(uint64_t)time(NULL) ^ round;
+		uint64_t seed = pattern(round, base_seed);
 		size_t i, evicted = 0, mismatches = 0;
 
 		for (i = 0; i < size / sizeof(*data); i++)
