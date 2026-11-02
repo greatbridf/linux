@@ -46,7 +46,7 @@ backends ship with the kernel:
 
 Both are deliberately simple:
 
-- The core hands a backend up to `RSWAP_BATCH_MAX` (8) pages at a time, which
+- The core hands a backend up to `RSWAP_BATCH_MAX` (32) pages at a time, which
   the Redis backend pipelines into a single write; HTTP/1.0 carries one object
   per request and turns a batch into a sequence of requests.
 - The Redis backend pools connections (`RSWAP_REDIS_POOL_MAX` = 8) and reuses
@@ -524,6 +524,10 @@ Batching and its effect (`RSWAP_BATCH_MAX` = 8, remote server, per page):
   batch (TCP slow start), settling at 13-15 ms per batch once warm. So the
   connection, not the batch size, was the bottleneck; pooling it takes a batch
   from 71 ms to 25 ms in the harness (15 ms steady state).
+- With a warm pooled connection the batch size then pays: 8 pages per batch
+  cost 15.9 ms (2.0 ms/page), 16 pages 17.6 ms (1.1 ms/page) and 32 pages
+  22.3 ms (0.7 ms/page), against a ~12 ms path round trip. That is why
+  `RSWAP_BATCH_MAX` is 32: one round trip per 512 KiB.
 - The live verifier used to spend ~60 ms per page operation; that is one TCP
   connect plus one RESP round trip to a proxied endpoint, not kernel time (the
   loopback HTTP backend does 0.09 ms per page operation).
@@ -560,9 +564,11 @@ path.
   throughput. A backend switch needs a reboot, and the backend for a device is
   never recorded, so a device written with one backend cannot be read back
   with another.
-- `RSWAP_BATCH_MAX` also bounds the core's bounce buffer (8 base pages, 128 KiB
-  with 16 KiB pages); raising it trades memory in the swap I/O path for fewer
-  round trips.
+- `RSWAP_BATCH_MAX` also bounds the core's per-request batch buffer (32 base
+  pages: 128 KiB with 4 KiB pages, 512 KiB with 16 KiB pages), kvmalloc'ed for
+  the duration of a request, plus the same amount again in the Redis request
+  buffer. That memory buys fewer round trips; with several CPUs in the swap I/O
+  path at once the transient cost is a few MiB.
 - There is no active eBPF integration.
 
 ## eBPF Status

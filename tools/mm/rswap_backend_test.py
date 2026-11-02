@@ -30,7 +30,7 @@ SHIMS = r"""
 #define SHA256_DIGEST_SIZE 32
 typedef uint8_t u8;
 #define RSWAP_KV_KEY_LEN 65
-#define RSWAP_BATCH_MAX 8
+#define RSWAP_BATCH_MAX 32
 #define RSWAP_HTTP_MAX_HEADER 2048
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -41,7 +41,10 @@ typedef int64_t s64;
 #define kmalloc(size, flags) malloc(size)
 #define kfree(ptr) free(ptr)
 #define kvmalloc_array(count, size, flags) calloc((count), (size))
+#define kvmalloc(size, flags) malloc(size)
 #define kvfree(ptr) free(ptr)
+#define __aligned(x) __attribute__((aligned(x)))
+#define struct_size(ptr, member, count) (sizeof(*(ptr)) + (count))
 #define PTR_ERR(ptr) ((long)(ptr))
 #define IS_ERR(ptr) ((uintptr_t)(ptr) > (uintptr_t)-4096)
 typedef struct { unsigned long val; } swp_entry_t;
@@ -53,7 +56,7 @@ struct folio {
     swp_entry_t swap;
     unsigned char *data;
     unsigned long nr_pages;
-    struct page pages[16];
+    struct page pages[RSWAP_BATCH_MAX * 2];
 };
 struct rswap_kv_page {
     const char *key;
@@ -133,8 +136,9 @@ static long completion;
 static int requests;
 static int moved;
 static unsigned long active_key;
-static unsigned char stored[32][PAGE_SIZE * 8];
-static size_t stored_len[32];
+static unsigned char stored[RSWAP_BATCH_MAX * 5][PAGE_SIZE];
+static size_t stored_len[RSWAP_BATCH_MAX * 5];
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 static void complete(struct kiocb *iocb, long ret) { completion = ret; }
 static void swap_fs_prepare_rw(struct swap_io_ctx *ctx, int rw,
                                struct iov_iter *iter)
@@ -230,7 +234,7 @@ static int rswap_kv_store(struct rswap_kv_page *pages, unsigned int nr,
     requests++;
     for (i = 0; i < nr; i++) {
         active_key = strtoul(pages[i].key, NULL, 16);
-        assert(active_key < 32 && len <= sizeof(stored[0]));
+        assert(active_key < ARRAY_LEN(stored) && len <= sizeof(stored[0]));
         memcpy(stored[active_key], pages[i].data, len);
         stored_len[active_key] = len;
         moved++;
@@ -245,7 +249,7 @@ static int rswap_kv_load(struct rswap_kv_page *pages, unsigned int nr,
     requests++;
     for (i = 0; i < nr; i++) {
         active_key = strtoul(pages[i].key, NULL, 16);
-        assert(active_key < 32);
+        assert(active_key < ARRAY_LEN(stored));
         if (stored_len[active_key] != len)
             return -ENOENT;
         memcpy(pages[i].data, stored[active_key], len);
@@ -389,9 +393,10 @@ int main(void)
         requests = moved = 0;
         rswap_submit_write(&wide_ctx);
         assert(completion == sizeof(many));
-        if (requests != 2 || moved != 12) {
+        /* RSWAP_BATCH_MAX == 32: 12 pages still fit in one batch. */
+        if (requests != 1 || moved != 12) {
             printf("FAIL: 12 page folio stored in %d call(s) moving %d page(s),"
-                   " expected 2/12\n", requests, moved);
+                   " expected 1/12\n", requests, moved);
             return 1;
         }
         wide_sio.bvecs[0] = (struct bio_vec) {
@@ -401,13 +406,59 @@ int main(void)
         requests = moved = 0;
         rswap_submit_read(&wide_ctx);
         assert(completion == sizeof(many));
-        if (requests != 2 || moved != 12) {
+        if (requests != 1 || moved != 12) {
             printf("FAIL: 12 page folio read in %d call(s) moving %d page(s),"
-                   " expected 2/12\n", requests, moved);
+                   " expected 1/12\n", requests, moved);
             return 1;
         }
         if (memcmp(many, wide_actual, sizeof(many))) {
             puts("FAIL: batched multi-folio round trip corrupted data");
+            return 1;
+        }
+    }
+    /* More pages than one batch must be split into full and tail batches. */
+    {
+        enum { PAGES = RSWAP_BATCH_MAX + 8 };
+        static unsigned char many[PAGE_SIZE * PAGES];
+        static unsigned char many_actual[PAGE_SIZE * PAGES];
+        struct folio wide = { .swap = { .val = 100 }, .data = many };
+        struct folio back = { .swap = { .val = 100 }, .data = many_actual };
+        struct swap_iocb wide_sio = { .nr_bvecs = 1, .len = sizeof(many) };
+        struct swap_io_ctx wide_ctx = { .sio = &wide_sio };
+
+        for (i = 0; i < sizeof(many); i++)
+            many[i] = (i * 13 + i / PAGE_SIZE * 61) & 255;
+        for (i = 0; i < PAGES; i++) {
+            wide.pages[i].data = many + i * PAGE_SIZE;
+            back.pages[i].data = many_actual + i * PAGE_SIZE;
+        }
+        wide_sio.bvecs[0] = (struct bio_vec) {
+            .folio = &wide, .bv_page = &wide.pages[0],
+            .bv_len = sizeof(many),
+        };
+        requests = moved = 0;
+        rswap_submit_write(&wide_ctx);
+        assert(completion == sizeof(many));
+        if (requests != 2 || moved != PAGES) {
+            printf("FAIL: %d page folio stored in %d call(s) moving %d page(s),"
+                   " expected 2/%d\n", (int)PAGES, requests, moved, (int)PAGES);
+            return 1;
+        }
+        memset(many_actual, 0, sizeof(many_actual));
+        wide_sio.bvecs[0] = (struct bio_vec) {
+            .folio = &back, .bv_page = &back.pages[0],
+            .bv_len = sizeof(many),
+        };
+        requests = moved = 0;
+        rswap_submit_read(&wide_ctx);
+        assert(completion == sizeof(many));
+        if (requests != 2 || moved != PAGES) {
+            printf("FAIL: %d page folio read in %d call(s) moving %d page(s),"
+                   " expected 2/%d\n", (int)PAGES, requests, moved, (int)PAGES);
+            return 1;
+        }
+        if (memcmp(many, many_actual, sizeof(many))) {
+            puts("FAIL: split batch round trip corrupted data");
             return 1;
         }
     }
