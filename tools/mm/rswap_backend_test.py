@@ -27,6 +27,7 @@ SHIMS = r"""
 #define ITER_SOURCE 0
 #define ITER_DEST 1
 #define RSWAP_SHA256_HEXLEN 64
+#define RSWAP_HTTP_MAX_HEADER 2048
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define pr_debug_ratelimited(...) do { } while (0)
@@ -121,7 +122,7 @@ static int kstrtoul(const char *text, unsigned int base, unsigned long *out)
     *out = strtoul(text, &end, base);
     return errno || end == text || *end ? -EINVAL : 0;
 }
-static int rswap_recv(struct socket *sock, char *buf, int len)
+static int rswap_sock_recv(struct socket *sock, char *buf, int len)
 {
     size_t available = response_size - response_offset;
     size_t count = min_t(size_t, available, len);
@@ -139,8 +140,7 @@ static void set_response(const char *data, size_t len, int error)
     response_offset = 0;
     response_error = error;
 }
-static int rswap_http_post(struct socket *sock, const char *key,
-                            const void *data, size_t len)
+static int rswap_kv_store(const char *key, const void *data, size_t len)
 {
     active_key = strtoul(key, NULL, 16);
     assert(active_key < 32 && len <= sizeof(stored[0]));
@@ -149,24 +149,14 @@ static int rswap_http_post(struct socket *sock, const char *key,
     requests++;
     return 0;
 }
-static int rswap_http_get(struct socket *sock, const char *key)
+static int rswap_kv_load(const char *key, void *data, size_t len)
 {
     active_key = strtoul(key, NULL, 16);
     assert(active_key < 32);
+    if (stored_len[active_key] != len)
+        return -ENOENT;
+    memcpy(data, stored[active_key], len);
     requests++;
-    return 0;
-}
-"""
-
-BACKEND_RESPONSE = r"""
-static int rswap_parse_response(struct socket *sock, char *data, size_t len,
-                                bool is_read)
-{
-    if (is_read) {
-        if (stored_len[active_key] != len)
-            return -ENOENT;
-        memcpy(data, stored[active_key], len);
-    }
     return 0;
 }
 """
@@ -298,6 +288,7 @@ HASH_SHIMS = r"""
 #include <string.h>
 #define SHA256_DIGEST_SIZE 32
 #define RSWAP_SHA256_HEXLEN 64
+#define RSWAP_HTTP_MAX_HEADER 2048
 #define WRITE 1
 #define smp_store_release(ptr, value) \
     __atomic_store_n((ptr), (value), __ATOMIC_RELEASE)
@@ -496,11 +487,24 @@ def main():
         swapfile = subprocess.check_output(
             ["git", "show", f"{args.revision}:mm/swapfile.c"],
             cwd=root, text=True)
+        http = subprocess.run(
+            ["git", "show", f"{args.revision}:mm/rswap_http.c"],
+            cwd=root, text=True, check=False, capture_output=True).stdout
     else:
         source = (root / "mm/rswap.c").read_text()
+        http = (root / "mm/rswap_http.c").read_text()
         swapfile = (root / "mm/swapfile.c").read_text()
-    response = source[source.index("static int rswap_parse_response("):
-                      source.index("/* ---------- Per-page digests (page_ext)")]
+    if http:
+        response = ("#define rswap_parse_response rswap_http_parse_response\n" +
+                    http[http.index("static int rswap_http_parse_response("):
+                         http.index(
+                             "/* ---------- Backend operations ---------- */")])
+    else:
+        # Revisions before the backend split keep the parser in rswap.c.
+        response = ("#define rswap_recv rswap_sock_recv\n" +
+                    source[source.index("static int rswap_parse_response("):
+                           source.index(
+                               "/* ---------- Per-page digests (page_ext)")])
     start = ("static void rswap_submit(" if "static void rswap_submit(" in source
              else "static void rswap_submit_write(")
     submit = source[source.index(start):source.index(
@@ -512,7 +516,7 @@ def main():
                     swapfile.index("static bool get_swap_device_info(")]
     snippets = {
         "response": SHIMS + response + PARSER_MAIN,
-        "folio": SHIMS + BACKEND_RESPONSE + submit + BACKEND_MAIN,
+        "folio": SHIMS + submit + BACKEND_MAIN,
         "hashes": HASH_SHIMS + hashes + HASH_MAIN,
         "free": FREE_SHIMS + free + FREE_MAIN,
     }

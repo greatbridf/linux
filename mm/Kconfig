@@ -132,15 +132,15 @@ config XSWAP
 	  on demand, avoiding static pre-allocation overhead.
 
 config RSWAP
-	bool "Remote Swap (rswap) - HTTP KV store backend"
+	bool "Remote Swap (rswap) - remote KV store backend"
 	depends on XSWAP && INET && SYSCTL
 	select CRYPTO_LIB_SHA256
 	select PAGE_EXTENSION
 	help
 	  Adds support for remote swap (rswap) devices.  rswap implements the
-	  swap_ops interface to store swap pages in an external HTTP key-value
-	  store.  On swap-out the kernel sends an HTTP POST with the page data;
-	  on swap-in it sends an HTTP GET.
+	  swap_ops interface to store swap pages in an external key-value
+	  store.  The transport is a pluggable backend: the HTTP backend POSTs
+	  and GETs a page object, the Redis backend uses RESP SET and GET.
 
 	  The KV store is keyed by a SHA-256 digest that user space attaches
 	  to a page through /proc/sys/vm/rswap/attach.  The digest is kept in
@@ -151,14 +151,37 @@ config RSWAP
 	  The attach file accepts:
 	    <virtual-address> <64 hexadecimal SHA-256 digits>
 
-	  The KV store server runs at 127.0.0.1:6789 and stores each page as
-	  a file named by the SHA-256 digest.
+	  Both backends store one page object per SHA-256 digest.  Select at
+	  least one backend below, then pick it with rswap.backend= and point
+	  it at a server with rswap.host= / rswap.port=.
 
 	  To use:
-	    1. Build and start the KV server (tools/mm/kvswap_server.c)
+	    1. Build and start the KV server (tools/mm/kvswap_server.c) or a
+	       Redis server (tools/mm/rswap_redis_test.py --live checks one)
 	    2. echo rswap > /sys/kernel/mm/xswap/create
 
 	  If unsure, say N.
+
+if RSWAP
+
+config RSWAP_KV_HTTP
+	bool "HTTP/1.0 KV backend (kvswap_server)"
+	default y
+	help
+	  Store swap pages with HTTP POST and fetch them with HTTP GET from
+	  tools/mm/kvswap_server.c.  Selected with rswap.backend=http; the
+	  endpoint defaults to 127.0.0.1:6789.
+
+config RSWAP_KV_REDIS
+	bool "Redis KV backend (RESP)"
+	help
+	  Store swap pages in a Redis server with RESP SET and GET.  Keys are
+	  the SHA-256 hex digests user space attached.  Selected with
+	  rswap.backend=redis; the endpoint defaults to 127.0.0.1:6379 and is
+	  configured with rswap.host=, rswap.port=, rswap.redis_user=,
+	  rswap.redis_password= and rswap.redis_db=.
+
+endif # RSWAP
 
 config ZSMALLOC
 	tristate

@@ -78,7 +78,9 @@ endif
 
 obj-$(CONFIG_SWAP)	+= page_io.o swap_state.o swapfile.o
 obj-$(CONFIG_ZSWAP)	+= zswap.o
-obj-$(CONFIG_RSWAP)	+= rswap.o
+obj-$(CONFIG_RSWAP)	+= rswap.o rswap_sock.o
+obj-$(CONFIG_RSWAP_KV_HTTP)	+= rswap_http.o
+obj-$(CONFIG_RSWAP_KV_REDIS)	+= rswap_redis.o
 obj-$(CONFIG_HAS_DMA)	+= dmapool.o
 obj-$(CONFIG_HUGETLBFS)	+= hugetlb.o hugetlb_sysfs.o hugetlb_sysctl.o
 ifdef CONFIG_CMA

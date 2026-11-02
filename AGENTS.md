@@ -29,17 +29,30 @@ only")` and must not return.
 
 ## Project Purpose
 
-rswap is a fileless xswap backend that stores swap pages in an external HTTP
+rswap is a fileless xswap backend that stores swap pages in an external
 key-value store. Each base page is stored under a SHA-256 hex key supplied by
 user space for that page.
 
-The current backend is deliberately simple:
+The store is reached through a pluggable KV backend. The core (`mm/rswap.c`)
+owns the keys, the page_ext digests, the per-device table and the `swap_ops`
+wiring; a backend only moves one page image to and from the store. Two
+backends ship with the kernel:
 
-- HTTP/1.0 over a hardcoded loopback endpoint, `127.0.0.1:6789`.
-- One HTTP request per base page.
-- A userspace `kvswap_server` stores one file per key.
-- No network authentication, payload encryption, or server persistence
-  guarantees beyond the backend implementation.
+- `http` (`mm/rswap_http.c`): HTTP/1.0 `POST`/`GET` to a userspace
+  `kvswap_server` that stores one file per key.
+- `redis` (`mm/rswap_redis.c`): RESP `SET`/`GET` against a Redis server, using
+  the same SHA-256 hex keys, so server contents can be audited against the
+  userspace digests.
+
+Both are deliberately simple:
+
+- One connection and one request per base page; nothing is cached across
+  operations, so no locking is needed in the swap I/O path.
+- The endpoint is a boot parameter; the defaults are `127.0.0.1:6789` (HTTP)
+  and `127.0.0.1:6379` (Redis).
+- No payload encryption and no persistence guarantees beyond the backend
+  implementation. The HTTP server has no authentication at all; Redis uses
+  `AUTH` and `SELECT` when a password resp. a database number is configured.
 - eBPF integration is postponed and is not part of the active build.
 
 ## Architecture
@@ -68,14 +81,54 @@ write. This lets one descriptor issue multiple command writes.
 
 ### Kernel Entry Point
 
-`mm/rswap.c` is the main implementation. It contains:
+`mm/rswap.c` is the core implementation. It contains:
 
-- kernel socket and HTTP request/response handling;
 - swap page I/O through the `swap_ops` interface;
 - the `/proc/sys/vm/rswap/attach` sysctl;
 - page_ext digest access;
 - per-device swap-offset hash storage;
-- debugfs per-device port reporting.
+- backend selection and the boot parameters below;
+- debugfs backend, endpoint and per-device port reporting.
+
+`mm/rswap_backend.h` defines the pluggable interface and the shared TCP
+transport helpers in `mm/rswap_sock.c`. A backend is:
+
+```c
+struct rswap_backend {
+        const char      *name;
+        const char      *description;
+        const char      *default_host;
+        u16             default_port;
+        unsigned int    default_send_timeout_ms;
+        unsigned int    default_recv_timeout_ms;
+        int             (*init)(const struct rswap_kv_config *cfg);
+        int             (*store)(const char *key, const void *data, size_t len);
+        int             (*load)(const char *key, void *data, size_t len);
+};
+```
+
+The core resolves every default before `->init()`, so a backend only ever
+sees final values. `->store()`/`->load()` run in swap I/O context under
+`GFP_NOIO`, may sleep, and must not touch the filesystem. `->load()` returns
+`-ENOENT` for a missing key and rejects an object whose length is not exactly
+one base page.
+
+Backends are chosen at boot, never at runtime: switching a live device to a
+different store would strand every page already written to the old one.
+
+```text
+rswap.backend=http|redis          default http
+rswap.host=<address>              empty selects the backend default
+rswap.port=<port>                 0 selects the backend default
+rswap.redis_user=<acl user>       empty uses the Redis default user
+rswap.redis_password=<secret>     empty sends no AUTH
+rswap.redis_db=<n>                Redis database number
+rswap.send_timeout_ms=<ms>        0 selects the backend default
+rswap.recv_timeout_ms=<ms>        0 selects the backend default
+```
+
+The secrets are boot parameters only; `rswap.redis_password` is deliberately
+not exposed in sysfs and must not be committed to the tree.
 
 The RSWAP Kconfig option is defined in `mm/Kconfig` and depends on:
 
@@ -83,7 +136,9 @@ The RSWAP Kconfig option is defined in `mm/Kconfig` and depends on:
 - `INET`
 - `SYSCTL`
 
-It selects `PAGE_EXTENSION` and `CRYPTO_LIB_SHA256`.
+It selects `PAGE_EXTENSION` and `CRYPTO_LIB_SHA256`. `RSWAP_KV_HTTP`
+(default y) and `RSWAP_KV_REDIS` (default n) build the individual backends;
+at least one is required.
 
 ### Page-Ext Stage
 
@@ -170,7 +225,12 @@ swap fault
 
 ## Relevant Files
 
-- `mm/rswap.c`: rswap backend, sysctl, page-ext and table implementation.
+- `mm/rswap.c`: rswap core, backend selection, sysctl, page-ext and table
+  implementation.
+- `mm/rswap_backend.h`: pluggable KV backend interface and transport API.
+- `mm/rswap_sock.c`: TCP connect/send/receive helpers shared by backends.
+- `mm/rswap_http.c`: HTTP/1.0 KV backend for `kvswap_server`.
+- `mm/rswap_redis.c`: RESP KV backend for Redis.
 - `mm/rswap.h`: rswap lifecycle declarations and no-op configuration stubs.
 - `include/linux/page_ext.h`: page-ext client declarations and lifecycle hooks.
 - `mm/page_ext.c`: page-ext client registration.
@@ -189,6 +249,8 @@ swap fault
 - `tools/mm/rswap_scale_test.py`: scaled live test (512 MiB by default) that
   also sets up the KV server and swap device, then audits the backend keys.
 - `tools/mm/rswap_backend_test.py`: source-level backend and table regressions.
+- `tools/mm/rswap_redis_test.py`: RESP client test against a scripted server,
+  plus `--live` against a real Redis server.
 - `tools/mm/kvswap_test.py`: HTTP protocol regression tests.
 
 ## Interfaces and Operations
@@ -205,9 +267,10 @@ Destroy it by swap type:
 echo 0 > /sys/kernel/mm/xswap/destroy
 ```
 
-The kernel hardcodes the KV server address as `127.0.0.1:6789`.
+The endpoint comes from the boot parameters; the defaults are
+`127.0.0.1:6789` for the HTTP backend and `127.0.0.1:6379` for Redis.
 
-Start the server:
+Start the HTTP server:
 
 ```sh
 tools/mm/kvswap_server -d /tmp/rswap-kv -p 6789
@@ -220,10 +283,22 @@ POST /v1/folios/<sha256>/write
 GET  /v1/folios/<sha256>/read
 ```
 
-Per-device KV port information is exposed through debugfs:
+Or boot with the Redis backend and point it at a server:
 
 ```text
-/sys/kernel/debug/rswap/type<N>/kv_port
+rswap.backend=redis rswap.host=192.0.2.10 rswap.port=6379
+rswap.redis_user=default rswap.redis_password=<secret> rswap.redis_db=0
+```
+
+Redis objects are the raw page images stored under the 64 hex digit digest,
+so `GET <sha256>` on the server must return exactly one base page.
+
+Selected backend information is exposed through debugfs:
+
+```text
+/sys/kernel/debug/rswap/backend             http | redis
+/sys/kernel/debug/rswap/endpoint            resolved host:port
+/sys/kernel/debug/rswap/type<N>/kv_port     resolved port of type <N>
 ```
 
 ## Build and Verification
@@ -232,7 +307,8 @@ Build the kernel and relevant objects:
 
 ```sh
 make O=build LLVM=1 -j"$(nproc)" W=1 \
-    mm/rswap.o mm/swapfile.o mm/page_alloc.o mm/migrate.o Image
+    mm/rswap.o mm/rswap_sock.o mm/rswap_http.o mm/rswap_redis.o \
+    mm/swapfile.o mm/page_alloc.o mm/migrate.o Image
 ```
 
 Build userspace tools:
@@ -242,11 +318,27 @@ make -C rswap-userspace-demos user
 make -C tools/mm kvswap_server rswap_test
 ```
 
+Build the installable kernel packages:
+
+```sh
+make O=build LLVM=1 -j"$(nproc)" binrpm-pkg
+```
+
 Source and protocol tests:
 
 ```sh
 python3 tools/mm/rswap_backend_test.py
 python3 tools/mm/kvswap_test.py
+python3 tools/mm/rswap_redis_test.py
+```
+
+The Redis test builds a userspace harness from the real RESP code in
+`mm/rswap_redis.c` and runs it against a scripted RESP server. With `--live`
+it also runs against a real server and audits the stored objects:
+
+```sh
+python3 tools/mm/rswap_redis_test.py --live --host 127.0.0.1 --port 6379 \
+    --user default --password "$RSWAP_REDIS_PASSWORD" --db 0
 ```
 
 Live integrity test, with rswap as the only active swap device:
@@ -304,6 +396,25 @@ The no-fallback design has been tested live on ARM64 with 16 KiB base pages:
   extras. A 64 MiB two-round run stored exactly 8192 objects.
 - Backend source regressions and all 11 KV protocol tests passed.
 
+After the backend split the live runs above still target the HTTP backend.
+The Redis backend has been verified at the protocol level only, because that
+requires a kernel with `CONFIG_RSWAP_KV_REDIS=y` booted:
+
+- `rswap_redis_test.py` builds the real `mm/rswap_redis.c` RESP code against
+  POSIX socket shims and passes against a scripted RESP server: pipelined
+  AUTH/SELECT/SET, `GET` round trip, `$-1` mapped to `-ENOENT`, `-WRONGPASS`
+  and `-NOAUTH` mapped to `-EACCES`, `SELECT <n>` honored, a non-page-sized
+  object rejected with `-EMSGSIZE`, and exactly one key per user digest.
+- `rswap_redis_test.py --live` passes against a real password-protected Redis
+  server: the page is stored as one 4 KiB object under the userspace SHA-256
+  hex key, reads back byte-for-byte, a missing key fails with `-ENOENT`, and
+  the test leaves no objects behind.
+
+Status of the refactor: `mm/rswap.c` no longer contains any socket, HTTP or
+RESP code, and `rswap_backend_test.py` still passes unchanged in substance for
+the response parser, the submit paths, the per-entry key path and slot
+cleanup.
+
 Expected `-ENODATA`/`-61` kernel messages occur during deliberate tests of
 writeout without an attached digest. They are not evidence of a fallback
 path.
@@ -318,9 +429,13 @@ path.
   device destruction, or reboot. Remote server objects may remain.
 - The current digest is an integrity input supplied by user space. The kernel
   does not independently recompute or verify it against page contents.
-- The KV endpoint is hardcoded to loopback and has no authentication.
-- The single-threaded KV server and one-request-per-page design are for
-  testing, not production throughput.
+- The HTTP KV server has no authentication and the kernel sends no
+  credentials to it. Redis supports `AUTH`/`SELECT`, but its secret is a boot
+  parameter and is stored in plain text while the kernel runs.
+- One connection and one request per page; the single-threaded HTTP server and
+  this per-page design are for testing, not production throughput. A backend
+  switch needs a reboot, and the backend for a device is never recorded, so a
+  device written with one backend cannot be read back with another.
 - There is no active eBPF integration.
 
 ## eBPF Status
