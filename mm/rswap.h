@@ -6,8 +6,8 @@
  * store swap pages in an external key-value store reachable over HTTP.
  * The KV store key is a SHA-256 hash attached by user space through
  * /proc/sys/vm/rswap/attach.  The hash is copied into a per-device table
- * indexed by swap offset at writeout and reused at swapin.  For unattached
- * pages, a hash of the swap entry value is stored in the same table.
+ * indexed by swap offset at writeout and reused at swapin.  Pages without
+ * an attached hash cannot be written to the remote device.
  *
  * == Setup ==
  *

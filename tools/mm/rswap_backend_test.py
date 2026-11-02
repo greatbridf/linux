@@ -323,10 +323,6 @@ static bool rswap_page_get_hash(struct page *page, u8 *hash)
     memcpy(hash, attached_hash, sizeof(attached_hash));
     return true;
 }
-static void sha256(const u8 *data, unsigned int len, u8 *out)
-{
-    memset(out, data[0], SHA256_DIGEST_SIZE);
-}
 static void bin2hex(char *dst, const u8 *src, size_t len)
 {
     size_t i;
@@ -341,8 +337,7 @@ int main(void)
     struct rswap_hash_entry entries[4] = { };
     struct swap_info_struct si = { .max = 4, .rswap_hashes = entries };
     uint8_t first[SHA256_DIGEST_SIZE], second[SHA256_DIGEST_SIZE], actual[32];
-    uint8_t fallback[SHA256_DIGEST_SIZE];
-    char fallback_hex[RSWAP_SHA256_HEXLEN + 1], hex[RSWAP_SHA256_HEXLEN + 1];
+    char expected_hex[RSWAP_SHA256_HEXLEN + 1], hex[RSWAP_SHA256_HEXLEN + 1];
     struct page page = { };
     swp_entry_t entry = { .val = 2 };
     size_t i;
@@ -354,30 +349,27 @@ int main(void)
     assert(rswap_hash_store(&si, entry, first) == 0);
     assert(rswap_hash_load(&si, entry, actual));
     assert(!memcmp(actual, first, sizeof(actual)));
-    assert(rswap_page_key(&si, &page, entry, WRITE, fallback_hex) == 0);
+    page_hash_available = true;
+    memcpy(attached_hash, first, sizeof(attached_hash));
+    assert(rswap_page_key(&si, &page, entry, WRITE, expected_hex) == 0);
     assert(rswap_page_key(&si, &page, entry, 0, hex) == 0);
-    assert(!strcmp(hex, fallback_hex));
-    sha256((const u8 *)&entry.val, sizeof(entry.val), fallback);
-    bin2hex(fallback_hex, fallback, sizeof(fallback));
-    fallback_hex[RSWAP_SHA256_HEXLEN] = '\0';
-    assert(!strcmp(hex, fallback_hex));
+    assert(!strcmp(hex, expected_hex));
 
     assert(rswap_hash_store(&si, entry, second) == 0);
     assert(rswap_hash_load(&si, entry, actual));
     assert(!memcmp(actual, second, sizeof(actual)));
-    page_hash_available = true;
-    memset(attached_hash, 0xaa, sizeof(attached_hash));
+    memcpy(attached_hash, second, sizeof(attached_hash));
     entry.val = 3;
     assert(rswap_page_key(&si, &page, entry, WRITE, hex) == 0);
-    assert(rswap_page_key(&si, &page, entry, 0, fallback_hex) == 0);
-    assert(!strcmp(hex, fallback_hex));
+    assert(rswap_page_key(&si, &page, entry, 0, expected_hex) == 0);
+    assert(!strcmp(hex, expected_hex));
 
-    /* Swapin must not fall back to page_ext or the swap entry. */
-    page_hash_available = true;
-    memset(attached_hash, 0xbb, sizeof(attached_hash));
+    /* Missing user digests fail writeout, and swapin has no fallback. */
+    page_hash_available = false;
     entry.val = 1;
     assert(!rswap_hash_load(&si, entry, actual));
     assert(rswap_page_key(&si, &page, entry, 0, hex) == -ENOENT);
+    assert(rswap_page_key(&si, &page, entry, WRITE, hex) == -ENODATA);
     entry.val = 4;
     assert(rswap_hash_store(&si, entry, first) == -ENOENT);
     assert(!rswap_hash_load(&si, entry, actual));

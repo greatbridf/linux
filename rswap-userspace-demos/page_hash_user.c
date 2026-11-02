@@ -87,6 +87,8 @@ static bool attach_hash(int fd, unsigned long addr,
 		errno = EOVERFLOW;
 		return false;
 	}
+	if (lseek(fd, 0, SEEK_SET) < 0)
+		return false;
 
 	do {
 		written = write(fd, line, len);
