@@ -54,7 +54,9 @@ SHIMS = r"""
 #define RSWAP_KV_KEY_LEN 65
 #define RSWAP_REDIS_CMD_SIZE (RSWAP_KV_KEY_LEN + 32)
 #define RSWAP_REDIS_MAX_LINE 256
+#define RSWAP_REDIS_POOL_MAX 8
 #define GFP_NOIO 0
+#define WARN_ON_ONCE(cond) (cond)
 #define PAGE_SIZE 4096
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define IS_ERR(ptr) ((uintptr_t)(ptr) > (uintptr_t)-4096)
@@ -68,6 +70,19 @@ struct rswap_kv_page {
 static struct socket socket_stub;
 #define kvmalloc(size, flags) malloc(size)
 #define kvfree(ptr) free(ptr)
+
+/* Pool primitives: the harness runs one operation at a time. */
+typedef struct { long long v; } atomic64_t;
+#define atomic64_read(p) ((p)->v)
+#define atomic64_inc(p) ((p)->v++)
+struct mutex { int unused; };
+#define DEFINE_MUTEX(name) struct mutex name
+#define mutex_lock(m) do { (void)(m); } while (0)
+#define mutex_unlock(m) do { (void)(m); } while (0)
+struct semaphore { int count; };
+#define DEFINE_SEMAPHORE(name, n) struct semaphore name = { .count = (n) }
+static void down(struct semaphore *sem) { sem->count--; }
+static void up(struct semaphore *sem) { sem->count++; }
 
 /* Mirrors the private state the backend keeps above the extracted code. */
 static struct {
@@ -137,6 +152,11 @@ static int rswap_sock_send(struct socket *sock, const void *data, size_t len)
         len -= done;
     }
     return 0;
+}
+
+static bool rswap_sock_alive(struct socket *sock)
+{
+    return sock->fd >= 0;
 }
 
 static int rswap_sock_recv(struct socket *sock, void *buf, size_t len)
@@ -241,6 +261,24 @@ int main(int argc, char **argv)
         }
         printf("batch ret=%d match=%d\n", batch_ret, match);
         return batch_ret || !match ? 1 : 0;
+    }
+    if (!strcmp(command, "pooltest")) {
+        int pool_ret = 0, batch_no;
+
+        for (batch_no = 0; batch_no < 4 && !pool_ret; batch_no++) {
+            for (i = 0; i < 8; i++) {
+                batch_key(keys[i], key, i);
+                keys[i][62] = '0' + batch_no;
+                fill_page(batch[i], keys[i]);
+                pages[i].key = keys[i];
+                pages[i].data = batch[i];
+            }
+            pool_ret = rswap_redis_store(pages, 8, PAGE_SIZE);
+            if (!pool_ret)
+                pool_ret = rswap_redis_load(pages, 8, PAGE_SIZE);
+        }
+        printf("pool ret=%d\n", pool_ret);
+        return pool_ret ? 1 : 0;
     }
     if (!strcmp(command, "get-missing")) {
         ret = rswap_redis_load(pages, 1, sizeof(page));
@@ -469,6 +507,25 @@ def offline(harness):
                 print(f"FAIL: batched page {i} missing or wrong")
                 failures += 1
                 break
+
+        # The pool must move 64 pages over one connection.
+        server.connections = 0
+        server.commands.clear()
+        ok, detail = run_harness(harness, "127.0.0.1", server.port, "default",
+                                 secret, 0, "pooltest", key)
+        sets = server.commands.count("SET")
+        gets = server.commands.count("GET")
+        if not ok:
+            print(f"FAIL: pooltest: {detail}")
+            failures += 1
+        if server.connections != 1:
+            print(f"FAIL: 8 batches used {server.connections} connection(s),"
+                  f" expected 1 (pooled)")
+            failures += 1
+        if sets != 32 or gets != 32:
+            print(f"FAIL: pooltest sent {sets} SET and {gets} GET,"
+                  f" expected 32/32")
+            failures += 1
         if not failures:
             print("PASS: RESP client stores and loads pages by user digest")
     finally:

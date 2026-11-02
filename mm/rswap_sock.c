@@ -18,6 +18,7 @@
 #include <linux/net.h>
 #include <linux/uio.h>
 #include <net/sock.h>
+#include <net/tcp_states.h>
 
 #include "rswap_backend.h"
 
@@ -77,6 +78,16 @@ void rswap_sock_close(struct socket *sock)
 {
 	kernel_sock_shutdown(sock, SHUT_RDWR);
 	sock_release(sock);
+}
+
+/*
+ * Is @sock still usable?  A pooled connection whose peer has closed is in
+ * CLOSE_WAIT: writing to it succeeds locally, and the request is then waited
+ * for until the receive timeout.  Such a socket is dropped instead of used.
+ */
+bool rswap_sock_alive(struct socket *sock)
+{
+	return sock->sk && READ_ONCE(sock->sk->sk_state) == TCP_ESTABLISHED;
 }
 
 /* Send @len bytes from @data, looping over short sends. */

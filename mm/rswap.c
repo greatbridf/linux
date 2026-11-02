@@ -947,6 +947,8 @@ static int rswap_stats_show(struct seq_file *m, void *unused)
 		   rswap_stats_avg(&rswap_read_io.ns, &rswap_read_io.batches));
 	seq_printf(m, "read_max_ns\t%llu\n",
 		   atomic64_read(&rswap_read_io.max_ns));
+	if (rswap_backend && rswap_backend->show_stats)
+		rswap_backend->show_stats(m);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(rswap_stats);

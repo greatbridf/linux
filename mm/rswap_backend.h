@@ -17,6 +17,7 @@
 
 #include <linux/types.h>
 
+struct seq_file;
 struct socket;
 
 /* Longest KV key rswap ever produces: SHA-256 as hex plus the NUL. */
@@ -62,6 +63,7 @@ struct rswap_kv_config {
  * @init:			optional; copy @cfg, validate it, return -errno
  * @store:			write @nr page images
  * @load:			read @nr page images
+ * @show_stats:			optional, append backend counters to debugfs
  *
  * ->store() and ->load() move @nr page images of @len bytes each from and to
  * @pages[].  @nr is between 1 and RSWAP_BATCH_MAX; keys stay valid only for
@@ -87,6 +89,7 @@ struct rswap_backend {
 				size_t len);
 	int		(*load)(struct rswap_kv_page *pages, unsigned int nr,
 			       size_t len);
+	void		(*show_stats)(struct seq_file *m);
 };
 
 /*
@@ -98,6 +101,7 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 				  unsigned int send_timeout_ms,
 				  unsigned int recv_timeout_ms);
 void rswap_sock_close(struct socket *sock);
+bool rswap_sock_alive(struct socket *sock);
 int rswap_sock_send(struct socket *sock, const void *data, size_t len);
 int rswap_sock_recv(struct socket *sock, void *buf, size_t len);
 

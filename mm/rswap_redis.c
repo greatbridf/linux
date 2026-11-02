@@ -6,24 +6,28 @@
  * backends use, so a Redis dump can be audited directly against the digests
  * user space attached.  Values are raw base page images.
  *
- * One batch of up to RSWAP_BATCH_MAX pages is one connection with all of its
- * commands pipelined into a single write:
+ * One batch of up to RSWAP_BATCH_MAX pages is one pipelined write:
  *
- *   write:  AUTH* SELECT* (SET <key> <page bytes>)+
- *   read:   AUTH* SELECT* (GET <key>)+
+ *   write:  (SET <key> <page bytes>)+
+ *   read:   (GET <key>)+
  *
- * (*) only when a password resp. a non-zero database is configured.
+ * Connections are pooled and reused, with AUTH and SELECT sent once when a
+ * connection is opened.  That matters more than the batch size: a fresh
+ * connection pays a handshake plus TCP slow start, which for one batch of 128
+ * KiB over a 12 ms path costs about 90 ms, against about 15 ms for the same
+ * batch on an established connection.  Nothing is cached across a *failed*
+ * connection: a transport error drops the socket, and the batch is retried
+ * once on a fresh one, which is safe because SET and GET are idempotent.
  *
- * Pipelining is what makes this usable: a round trip to a remote server costs
- * milliseconds, so paying one per page instead of one per batch dominates the
- * run time.  Nothing is cached across calls.  Swap I/O runs on many CPUs at
- * once, so a shared connection would need a sleeping lock in the I/O path;
- * opening a connection per batch keeps the backend stateless instead.
+ * Swap I/O runs on many CPUs at once, so the pool hands out one connection per
+ * caller instead of holding a lock across the I/O.
  */
 
 #define pr_fmt(fmt) "rswap: " fmt
 
 #include <linux/kernel.h>
+#include <linux/seq_file.h>
+#include <linux/semaphore.h>
 #include <linux/string.h>
 #include <linux/kstrtox.h>
 #include <linux/net.h>
@@ -38,6 +42,8 @@
 #define RSWAP_REDIS_CMD_SIZE		(RSWAP_KV_KEY_LEN + 32)
 /* Status, error and bulk length lines are all tiny. */
 #define RSWAP_REDIS_MAX_LINE		256
+/* Cached connections; more concurrent batches than this fall back to new. */
+#define RSWAP_REDIS_POOL_MAX		8
 
 static struct {
 	char		host[RSWAP_KV_HOST_LEN];
@@ -260,53 +266,130 @@ static int rswap_redis_queue_preamble(struct rswap_redis_cmd *cmd,
 	return 0;
 }
 
-/* ---------- Backend operations ---------- */
+/* ---------- Connection pool ---------- */
 
-static struct socket *rswap_redis_open(void)
+struct rswap_redis_conn {
+	struct socket	*sock;
+	bool		busy;
+};
+
+static DEFINE_MUTEX(rswap_redis_pool_lock);
+static DEFINE_SEMAPHORE(rswap_redis_pool_sem, RSWAP_REDIS_POOL_MAX);
+static struct rswap_redis_conn rswap_redis_pool[RSWAP_REDIS_POOL_MAX];
+
+static atomic64_t rswap_redis_connects;
+static atomic64_t rswap_redis_reuses;
+static atomic64_t rswap_redis_dropped;
+static atomic64_t rswap_redis_retries;
+
+/* Errors that mean the connection is unusable, not that the key is absent. */
+static bool rswap_redis_transport_error(int err)
 {
-	return rswap_sock_connect(rswap_redis.host, rswap_redis.port,
-				  rswap_redis.send_timeout_ms,
-				  rswap_redis.recv_timeout_ms);
+	return err && err != -ENOENT && err != -EMSGSIZE;
 }
 
-/*
- * Size of the request header block: every command of the batch, without the
- * page images, which are appended after it.
- */
-static size_t rswap_redis_header_size(unsigned int nr)
+static void rswap_redis_drop(struct rswap_redis_conn *conn)
 {
-	return (nr + 1) * RSWAP_REDIS_CMD_SIZE;
+	if (!conn->sock)
+		return;
+	rswap_sock_close(conn->sock);
+	conn->sock = NULL;
+	atomic64_inc(&rswap_redis_dropped);
 }
 
-/*
- * Store a batch of pages: one write carrying AUTH, SELECT and every SET,
- * each immediately followed by its page image, then one status reply per
- * command.
- */
-static int rswap_redis_store(struct rswap_kv_page *pages, unsigned int nr,
-			     size_t len)
+/* Open a connection if @conn has none, and authenticate it. */
+static int rswap_redis_ensure(struct rswap_redis_conn *conn)
 {
 	struct rswap_redis_cmd cmd;
-	struct socket *sock;
-	char *request;
+	/* Holds AUTH (user + secret) and SELECT, far below the limits below. */
+	char buf[512];
 	unsigned int replies;
 	unsigned int i;
 	int ret;
 
-	if (!nr)
-		return -EINVAL;
+	if (conn->sock) {
+		if (rswap_sock_alive(conn->sock)) {
+			atomic64_inc(&rswap_redis_reuses);
+			return 0;
+		}
+		rswap_redis_drop(conn);
+	}
 
-	/* Header bound plus every payload; the real length ends up in cmd.len. */
-	request = kvmalloc(rswap_redis_header_size(nr) + nr * (len + 2),
-			   GFP_NOIO);
+	conn->sock = rswap_sock_connect(rswap_redis.host, rswap_redis.port,
+					rswap_redis.send_timeout_ms,
+					rswap_redis.recv_timeout_ms);
+	if (IS_ERR(conn->sock)) {
+		ret = PTR_ERR(conn->sock);
+		conn->sock = NULL;
+		return ret;
+	}
+	atomic64_inc(&rswap_redis_connects);
+
+	cmd.buf = buf;
+	cmd.size = sizeof(buf);
+	cmd.len = 0;
+	ret = rswap_redis_queue_preamble(&cmd, &replies);
+	if (!ret && replies) {
+		ret = rswap_sock_send(conn->sock, cmd.buf, cmd.len);
+		for (i = 0; !ret && i < replies; i++)
+			ret = rswap_redis_status(conn->sock, "OK");
+	}
+	if (ret)
+		rswap_redis_drop(conn);
+	return ret;
+}
+
+static struct rswap_redis_conn *rswap_redis_conn_get(void)
+{
+	struct rswap_redis_conn *conn = NULL;
+	unsigned int i;
+
+	down(&rswap_redis_pool_sem);
+	mutex_lock(&rswap_redis_pool_lock);
+	for (i = 0; i < RSWAP_REDIS_POOL_MAX; i++) {
+		if (!rswap_redis_pool[i].busy) {
+			rswap_redis_pool[i].busy = true;
+			conn = &rswap_redis_pool[i];
+			break;
+		}
+	}
+	mutex_unlock(&rswap_redis_pool_lock);
+
+	if (WARN_ON_ONCE(!conn)) {
+		up(&rswap_redis_pool_sem);
+		return NULL;
+	}
+	return conn;
+}
+
+static void rswap_redis_conn_put(struct rswap_redis_conn *conn)
+{
+	mutex_lock(&rswap_redis_pool_lock);
+	conn->busy = false;
+	mutex_unlock(&rswap_redis_pool_lock);
+	up(&rswap_redis_pool_sem);
+}
+
+/* ---------- Backend operations ---------- */
+
+static int rswap_redis_do_store(struct rswap_redis_conn *conn,
+				struct rswap_kv_page *pages, unsigned int nr,
+				size_t len)
+{
+	struct rswap_redis_cmd cmd;
+	char *request;
+	unsigned int i;
+	int ret = 0;
+
+	/* Command headers plus every payload. */
+	request = kvmalloc(nr * (RSWAP_REDIS_CMD_SIZE + len + 2), GFP_NOIO);
 	if (!request)
 		return -ENOMEM;
 
 	cmd.buf = request;
-	cmd.size = rswap_redis_header_size(nr) + nr * (len + 2);
+	cmd.size = nr * (RSWAP_REDIS_CMD_SIZE + len + 2);
 	cmd.len = 0;
 
-	ret = rswap_redis_queue_preamble(&cmd, &replies);
 	for (i = 0; !ret && i < nr; i++) {
 		ret = rswap_redis_add_array(&cmd, 3);
 		if (!ret)
@@ -325,49 +408,34 @@ static int rswap_redis_store(struct rswap_kv_page *pages, unsigned int nr,
 	if (ret)
 		goto out_free;
 
-	sock = rswap_redis_open();
-	if (IS_ERR(sock)) {
-		ret = PTR_ERR(sock);
-		goto out_free;
-	}
+	ret = rswap_sock_send(conn->sock, request, cmd.len);
+	for (i = 0; !ret && i < nr; i++)
+		ret = rswap_redis_status(conn->sock, "OK");
 
-	ret = rswap_sock_send(sock, request, cmd.len);
-	for (i = 0; !ret && i < replies + nr; i++)
-		ret = rswap_redis_status(sock, "OK");
-
-	rswap_sock_close(sock);
 out_free:
 	kvfree(request);
+	if (rswap_redis_transport_error(ret))
+		rswap_redis_drop(conn);
 	return ret;
 }
 
-/*
- * Load a batch of pages: one write with AUTH, SELECT and every GET, then the
- * status replies and one bulk reply per page.
- */
-static int rswap_redis_load(struct rswap_kv_page *pages, unsigned int nr,
-			    size_t len)
+static int rswap_redis_do_load(struct rswap_redis_conn *conn,
+			       struct rswap_kv_page *pages, unsigned int nr,
+			       size_t len)
 {
-	size_t header_size = rswap_redis_header_size(nr);
 	struct rswap_redis_cmd cmd;
-	struct socket *sock;
 	char *request;
-	unsigned int replies;
 	unsigned int i;
-	int ret;
+	int ret = 0;
 
-	if (!nr)
-		return -EINVAL;
-
-	request = kvmalloc(header_size, GFP_NOIO);
+	request = kvmalloc(nr * RSWAP_REDIS_CMD_SIZE, GFP_NOIO);
 	if (!request)
 		return -ENOMEM;
 
 	cmd.buf = request;
-	cmd.size = header_size;
+	cmd.size = nr * RSWAP_REDIS_CMD_SIZE;
 	cmd.len = 0;
 
-	ret = rswap_redis_queue_preamble(&cmd, &replies);
 	for (i = 0; !ret && i < nr; i++) {
 		ret = rswap_redis_add_array(&cmd, 2);
 		if (!ret)
@@ -379,25 +447,82 @@ static int rswap_redis_load(struct rswap_kv_page *pages, unsigned int nr,
 	if (ret)
 		goto out_free;
 
-	sock = rswap_redis_open();
-	if (IS_ERR(sock)) {
-		ret = PTR_ERR(sock);
-		goto out_free;
-	}
-
-	ret = rswap_sock_send(sock, request, cmd.len);
-	for (i = 0; !ret && i < replies; i++)
-		ret = rswap_redis_status(sock, "OK");
+	ret = rswap_sock_send(conn->sock, request, cmd.len);
 	for (i = 0; !ret && i < nr; i++)
-		ret = rswap_redis_read_bulk(sock, pages[i].data, len);
+		ret = rswap_redis_read_bulk(conn->sock, pages[i].data, len);
 
-	rswap_sock_close(sock);
 out_free:
 	kvfree(request);
+	if (rswap_redis_transport_error(ret))
+		rswap_redis_drop(conn);
+	return ret;
+}
+
+static int rswap_redis_store(struct rswap_kv_page *pages, unsigned int nr,
+			     size_t len)
+{
+	struct rswap_redis_conn *conn;
+	unsigned int tries = 0;
+	int ret;
+
+	if (!nr)
+		return -EINVAL;
+
+	conn = rswap_redis_conn_get();
+	if (!conn)
+		return -ENOMEM;
+retry:
+	ret = rswap_redis_ensure(conn);
+	if (!ret)
+		ret = rswap_redis_do_store(conn, pages, nr, len);
+	if (ret && rswap_redis_transport_error(ret) && !conn->sock &&
+	    tries++ < 1) {
+		atomic64_inc(&rswap_redis_retries);
+		goto retry;
+	}
+	rswap_redis_conn_put(conn);
+	return ret;
+}
+
+static int rswap_redis_load(struct rswap_kv_page *pages, unsigned int nr,
+			    size_t len)
+{
+	struct rswap_redis_conn *conn;
+	unsigned int tries = 0;
+	int ret;
+
+	if (!nr)
+		return -EINVAL;
+
+	conn = rswap_redis_conn_get();
+	if (!conn)
+		return -ENOMEM;
+retry:
+	ret = rswap_redis_ensure(conn);
+	if (!ret)
+		ret = rswap_redis_do_load(conn, pages, nr, len);
+	if (ret && rswap_redis_transport_error(ret) && !conn->sock &&
+	    tries++ < 1) {
+		atomic64_inc(&rswap_redis_retries);
+		goto retry;
+	}
+	rswap_redis_conn_put(conn);
 	return ret;
 }
 
 /* ---------- Backend registration ---------- */
+
+static void rswap_redis_show_stats(struct seq_file *m)
+{
+	seq_printf(m, "redis_connects\t%llu\n",
+		   atomic64_read(&rswap_redis_connects));
+	seq_printf(m, "redis_reuses\t%llu\n",
+		   atomic64_read(&rswap_redis_reuses));
+	seq_printf(m, "redis_dropped\t%llu\n",
+		   atomic64_read(&rswap_redis_dropped));
+	seq_printf(m, "redis_retries\t%llu\n",
+		   atomic64_read(&rswap_redis_retries));
+}
 
 static int rswap_redis_init(const struct rswap_kv_config *cfg)
 {
@@ -427,4 +552,5 @@ const struct rswap_backend rswap_redis_backend = {
 	.init			= rswap_redis_init,
 	.store			= rswap_redis_store,
 	.load			= rswap_redis_load,
+	.show_stats		= rswap_redis_show_stats,
 };
