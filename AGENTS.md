@@ -54,6 +54,20 @@ Both are deliberately simple:
 - `->can_merge()` accepts merging so several folios (up to the swap core's
   `SWAP_CLUSTER_MAX` bvecs) share one request; that is what fills a batch on
   the base-page path, where every folio is a single 4 KiB/16 KiB page.
+
+### Request granularity
+
+How full a batch gets is decided by two core paths, not by the backend:
+
+- `->can_merge()`: without it the swap core submits one folio per request, so
+  every 4 KiB/16 KiB base page costs its own round trip. rswap merges when
+  every page of both folios can move.
+- swap readahead: plain xswap skips it because its entries live only in zswap,
+  but rswap entries live in the remote store, so `mm/swap_state.c` keeps
+  readahead for `SWP_RSWAP`. One fault's readahead window becomes one request.
+
+A fault that finds no readahead window still submits one page
+(`swapin_sync`), and the HTTP backend always sends one object per request.
 - The endpoint is a boot parameter; the defaults are `127.0.0.1:6789` (HTTP)
   and `127.0.0.1:6379` (Redis).
 - No payload encryption and no persistence guarantees beyond the backend
@@ -328,7 +342,9 @@ debugfs:
 `stats` reports, per direction, the pages and bytes moved, the number of
 backend batches, the failed pages, and for writeout the pages that had no
 attached digest (`written_no_digest`) resp. for swapin the entries with no
-stored digest (`read_no_entry`). It also reports the average and peak batch
+stored digest (`read_no_entry`). Failed pages count attempts: reclaim retries
+a page it could not move, so one such page is counted more than once. Such a
+failure happens before the backend is called, so it costs no round trip. It also reports the average and peak batch
 time in nanoseconds, so `written_avg_ns / (written_pages / written_batches)`
 is the per-page store cost:
 
@@ -469,6 +485,12 @@ by recomputing the expected digests from the test seed:
   (no key reuse between rounds), all content-exact, no extras.
 
 Batching and its effect (`RSWAP_BATCH_MAX` = 8, remote server, per page):
+
+- Live, 16 MiB x 2 rounds with `can_merge()` disabled: `written_pages` 2048
+  but `written_batches` 2048 (one page per request) and 4m25s wall time. With
+  merging: 258 batches (7.9 pages per batch), 2m27s, `read_batches` still 2048
+  because swapin readahead was skipped for xswap. Both runs audited exactly
+  2048 objects, no extras, content-exact.
 
 - `rswap_backend_test.py` checks the batching itself: an 8 page folio is one
   backend call, 12 pages split into 8 + 4, and data survives both directions.
