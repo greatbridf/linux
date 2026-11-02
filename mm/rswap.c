@@ -671,16 +671,43 @@ static void rswap_submit_read(struct swap_io_ctx *ctx)
 	rswap_submit(ctx, READ);
 }
 
+/* Can every base page of @folio be moved right now? */
+static bool rswap_folio_ready(struct folio *folio, int rw)
+{
+	unsigned long i;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		swp_entry_t entry = folio_swap_entry(folio, i);
+		struct swap_info_struct *si = __swap_entry_to_info(entry);
+		u8 hash[SHA256_DIGEST_SIZE];
+
+		if (rw == WRITE) {
+			if (!rswap_page_get_hash(folio_page(folio, i), hash))
+				return false;
+		} else if (!rswap_hash_load(si, entry, hash)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /*
- * rswap_can_merge - Check whether two folios can share a single request.
+ * rswap_can_merge - Can @folio share a request with @prev_folio?
  *
- * For a KV store each folio is a separate request, so merging is
- * not supported.
+ * Merging is what lets one KV round trip carry several pages; without it every
+ * folio is its own request and the round trip cost is paid per page.
+ *
+ * A page that cannot be moved must not drag its neighbours down with it: the
+ * swap core fails a whole request at once, so a folio whose pages have no
+ * attached digest (writeout) resp. no stored digest (swapin) is submitted on
+ * its own and only it fails and stays resident.  That is why @prev_folio is
+ * re-checked as well: it may have started the request without being asked.
  */
 static bool rswap_can_merge(struct folio *folio, struct folio *prev_folio,
 			    size_t prev_folio_size, int rw)
 {
-	return false;
+	return rswap_folio_ready(prev_folio, rw) &&
+	       rswap_folio_ready(folio, rw);
 }
 
 /* The rswap operations vector. */

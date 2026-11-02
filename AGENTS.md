@@ -51,6 +51,9 @@ Both are deliberately simple:
   backend up to `RSWAP_BATCH_MAX` (8) pages at a time, which the Redis backend
   pipelines into a single write; HTTP/1.0 carries one object per request and
   turns a batch into a sequence of requests.
+- `->can_merge()` accepts merging so several folios (up to the swap core's
+  `SWAP_CLUSTER_MAX` bvecs) share one request; that is what fills a batch on
+  the base-page path, where every folio is a single 4 KiB/16 KiB page.
 - The endpoint is a boot parameter; the defaults are `127.0.0.1:6789` (HTTP)
   and `127.0.0.1:6379` (Redis).
 - No payload encryption and no persistence guarantees beyond the backend
@@ -126,7 +129,9 @@ charges milliseconds per round trip, so batching is what makes it usable.
 They run in swap I/O context under `GFP_NOIO`, may sleep, and must not touch
 the filesystem. `->load()` returns `-ENOENT` for a missing key and rejects an
 object whose length is not exactly one base page. On error the whole swap
-request fails.
+request fails, which is why `rswap_can_merge()` only merges folios whose pages
+all have a digest: a page that cannot be moved must fail alone instead of
+taking its request neighbours down with it.
 
 Backends are chosen at boot, never at runtime: switching a live device to a
 different store would strand every page already written to the old one.

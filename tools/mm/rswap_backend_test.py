@@ -27,6 +27,8 @@ SHIMS = r"""
 #define ITER_SOURCE 0
 #define ITER_DEST 1
 #define RSWAP_SHA256_HEXLEN 64
+#define SHA256_DIGEST_SIZE 32
+typedef uint8_t u8;
 #define RSWAP_KV_KEY_LEN 65
 #define RSWAP_BATCH_MAX 8
 #define RSWAP_HTTP_MAX_HEADER 2048
@@ -50,6 +52,7 @@ struct page { unsigned char *data; };
 struct folio {
     swp_entry_t swap;
     unsigned char *data;
+    unsigned long nr_pages;
     struct page pages[16];
 };
 struct rswap_kv_page {
@@ -144,6 +147,22 @@ static struct folio *bvec_folio(struct bio_vec *bv) { return bv->folio; }
 static unsigned long folio_page_idx(struct folio *folio, struct page *page)
 {
     return page - folio->pages;
+}
+static unsigned long folio_nr_pages(struct folio *folio)
+{
+    return folio->nr_pages ? folio->nr_pages : 1;
+}
+/* Mergefability probes: the real ones read page_ext resp. the device table. */
+static bool digest_ok = true;
+static bool entry_ok = true;
+static bool rswap_page_get_hash(struct page *page, unsigned char *hash)
+{
+    return digest_ok;
+}
+static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
+                            unsigned char *hash)
+{
+    return entry_ok;
 }
 static struct page *folio_page(struct folio *folio, unsigned long index)
 {
@@ -415,6 +434,33 @@ int main(void)
         printf("FAIL: two folios read in %d call(s) moving %d page(s),"
                " expected 1/2\n", requests, moved);
         return 1;
+    }
+    /* Merging is only allowed when every page of the folio is movable. */
+    {
+        struct folio candidate = { .swap = { .val = 1 }, .nr_pages = 8 };
+        struct folio previous = { .swap = { .val = 1 } };
+
+        if (!rswap_can_merge(&candidate, &previous, PAGE_SIZE, WRITE) ||
+            !rswap_can_merge(&candidate, &previous, PAGE_SIZE, READ)) {
+            puts("FAIL: ready folio refused a merged request");
+            return 1;
+        }
+        digest_ok = false;
+        if (rswap_can_merge(&candidate, &previous, PAGE_SIZE, WRITE)) {
+            puts("FAIL: merged a write whose pages have no digest");
+            return 1;
+        }
+        if (!rswap_can_merge(&candidate, &previous, PAGE_SIZE, READ)) {
+            puts("FAIL: write-only digest gate blocked a read merge");
+            return 1;
+        }
+        digest_ok = true;
+        entry_ok = false;
+        if (rswap_can_merge(&candidate, &previous, PAGE_SIZE, READ)) {
+            puts("FAIL: merged a read whose entries have no digest");
+            return 1;
+        }
+        entry_ok = true;
     }
     /* A missing page must fail completion and remain not uptodate. */
     stored_len[2] = 0;
@@ -732,8 +778,8 @@ def main():
              in source else
              "static void rswap_submit(" if "static void rswap_submit(" in source
              else "static void rswap_submit_write(")
-    submit = source[source.index(start):source.index(
-        "/*\n * rswap_can_merge")]
+    submit = source[source.index(start):
+                    source.index("/* The rswap operations vector. */")]
     hashes = source[source.index(
         "static struct rswap_hash_entry *rswap_hash_slot("):
         source.index("/* ---------- swap_ops implementations")]
