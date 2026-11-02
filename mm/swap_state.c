@@ -894,8 +894,12 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	struct blk_plug plug;
 	swp_entry_t ra_entry;
 
-	/* xswap entries live only in zswap; readahead does not help. */
-	if (si->flags & SWP_XSWAP)
+	/*
+	 * Plain xswap entries live only in zswap, where readahead does not
+	 * help.  rswap entries live in a remote store, where one request can
+	 * carry several pages, so readahead pays off there.
+	 */
+	if ((si->flags & SWP_XSWAP) && !(si->flags & SWP_RSWAP))
 		goto skip;
 
 	mask = swapin_nr_pages(offset) - 1;
@@ -992,8 +996,12 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
 	unsigned long start, end, addr;
 	pgoff_t ilx = targ_ilx;
 
-	/* xswap entries live only in zswap; readahead does not help. */
-	if (si->flags & SWP_XSWAP)
+	/*
+	 * Plain xswap entries live only in zswap, where readahead does not
+	 * help.  rswap entries live in a remote store, where one request can
+	 * carry several pages, so readahead pays off there.
+	 */
+	if ((si->flags & SWP_XSWAP) && !(si->flags & SWP_RSWAP))
 		goto skip;
 
 	win = swap_vma_ra_win(vmf, &start, &end);
