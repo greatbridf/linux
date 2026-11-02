@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdint.h>
@@ -11,6 +12,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/compiler.h>
+#include <openssl/evp.h>
+
+#define RSWAP_ATTACH_PATH "/proc/sys/vm/rswap/attach"
 
 static void sigbus_handler(int sig __always_unused,
 			  siginfo_t *info __always_unused,
@@ -29,6 +33,53 @@ static uint64_t pattern(uint64_t word, uint64_t seed)
 	value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
 	value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
 	return value ^ (value >> 31);
+}
+
+static int attach_page_hashes(void *data, size_t size, size_t page_size)
+{
+	EVP_MD_CTX *ctx;
+	size_t offset;
+	int fd;
+	int ret = -1;
+
+	ctx = EVP_MD_CTX_new();
+	fd = open(RSWAP_ATTACH_PATH, O_WRONLY);
+	if (!ctx || fd < 0) {
+		perror(RSWAP_ATTACH_PATH);
+		goto out;
+	}
+
+	for (offset = 0; offset < size; offset += page_size) {
+		unsigned char hash[EVP_MAX_MD_SIZE];
+		unsigned int hash_len;
+		char hex[EVP_MAX_MD_SIZE * 2 + 1];
+		char line[128];
+		size_t i, len;
+
+		if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1 ||
+		    EVP_DigestUpdate(ctx, (char *)data + offset, page_size) != 1 ||
+		    EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1 ||
+		    hash_len != 32) {
+			fprintf(stderr, "SHA-256 failed at offset %zu\n", offset);
+			goto out;
+		}
+		for (i = 0; i < hash_len; i++)
+			snprintf(hex + i * 2, 3, "%02x", hash[i]);
+		len = snprintf(line, sizeof(line), "%#lx %s\n",
+			       (unsigned long)((char *)data + offset), hex);
+		if (len >= sizeof(line) || lseek(fd, 0, SEEK_SET) < 0 ||
+		    write(fd, line, len) != (ssize_t)len) {
+			perror("attach page hash");
+			goto out;
+		}
+	}
+
+	ret = 0;
+out:
+	if (fd >= 0)
+		close(fd);
+	EVP_MD_CTX_free(ctx);
+	return ret;
 }
 
 int main(int argc, char **argv)
@@ -102,6 +153,8 @@ int main(int argc, char **argv)
 
 		for (i = 0; i < size / sizeof(*data); i++)
 			data[i] = pattern(i, seed);
+		if (attach_page_hashes(data, size, page_size))
+			return 1;
 		if (huge) {
 			FILE *file = fopen("/proc/self/smaps", "r");
 			char line[256];
