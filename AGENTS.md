@@ -73,6 +73,28 @@ How full a batch gets is decided by two core paths, not by the backend:
 
 A fault that finds no readahead window still submits one page
 (`swapin_sync`), and the HTTP backend always sends one object per request.
+
+### Submission and completion
+
+The current rswap submission path is synchronous, even when reached through
+`read_swap_cache_async()` or `MADV_WILLNEED`. `swap_read_submit()` calls
+`rswap_submit_read()` directly; `rswap_submit()` waits for each
+`rswap_flush_batch()` before advancing. Redis pipelines up to 32 GET commands,
+then receives all responses in that batch before the next batch is sent.
+Pooling reuses connections and permits overlap between callers; a single
+caller still has only one batch in flight. WILLNEED fills larger batches but
+does not make this backend asynchronous.
+
+The planned optimization is recorded in `TODOS.md`: dispatch/queue reads and
+return promptly, allow bounded concurrent I/O, and invoke the existing swap
+completion callback when each request finishes. Preserve request, folio,
+buffer and device lifetimes, complete exactly once, and drain outstanding
+work safely during teardown. This is pending work, not implemented behavior.
+The swapin performance test must then separate submission time from actual
+I/O completion instead of assuming WILLNEED has finished loading on return.
+
+### Endpoint and build scope
+
 - The endpoint is a boot parameter; the defaults are `127.0.0.1:6789` (HTTP)
   and `127.0.0.1:6379` (Redis).
 - No payload encryption and no persistence guarantees beyond the backend
@@ -286,12 +308,20 @@ swap fault
   hashes before reclaim.
 - `tools/mm/rswap_run_test.py`: cgroup-based live test runner.
 - `tools/mm/rswap_scale_test.py`: scaled live test (512 MiB by default) that
-  also sets up the KV server and swap device, then audits the backend keys.
+  sets up a local HTTP KV server and swap device, then audits backend keys;
+  it is not a Redis setup/audit runner.
+- `tools/mm/rswap_pageout_test.c` / `.py` / `.rst`: separate whole-mapping
+  MADV_PAGEOUT test, trace runner, and usage notes; measures batch overlap,
+  swap PTEs, and physical residency independently.
+- `tools/mm/rswap_swapin_test.c` / `.py` / `.rst`: separate cold swapin
+  benchmark comparing WILLNEED with page faults and multiple reader threads.
 - `tools/mm/rswap_backend_test.py`: source-level backend, batching, counter and
   table regressions.
 - `tools/mm/rswap_redis_test.py`: RESP client test against a scripted server,
   plus `--live` against a real Redis server.
 - `tools/mm/kvswap_test.py`: HTTP protocol regression tests.
+- `TODOS.md`: pending asynchronous `submit_read` design, lifecycle requirements,
+  and validation criteria.
 
 ## Interfaces and Operations
 
@@ -364,9 +394,11 @@ redis_retries       0
 `redis_connects` counts sockets opened, `redis_reuses` batches that found a
 live pooled socket, `redis_dropped` stale or broken sockets closed, and
 `redis_retries` batches retried on a fresh connection. A steady state run
-wants `reuses` to dominate and `connects` to stay small. It also reports the average and peak batch
-time in nanoseconds, so `written_avg_ns / (written_pages / written_batches)`
-is the per-page store cost:
+wants `reuses` to dominate and `connects` to stay small. It also reports the
+average and peak batch time in nanoseconds, so
+`written_avg_ns / (written_pages / written_batches)`
+is the per-page store cost. Historical example with the old 8-page limit
+(the current `batch_max` is 32):
 
 ```text
 backend             redis
@@ -400,7 +432,7 @@ Build userspace tools:
 
 ```sh
 make -C rswap-userspace-demos user
-make -C tools/mm kvswap_server rswap_test
+make -C tools/mm kvswap_server rswap_test rswap_pageout_test rswap_swapin_test
 ```
 
 Build the installable kernel packages:
@@ -432,9 +464,9 @@ Live integrity test, with rswap as the only active swap device:
 sudo python3 tools/mm/rswap_run_test.py --size-kib 8192 --rounds 5
 ```
 
-Scaled live test (512 MiB of anonymous memory by default). It starts the KV
-server, creates the rswap device, runs the verifier in a bounded cgroup, and
-then checks that the backend holds exactly one full page object per base
+Scaled live HTTP test (512 MiB of anonymous memory by default). It starts the
+local KV server, creates the rswap device, runs the verifier in a bounded
+cgroup, and then checks that the backend holds exactly one full page object per base
 page and nothing else. `--takeover-swap` swaps off existing devices for the
 duration of the run and restores them before exit:
 
@@ -446,6 +478,45 @@ sudo python3 tools/mm/rswap_scale_test.py --size-kib 524288 --rounds 2 \
 
 The verifier now attaches userspace hashes before each round. This update is
 required because unattached pages intentionally fail writeout.
+
+### Whole-mapping pageout and cold swapin performance
+
+Keep these experiments in their separate test files; do not repurpose the
+existing `rswap_test.c` / `rswap_run_test.py` integrity test in place.
+Both new runners default to 512 MiB and require the configured backend to be
+reachable, debugfs/tracefs mounted, and `CONFIG_FPROBE_EVENTS`. They create
+private trace instances to measure batch size and overlapping entry/return
+intervals. Stop other rswap workloads while measuring global counters.
+
+```sh
+sudo python3 tools/mm/rswap_pageout_test.py --takeover-swap \
+    --output /tmp/rswap-pageout-base
+sudo python3 tools/mm/rswap_pageout_test.py --takeover-swap --huge \
+    --output /tmp/rswap-pageout-thp
+sudo python3 tools/mm/rswap_swapin_test.py --takeover-swap \
+    --mode willneed --workers 1 --output /tmp/rswap-willneed-1
+sudo python3 tools/mm/rswap_swapin_test.py --takeover-swap \
+    --mode willneed --workers 8 --output /tmp/rswap-willneed-8
+sudo python3 tools/mm/rswap_swapin_test.py --takeover-swap \
+    --mode fault --workers 8 --output /tmp/rswap-fault-8
+```
+
+Output directories must be new. `--size-kib` allows smaller checks. Swapin
+accepts 1..32 workers dividing the page count, each on a disjoint range.
+The runners restore swap configuration and remove their cgroup and tracing
+state. They retain `result.json`, raw traces, logs and `digests.txt`; backend
+objects remain for a separate audit/cleanup using that manifest. Preserve
+preexisting backend objects. Neither runner starts a backend server.
+
+The pageout test issues exactly one MADV_PAGEOUT over the entire mapping,
+without retries or `memory.reclaim`. Successful backend writes and swap PTEs
+do not prove RAM was freed: `mincore()` can still find pages in swap cache.
+The swapin test therefore follows pageout with bounded cgroup reclaim and
+requires every page nonresident before timing. It checks actual remote byte
+counts, then verifies every word with no additional remote reads. Preparation
+time is excluded. Report batch latency as backend-call latency, not bare RTT
+or individual page-fault latency. Under concurrency, compute bandwidth from
+wall time rather than summed overlapping batch durations.
 
 For manual live testing, stop zram swap before creating the remote-only
 configuration (`rswap_scale_test.py --takeover-swap` does this and restores
@@ -482,8 +553,8 @@ The no-fallback design has been tested live on ARM64 with 16 KiB base pages:
 - Backend source regressions and all 11 KV protocol tests passed.
 
 After the backend split the live runs above still target the HTTP backend.
-The Redis backend has been verified at the protocol level only, because that
-requires a kernel with `CONFIG_RSWAP_KV_REDIS=y` booted:
+Redis protocol checks also passed; the subsequent live results below use a
+kernel booted with `CONFIG_RSWAP_KV_REDIS=y`:
 
 - `rswap_redis_test.py` builds the real `mm/rswap_redis.c` RESP code against
   POSIX socket shims and passes against a scripted RESP server: pipelined
@@ -504,7 +575,8 @@ by recomputing the expected digests from the test seed:
 - 16 MiB, 2 rounds: 1024/1024 pages evicted per round, 2048 distinct objects
   (no key reuse between rounds), all content-exact, no extras.
 
-Batching and its effect (`RSWAP_BATCH_MAX` = 8, remote server, per page):
+Earlier batching measurements and regressions (remote server; the initial
+batch limit was 8 and was subsequently raised to 32):
 
 - Live, 16 MiB x 2 rounds with `can_merge()` disabled: `written_pages` 2048
   but `written_batches` 2048 (one page per request) and 4m25s wall time. With
@@ -512,10 +584,11 @@ Batching and its effect (`RSWAP_BATCH_MAX` = 8, remote server, per page):
   because swapin readahead was skipped for xswap. Both runs audited exactly
   2048 objects, no extras, content-exact.
 
-- `rswap_backend_test.py` checks the batching itself: an 8 page folio is one
-  backend call, 12 pages split into 8 + 4, and data survives both directions.
-- `rswap_redis_test.py` checks that a batch of 8 pages uses one connection and
-  sends 8 pipelined `SET`/`GET` commands.
+- At the current 32-page limit, `rswap_backend_test.py` checks that 8- and
+  12-page folios each use one backend call, 40 pages split into 32 + 8, and
+  data survives both directions.
+- `rswap_redis_test.py` checks that 32 pages use one connection with 32
+  pipelined `SET`/`GET` commands, plus reuse across successive batches.
 - Harness timing against the remote server: 8 pages one connection each cost
   42 ms/page written and 48 ms/page read; pipelined into one batch they cost
   7 ms/page in both directions.
@@ -541,9 +614,53 @@ RESP code, and `rswap_backend_test.py` still passes unchanged in substance for
 the response parser, the submit paths, the per-entry key path and slot
 cleanup.
 
-Expected `-ENODATA`/`-61` kernel messages occur during deliberate tests of
-writeout without an attached digest. They are not evidence of a fallback
-path.
+### November 2, 2026: 32-page batching and concurrency
+
+Tested on kernel `aeb11a14094d`, ARM64 with 16 KiB pages and remote Redis:
+
+- Integrity/reclaim runs passed at 8 MiB x 5 rounds, 16 MiB x 2 rounds, and
+  512 MiB with base pages and THP. Every page was evicted, every byte matched,
+  and all 72,192 objects across these runs and a readahead check passed exact
+  digest/content audits. One Redis connection served 11,116 batches without
+  drops or retries. Backend harnesses, all 11 HTTP protocol tests, scripted
+  and live Redis tests, and the affected rswap object build with `W=1` passed.
+- One 512 MiB MADV_PAGEOUT: base pages took 25.58 s (20.01 MiB/s), with
+  1,025 batches; THP took 29.16 s with 1,024 full 32-page batches. Both traces
+  showed one writer and peak concurrency one. All 32,768 pages were written
+  and became swap PTEs, but only 1,023/1,024 pages (about 16 MiB) were
+  nonresident immediately. The rest remained in swap cache. Full content
+  verification and separate audits of all remote objects passed.
+
+Cold swapin results below kept `vm.page-cluster=3`. Every run started with
+32,768 nonresident pages, read exactly 512 MiB remotely without errors or
+retries, and verified all contents with no further remote reads:
+
+| Access mode | Callers | Load time | Payload MiB/s | Peak active batches |
+|---|---:|---:|---:|---:|
+| Page faults | 1 | 61.42 s | 8.34 | 1 |
+| WILLNEED | 1 | 52.72 s | 9.71 | 1 |
+| WILLNEED | 2 | 36.59 s | 13.99 | 2 |
+| WILLNEED | 4 | 23.67 s | 21.63 | 4 |
+| WILLNEED | 8 | 22.76 s | 22.50 | 8 |
+| Page faults | 8 | 24.79 s | 20.66 | 8 |
+
+WILLNEED used 1,024 full 32-page batches in each run. Page faults averaged
+about eight pages per batch. WILLNEED batch p50/p95 latency increased from
+48.70/67.96 ms with one caller to 148.24/300.49 ms with eight, while total
+load time fell because requests overlapped. Throughput flattened around
+four to eight callers; individual runs do not establish physical link
+capacity. These findings motivate the asynchronous `submit_read` TODO.
+
+The cold tests recorded a 2,129,920-byte cgroup swap charge after verifier
+exit, before device teardown; its cause was not established and it is not
+proof of unfinished remote reads. The measured mapping was fully loaded
+and verified. Swap configuration and tracing were restored; each run's
+exact key set and object sizes were audited and test objects removed.
+
+Expected `-ENODATA`/`-61` messages can occur when deliberate negative tests or
+cgroup reclaim attempt unattached pages outside the test mapping. Compare
+`written_errors` with `written_no_digest` and audit keys; these rejects alone
+are not backend transport failures or evidence of a fallback path.
 
 ## Known Limitations
 
@@ -558,12 +675,14 @@ path.
 - The HTTP KV server has no authentication and the kernel sends no
   credentials to it. Redis supports `AUTH`/`SELECT`, but its secret is a boot
   parameter and is stored in plain text while the kernel runs.
-- Throughput is bounded by round trips: one connection per batch, and the
-  Redis backend still sends one command per page inside the batch. Both the
-  single-threaded HTTP server and this design are for testing, not production
-  throughput. A backend switch needs a reboot, and the backend for a device is
-  never recorded, so a device written with one backend cannot be read back
-  with another.
+- One caller waits for each batch to finish before submitting the next,
+  including on WILLNEED. Redis leases and reuses a pooled connection for each
+  batch and sends one command per page; overlapping callers can use multiple
+  connections. Asynchronous read submission is pending in `TODOS.md`. Both
+  the single-threaded HTTP server and this design are for testing, not
+  production throughput. A backend switch needs a reboot, and the backend
+  for a device is never recorded, so a device written with one backend cannot
+  be read back with another.
 - `RSWAP_BATCH_MAX` also bounds the core's per-request batch buffer (32 base
   pages: 128 KiB with 4 KiB pages, 512 KiB with 16 KiB pages), kvmalloc'ed for
   the duration of a request, plus the same amount again in the Redis request
