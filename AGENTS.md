@@ -46,11 +46,16 @@ backends ship with the kernel:
 
 Both are deliberately simple:
 
-- One connection per `->store()`/`->load()` call and nothing cached across
-  calls, so no locking is needed in the swap I/O path. The core hands a
-  backend up to `RSWAP_BATCH_MAX` (8) pages at a time, which the Redis backend
-  pipelines into a single write; HTTP/1.0 carries one object per request and
-  turns a batch into a sequence of requests.
+- The core hands a backend up to `RSWAP_BATCH_MAX` (8) pages at a time, which
+  the Redis backend pipelines into a single write; HTTP/1.0 carries one object
+  per request and turns a batch into a sequence of requests.
+- The Redis backend pools connections (`RSWAP_REDIS_POOL_MAX` = 8) and reuses
+  them, with `AUTH`/`SELECT` sent once per connection. A fresh connection per
+  batch costs ~90 ms for 128 KiB against ~15 ms on an established one (TCP
+  handshake plus slow start over the remote path). A pooled socket whose peer
+  has closed is detected and dropped, and a batch that fails on the transport
+  is retried once on a fresh connection, which is safe because `SET`/`GET` are
+  idempotent. HTTP opens a connection per request as before.
 - `->can_merge()` accepts merging so several folios (up to the swap core's
   `SWAP_CLUSTER_MAX` bvecs) share one request; that is what fills a batch on
   the base-page path, where every folio is a single 4 KiB/16 KiB page.
@@ -344,7 +349,22 @@ backend batches, the failed pages, and for writeout the pages that had no
 attached digest (`written_no_digest`) resp. for swapin the entries with no
 stored digest (`read_no_entry`). Failed pages count attempts: reclaim retries
 a page it could not move, so one such page is counted more than once. Such a
-failure happens before the backend is called, so it costs no round trip. It also reports the average and peak batch
+failure happens before the backend is called, so it costs no round trip.
+
+Backends may add their own lines at the end of `stats`; the Redis backend
+reports its connection pool:
+
+```text
+redis_connects      1
+redis_reuses        258
+redis_dropped       0
+redis_retries       0
+```
+
+`redis_connects` counts sockets opened, `redis_reuses` batches that found a
+live pooled socket, `redis_dropped` stale or broken sockets closed, and
+`redis_retries` batches retried on a fresh connection. A steady state run
+wants `reuses` to dominate and `connects` to stay small. It also reports the average and peak batch
 time in nanoseconds, so `written_avg_ns / (written_pages / written_batches)`
 is the per-page store cost:
 
@@ -499,6 +519,11 @@ Batching and its effect (`RSWAP_BATCH_MAX` = 8, remote server, per page):
 - Harness timing against the remote server: 8 pages one connection each cost
   42 ms/page written and 48 ms/page read; pipelined into one batch they cost
   7 ms/page in both directions.
+- Measured per batch against the remote server: a fresh connection needs 2 ms
+  to connect, ~34 ms for the first command, and 45-54 ms for the first 128 KiB
+  batch (TCP slow start), settling at 13-15 ms per batch once warm. So the
+  connection, not the batch size, was the bottleneck; pooling it takes a batch
+  from 71 ms to 25 ms in the harness (15 ms steady state).
 - The live verifier used to spend ~60 ms per page operation; that is one TCP
   connect plus one RESP round trip to a proxied endpoint, not kernel time (the
   loopback HTTP backend does 0.09 ms per page operation).
