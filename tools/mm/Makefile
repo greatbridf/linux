@@ -5,6 +5,8 @@ include ../scripts/Makefile.include
 
 BUILD_TARGETS=page-types slabinfo page_owner_sort page_owner_filter
 BUILD_TARGETS += thp_swap_allocator_test gup_bench kvswap_server rswap_test
+BUILD_TARGETS += rswap_pageout_test
+BUILD_TARGETS += rswap_swapin_test
 INSTALL_TARGETS = $(BUILD_TARGETS) thpmaps
 
 LIB_DIR = ../lib/api
@@ -27,7 +29,7 @@ $(LIBS):
 gup_bench: $(GUP_BENCH_OBJS) $(LIBS)
 	$(CC) $(CFLAGS) -o $@ $(GUP_BENCH_OBJS) $(LDFLAGS)
 
-rswap_test: rswap_test.c $(LIBS)
+rswap_test rswap_pageout_test rswap_swapin_test: %: %.c $(LIBS)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lcrypto
 
 clean:
