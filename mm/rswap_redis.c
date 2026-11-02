@@ -6,16 +6,19 @@
  * backends use, so a Redis dump can be audited directly against the digests
  * user space attached.  Values are raw base page images.
  *
- * One page operation is one connection with the commands pipelined:
+ * One batch of up to RSWAP_BATCH_MAX pages is one connection with all of its
+ * commands pipelined into a single write:
  *
- *   write:  AUTH* SELECT* SET <key> <page bytes>
- *   read:   AUTH* SELECT* GET <key>
+ *   write:  AUTH* SELECT* (SET <key> <page bytes>)+
+ *   read:   AUTH* SELECT* (GET <key>)+
  *
  * (*) only when a password resp. a non-zero database is configured.
  *
- * Nothing is cached across operations.  Swap I/O runs on many CPUs at once,
- * so a shared connection would need a sleeping lock in the I/O path; opening
- * a connection per page keeps the backend stateless instead.
+ * Pipelining is what makes this usable: a round trip to a remote server costs
+ * milliseconds, so paying one per page instead of one per batch dominates the
+ * run time.  Nothing is cached across calls.  Swap I/O runs on many CPUs at
+ * once, so a shared connection would need a sleeping lock in the I/O path;
+ * opening a connection per batch keeps the backend stateless instead.
  */
 
 #define pr_fmt(fmt) "rswap: " fmt
@@ -31,8 +34,8 @@
 #define RSWAP_REDIS_DEFAULT_PORT	6379
 #define RSWAP_REDIS_SEND_TIMEOUT_MS	10000
 #define RSWAP_REDIS_RECV_TIMEOUT_MS	10000
-/* AUTH + SELECT + the SET/GET header, including bulk length prefixes. */
-#define RSWAP_REDIS_MAX_CMD		320
+/* Upper bound for one command: array and bulk headers plus a 64 digit key. */
+#define RSWAP_REDIS_CMD_SIZE		(RSWAP_KV_KEY_LEN + 32)
 /* Status, error and bulk length lines are all tiny. */
 #define RSWAP_REDIS_MAX_LINE		256
 
@@ -48,8 +51,10 @@ static struct {
 
 /* ---------- RESP wire format ---------- */
 
+/* Builder for a run of pipelined commands inside one write buffer. */
 struct rswap_redis_cmd {
-	char	buf[RSWAP_REDIS_MAX_CMD];
+	char	*buf;
+	size_t	size;
 	size_t	len;
 };
 
@@ -60,7 +65,7 @@ static int rswap_redis_add_array(struct rswap_redis_cmd *cmd, unsigned int argc)
 	int len;
 
 	len = snprintf(prefix, sizeof(prefix), "*%u\r\n", argc);
-	if (len < 0 || cmd->len + len > sizeof(cmd->buf))
+	if (len < 0 || cmd->len + len > cmd->size)
 		return -ENOSPC;
 	memcpy(cmd->buf + cmd->len, prefix, len);
 	cmd->len += len;
@@ -74,10 +79,21 @@ static int rswap_redis_add_bulk_header(struct rswap_redis_cmd *cmd, size_t len)
 	int plen;
 
 	plen = snprintf(prefix, sizeof(prefix), "$%zu\r\n", len);
-	if (plen < 0 || cmd->len + plen + 2 > sizeof(cmd->buf))
+	if (plen < 0 || cmd->len + plen + 2 > cmd->size)
 		return -ENOSPC;
 	memcpy(cmd->buf + cmd->len, prefix, plen);
 	cmd->len += plen;
+	return 0;
+}
+
+/* Append raw bytes, used for bulk payloads that are already in memory. */
+static int rswap_redis_add_raw(struct rswap_redis_cmd *cmd, const void *data,
+			       size_t len)
+{
+	if (cmd->len + len > cmd->size)
+		return -ENOSPC;
+	memcpy(cmd->buf + cmd->len, data, len);
+	cmd->len += len;
 	return 0;
 }
 
@@ -90,7 +106,7 @@ static int rswap_redis_add_bulk(struct rswap_redis_cmd *cmd, const void *arg,
 	ret = rswap_redis_add_bulk_header(cmd, len);
 	if (ret)
 		return ret;
-	if (cmd->len + len + 2 > sizeof(cmd->buf))
+	if (cmd->len + len + 2 > cmd->size)
 		return -ENOSPC;
 	memcpy(cmd->buf + cmd->len, arg, len);
 	cmd->len += len;
@@ -253,81 +269,131 @@ static struct socket *rswap_redis_open(void)
 				  rswap_redis.recv_timeout_ms);
 }
 
-static int rswap_redis_store(const char *key, const void *data, size_t len)
+/*
+ * Size of the request header block: every command of the batch, without the
+ * page images, which are appended after it.
+ */
+static size_t rswap_redis_header_size(unsigned int nr)
 {
-	struct rswap_redis_cmd cmd = { };
+	return (nr + 1) * RSWAP_REDIS_CMD_SIZE;
+}
+
+/*
+ * Store a batch of pages: one write carrying AUTH, SELECT and every SET,
+ * each immediately followed by its page image, then one status reply per
+ * command.
+ */
+static int rswap_redis_store(struct rswap_kv_page *pages, unsigned int nr,
+			     size_t len)
+{
+	struct rswap_redis_cmd cmd;
 	struct socket *sock;
+	char *request;
 	unsigned int replies;
 	unsigned int i;
 	int ret;
 
-	sock = rswap_redis_open();
-	if (IS_ERR(sock))
-		return PTR_ERR(sock);
+	if (!nr)
+		return -EINVAL;
+
+	/* Header bound plus every payload; the real length ends up in cmd.len. */
+	request = kvmalloc(rswap_redis_header_size(nr) + nr * (len + 2),
+			   GFP_NOIO);
+	if (!request)
+		return -ENOMEM;
+
+	cmd.buf = request;
+	cmd.size = rswap_redis_header_size(nr) + nr * (len + 2);
+	cmd.len = 0;
 
 	ret = rswap_redis_queue_preamble(&cmd, &replies);
-	if (!ret)
+	for (i = 0; !ret && i < nr; i++) {
 		ret = rswap_redis_add_array(&cmd, 3);
-	if (!ret)
-		ret = rswap_redis_add_bulk(&cmd, "SET", 3);
-	if (!ret)
-		ret = rswap_redis_add_bulk(&cmd, key, strlen(key));
-	/* The page is sent from its own buffer, not copied into @cmd. */
-	if (!ret)
-		ret = rswap_redis_add_bulk_header(&cmd, len);
-	if (ret)
-		goto out;
-
-	ret = rswap_sock_send(sock, cmd.buf, cmd.len);
-	if (!ret && len)
-		ret = rswap_sock_send(sock, data, len);
-	if (!ret)
-		ret = rswap_sock_send(sock, "\r\n", 2);
-	if (ret)
-		goto out;
-
-	for (i = 0; i <= replies; i++) {
-		ret = rswap_redis_status(sock, "OK");
-		if (ret)
-			goto out;
+		if (!ret)
+			ret = rswap_redis_add_bulk(&cmd, "SET", 3);
+		if (!ret)
+			ret = rswap_redis_add_bulk(&cmd, pages[i].key,
+						   strlen(pages[i].key));
+		if (!ret)
+			ret = rswap_redis_add_bulk_header(&cmd, len);
+		/* A bulk payload must follow its own header directly. */
+		if (!ret)
+			ret = rswap_redis_add_raw(&cmd, pages[i].data, len);
+		if (!ret)
+			ret = rswap_redis_add_raw(&cmd, "\r\n", 2);
 	}
-out:
+	if (ret)
+		goto out_free;
+
+	sock = rswap_redis_open();
+	if (IS_ERR(sock)) {
+		ret = PTR_ERR(sock);
+		goto out_free;
+	}
+
+	ret = rswap_sock_send(sock, request, cmd.len);
+	for (i = 0; !ret && i < replies + nr; i++)
+		ret = rswap_redis_status(sock, "OK");
+
 	rswap_sock_close(sock);
+out_free:
+	kvfree(request);
 	return ret;
 }
 
-static int rswap_redis_load(const char *key, void *data, size_t len)
+/*
+ * Load a batch of pages: one write with AUTH, SELECT and every GET, then the
+ * status replies and one bulk reply per page.
+ */
+static int rswap_redis_load(struct rswap_kv_page *pages, unsigned int nr,
+			    size_t len)
 {
-	struct rswap_redis_cmd cmd = { };
+	size_t header_size = rswap_redis_header_size(nr);
+	struct rswap_redis_cmd cmd;
 	struct socket *sock;
+	char *request;
 	unsigned int replies;
 	unsigned int i;
 	int ret;
 
-	sock = rswap_redis_open();
-	if (IS_ERR(sock))
-		return PTR_ERR(sock);
+	if (!nr)
+		return -EINVAL;
+
+	request = kvmalloc(header_size, GFP_NOIO);
+	if (!request)
+		return -ENOMEM;
+
+	cmd.buf = request;
+	cmd.size = header_size;
+	cmd.len = 0;
 
 	ret = rswap_redis_queue_preamble(&cmd, &replies);
-	if (!ret)
+	for (i = 0; !ret && i < nr; i++) {
 		ret = rswap_redis_add_array(&cmd, 2);
-	if (!ret)
-		ret = rswap_redis_add_bulk(&cmd, "GET", 3);
-	if (!ret)
-		ret = rswap_redis_add_bulk(&cmd, key, strlen(key));
-	if (!ret)
-		ret = rswap_sock_send(sock, cmd.buf, cmd.len);
-	if (ret)
-		goto out;
-
-	for (i = 0; i < replies; i++) {
-		ret = rswap_redis_status(sock, "OK");
-		if (ret)
-			goto out;
+		if (!ret)
+			ret = rswap_redis_add_bulk(&cmd, "GET", 3);
+		if (!ret)
+			ret = rswap_redis_add_bulk(&cmd, pages[i].key,
+						   strlen(pages[i].key));
 	}
-	ret = rswap_redis_read_bulk(sock, data, len);
-out:
+	if (ret)
+		goto out_free;
+
+	sock = rswap_redis_open();
+	if (IS_ERR(sock)) {
+		ret = PTR_ERR(sock);
+		goto out_free;
+	}
+
+	ret = rswap_sock_send(sock, request, cmd.len);
+	for (i = 0; !ret && i < replies; i++)
+		ret = rswap_redis_status(sock, "OK");
+	for (i = 0; !ret && i < nr; i++)
+		ret = rswap_redis_read_bulk(sock, pages[i].data, len);
+
 	rswap_sock_close(sock);
+out_free:
+	kvfree(request);
 	return ret;
 }
 

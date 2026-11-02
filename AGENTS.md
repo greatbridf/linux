@@ -46,8 +46,11 @@ backends ship with the kernel:
 
 Both are deliberately simple:
 
-- One connection and one request per base page; nothing is cached across
-  operations, so no locking is needed in the swap I/O path.
+- One connection per `->store()`/`->load()` call and nothing cached across
+  calls, so no locking is needed in the swap I/O path. The core hands a
+  backend up to `RSWAP_BATCH_MAX` (8) pages at a time, which the Redis backend
+  pipelines into a single write; HTTP/1.0 carries one object per request and
+  turns a batch into a sequence of requests.
 - The endpoint is a boot parameter; the defaults are `127.0.0.1:6789` (HTTP)
   and `127.0.0.1:6379` (Redis).
 - No payload encryption and no persistence guarantees beyond the backend
@@ -102,16 +105,28 @@ struct rswap_backend {
         unsigned int    default_send_timeout_ms;
         unsigned int    default_recv_timeout_ms;
         int             (*init)(const struct rswap_kv_config *cfg);
-        int             (*store)(const char *key, const void *data, size_t len);
-        int             (*load)(const char *key, void *data, size_t len);
+        int             (*store)(struct rswap_kv_page *pages, unsigned int nr,
+                                 size_t len);
+        int             (*load)(struct rswap_kv_page *pages, unsigned int nr,
+                                size_t len);
+};
+
+struct rswap_kv_page {
+        const char      *key;   /* 64 digit hex SHA-256 */
+        void            *data;  /* one base page image */
 };
 ```
 
 The core resolves every default before `->init()`, so a backend only ever
-sees final values. `->store()`/`->load()` run in swap I/O context under
-`GFP_NOIO`, may sleep, and must not touch the filesystem. `->load()` returns
-`-ENOENT` for a missing key and rejects an object whose length is not exactly
-one base page.
+sees final values. `->store()`/`->load()` move `nr` (1..`RSWAP_BATCH_MAX`)
+page images of `len` bytes each; keys are only valid during the call. A
+backend should spend one round trip per batch, not per page: a remote store
+charges milliseconds per round trip, so batching is what makes it usable.
+
+They run in swap I/O context under `GFP_NOIO`, may sleep, and must not touch
+the filesystem. `->load()` returns `-ENOENT` for a missing key and rejects an
+object whose length is not exactly one base page. On error the whole swap
+request fails.
 
 Backends are chosen at boot, never at runtime: switching a live device to a
 different store would strand every page already written to the old one.
@@ -410,6 +425,28 @@ requires a kernel with `CONFIG_RSWAP_KV_REDIS=y` booted:
   hex key, reads back byte-for-byte, a missing key fails with `-ENOENT`, and
   the test leaves no objects behind.
 
+With a kernel booted as `rswap.backend=redis` against a remote server, the
+verifier attached digests before each round and the Redis database was audited
+by recomputing the expected digests from the test seed:
+
+- 8 MiB, 1 round: 512/512 pages evicted, all bytes matched, 512 objects, each
+  exactly one 16 KiB page under the expected userspace digest, no extras.
+- 16 MiB, 2 rounds: 1024/1024 pages evicted per round, 2048 distinct objects
+  (no key reuse between rounds), all content-exact, no extras.
+
+Batching and its effect (`RSWAP_BATCH_MAX` = 8, remote server, per page):
+
+- `rswap_backend_test.py` checks the batching itself: an 8 page folio is one
+  backend call, 12 pages split into 8 + 4, and data survives both directions.
+- `rswap_redis_test.py` checks that a batch of 8 pages uses one connection and
+  sends 8 pipelined `SET`/`GET` commands.
+- Harness timing against the remote server: 8 pages one connection each cost
+  42 ms/page written and 48 ms/page read; pipelined into one batch they cost
+  7 ms/page in both directions.
+- The live verifier used to spend ~60 ms per page operation; that is one TCP
+  connect plus one RESP round trip to a proxied endpoint, not kernel time (the
+  loopback HTTP backend does 0.09 ms per page operation).
+
 Status of the refactor: `mm/rswap.c` no longer contains any socket, HTTP or
 RESP code, and `rswap_backend_test.py` still passes unchanged in substance for
 the response parser, the submit paths, the per-entry key path and slot
@@ -432,10 +469,15 @@ path.
 - The HTTP KV server has no authentication and the kernel sends no
   credentials to it. Redis supports `AUTH`/`SELECT`, but its secret is a boot
   parameter and is stored in plain text while the kernel runs.
-- One connection and one request per page; the single-threaded HTTP server and
-  this per-page design are for testing, not production throughput. A backend
-  switch needs a reboot, and the backend for a device is never recorded, so a
-  device written with one backend cannot be read back with another.
+- Throughput is bounded by round trips: one connection per batch, and the
+  Redis backend still sends one command per page inside the batch. Both the
+  single-threaded HTTP server and this design are for testing, not production
+  throughput. A backend switch needs a reboot, and the backend for a device is
+  never recorded, so a device written with one backend cannot be read back
+  with another.
+- `RSWAP_BATCH_MAX` also bounds the core's bounce buffer (8 base pages, 128 KiB
+  with 16 KiB pages); raising it trades memory in the swap I/O path for fewer
+  round trips.
 - There is no active eBPF integration.
 
 ## eBPF Status

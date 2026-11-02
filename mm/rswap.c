@@ -178,16 +178,18 @@ static int __init rswap_backend_setup(void)
  */
 late_initcall(rswap_backend_setup);
 
-/* Store one base page under @key.  @data is a full base page image. */
-static int rswap_kv_store(const char *key, const void *data, size_t len)
+/* Move @nr base page images to the KV store. */
+static int rswap_kv_store(struct rswap_kv_page *pages, unsigned int nr,
+			  size_t len)
 {
-	return rswap_backend->store(key, data, len);
+	return rswap_backend->store(pages, nr, len);
 }
 
-/* Load one base page stored under @key into @data. */
-static int rswap_kv_load(const char *key, void *data, size_t len)
+/* Move @nr base page images from the KV store. */
+static int rswap_kv_load(struct rswap_kv_page *pages, unsigned int nr,
+			 size_t len)
 {
-	return rswap_backend->load(key, data, len);
+	return rswap_backend->load(pages, nr, len);
 }
 
 /* ---------- Per-page digests (page_ext) ---------- */
@@ -400,13 +402,55 @@ static int rswap_page_key(struct swap_info_struct *si, struct page *page,
 /* ---------- swap_ops implementations ---------- */
 
 /*
+ * rswap_submit_batch - Move one batch of base pages and copy reads back.
+ *
+ * @pages:	page images, already filled for a write
+ * @targets:	folio pages the data belongs to
+ * @nr:		number of pages in the batch
+ * @rw:		WRITE or READ
+ */
+static int rswap_submit_batch(struct rswap_kv_page *pages,
+			      struct page *const *targets, unsigned int nr,
+			      int rw)
+{
+	void *mapped;
+	int ret;
+	int i;
+
+	if (rw == WRITE)
+		ret = rswap_kv_store(pages, nr, PAGE_SIZE);
+	else
+		ret = rswap_kv_load(pages, nr, PAGE_SIZE);
+	if (ret)
+		return ret;
+
+	if (rw == READ) {
+		for (i = 0; i < nr; i++) {
+			mapped = kmap_local_page(targets[i]);
+			memcpy(mapped, pages[i].data, PAGE_SIZE);
+			kunmap_local(mapped);
+		}
+	}
+	return 0;
+}
+
+/*
  * Submit each base page synchronously and complete the whole swap request.
+ *
+ * Pages are collected into batches of up to RSWAP_BATCH_MAX so the backend
+ * can move several pages per round trip; the batch is flushed whenever it is
+ * full or the request runs out of pages.
  */
 static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 {
 	struct swap_iocb *sio = ctx->sio;
 	struct iov_iter iter;
-	char sha256_hex[RSWAP_SHA256_HEXLEN + 1];
+	char keys[RSWAP_BATCH_MAX][RSWAP_SHA256_HEXLEN + 1];
+	struct rswap_kv_page pages[RSWAP_BATCH_MAX];
+	struct page *targets[RSWAP_BATCH_MAX];
+	unsigned int nr = 0;
+	swp_entry_t batch_entry = { };
+	swp_entry_t cur_entry = { };
 	char *data = NULL;
 	int ret = 0;
 	int i;
@@ -414,7 +458,7 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 
 	noio_flags = memalloc_noio_save();
 	swap_fs_prepare_rw(ctx, rw, &iter);
-	data = kmalloc(PAGE_SIZE, GFP_NOIO);
+	data = kvmalloc_array(RSWAP_BATCH_MAX, PAGE_SIZE, GFP_NOIO);
 	if (!data) {
 		ret = -ENOMEM;
 		goto out;
@@ -440,34 +484,50 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 				__swap_entry_to_info(entry);
 			void *mapped;
 
-			ret = rswap_page_key(si, page, entry, rw, sha256_hex);
+			cur_entry = entry;
+			ret = rswap_page_key(si, page, entry, rw, keys[nr]);
 			if (ret)
 				goto io_error;
+
+			if (!nr)
+				batch_entry = entry;
+			pages[nr].key = keys[nr];
+			pages[nr].data = data + nr * PAGE_SIZE;
+			targets[nr] = page;
 			if (rw == WRITE) {
 				mapped = kmap_local_page(page);
-				memcpy(data, mapped, PAGE_SIZE);
+				memcpy(pages[nr].data, mapped, PAGE_SIZE);
 				kunmap_local(mapped);
-				ret = rswap_kv_store(sha256_hex, data, PAGE_SIZE);
-			} else {
-				ret = rswap_kv_load(sha256_hex, data, PAGE_SIZE);
 			}
+			nr++;
+
+			if (nr < RSWAP_BATCH_MAX)
+				continue;
+			ret = rswap_submit_batch(pages, targets, nr, rw);
 			if (ret)
-				goto io_error;
-			if (rw == READ) {
-				mapped = kmap_local_page(page);
-				memcpy(mapped, data, PAGE_SIZE);
-				kunmap_local(mapped);
-			}
-			continue;
-io_error:
-			pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
-					   rw == WRITE ? "write" : "read",
-					   swp_type(entry), swp_offset(entry), ret);
-			goto out;
+				goto batch_error;
+			nr = 0;
 		}
 	}
+	if (nr) {
+		ret = rswap_submit_batch(pages, targets, nr, rw);
+		if (ret)
+			goto batch_error;
+	}
+	goto out;
+
+batch_error:
+	pr_err_ratelimited("%s type %u offset %lu..%lu failed: %d\n",
+			   rw == WRITE ? "write" : "read",
+			   swp_type(batch_entry), swp_offset(batch_entry),
+			   swp_offset(batch_entry) + nr - 1, ret);
+	goto out;
+io_error:
+	pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
+			   rw == WRITE ? "write" : "read",
+			   swp_type(cur_entry), swp_offset(cur_entry), ret);
 out:
-	kfree(data);
+	kvfree(data);
 	memalloc_noio_restore(noio_flags);
 	sio->iocb.ki_complete(&sio->iocb, ret < 0 ? ret : sio->len);
 }

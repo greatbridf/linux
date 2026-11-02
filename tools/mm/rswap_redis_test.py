@@ -51,15 +51,23 @@ SHIMS = r"""
 #include <unistd.h>
 
 #define RSWAP_KV_HOST_LEN 64
-#define RSWAP_REDIS_MAX_CMD 320
+#define RSWAP_KV_KEY_LEN 65
+#define RSWAP_REDIS_CMD_SIZE (RSWAP_KV_KEY_LEN + 32)
 #define RSWAP_REDIS_MAX_LINE 256
+#define GFP_NOIO 0
 #define PAGE_SIZE 4096
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define IS_ERR(ptr) ((uintptr_t)(ptr) > (uintptr_t)-4096)
 #define PTR_ERR(ptr) ((long)(ptr))
 
 struct socket { int fd; };
+struct rswap_kv_page {
+    const char *key;
+    void *data;
+};
 static struct socket socket_stub;
+#define kvmalloc(size, flags) malloc(size)
+#define kvfree(ptr) free(ptr)
 
 /* Mirrors the private state the backend keeps above the extracted code. */
 static struct {
@@ -158,10 +166,22 @@ static void fill_page(unsigned char *page, const char *key)
     }
 }
 
+/* Batch keys: the last hex digit of @key selects the page, so every key of
+ * the batch is still a 64 digit digest. */
+static void batch_key(char *out, const char *key, unsigned int index)
+{
+    strcpy(out, key);
+    out[63] = "01234567"[index];
+}
+
 int main(int argc, char **argv)
 {
     unsigned char page[PAGE_SIZE];
+    unsigned char batch[8][PAGE_SIZE];
+    char keys[8][RSWAP_KV_KEY_LEN];   /* 64 digits plus the NUL */
+    struct rswap_kv_page pages[8];
     const char *command, *key;
+    unsigned int i;
     int ret;
 
     if (argc != 8) {
@@ -181,10 +201,12 @@ int main(int argc, char **argv)
     key = argv[7];
 
     fill_page(page, key);
+    pages[0].key = key;
+    pages[0].data = page;
     if (!strcmp(command, "put") || !strcmp(command, "put-noauth")) {
         int expected = strcmp(command, "put") ? -EACCES : 0;
 
-        ret = rswap_redis_store(key, page, sizeof(page));
+        ret = rswap_redis_store(pages, 1, sizeof(page));
         printf("store ret=%d\n", ret);
         return ret == expected ? 0 : 1;
     }
@@ -192,18 +214,41 @@ int main(int argc, char **argv)
         unsigned char actual[PAGE_SIZE];
 
         memset(actual, 0, sizeof(actual));
-        ret = rswap_redis_load(key, actual, sizeof(actual));
+        pages[0].data = actual;
+        ret = rswap_redis_load(pages, 1, sizeof(actual));
         printf("load ret=%d match=%d\n", ret,
                ret ? 0 : !memcmp(page, actual, sizeof(page)));
         return ret || memcmp(page, actual, sizeof(page)) ? 1 : 0;
     }
+    if (!strcmp(command, "putbatch") || !strcmp(command, "getbatch")) {
+        int batch_ret = 0, match = 1;
+
+        for (i = 0; i < 8; i++) {
+            batch_key(keys[i], key, i);
+            fill_page(batch[i], keys[i]);
+            pages[i].key = keys[i];
+            pages[i].data = batch[i];
+        }
+        if (!strcmp(command, "putbatch"))
+            batch_ret = rswap_redis_store(pages, 8, PAGE_SIZE);
+        else
+            batch_ret = rswap_redis_load(pages, 8, PAGE_SIZE);
+        for (i = 0; i < 8; i++) {
+            unsigned char expected[PAGE_SIZE];
+
+            fill_page(expected, keys[i]);
+            match &= !memcmp(batch[i], expected, PAGE_SIZE);
+        }
+        printf("batch ret=%d match=%d\n", batch_ret, match);
+        return batch_ret || !match ? 1 : 0;
+    }
     if (!strcmp(command, "get-missing")) {
-        ret = rswap_redis_load(key, page, sizeof(page));
+        ret = rswap_redis_load(pages, 1, sizeof(page));
         printf("load ret=%d\n", ret);
         return ret == -ENOENT ? 0 : 1;
     }
     if (!strcmp(command, "get-badlen")) {
-        ret = rswap_redis_load(key, page, sizeof(page));
+        ret = rswap_redis_load(pages, 1, sizeof(page));
         printf("load ret=%d\n", ret);
         return ret == -EMSGSIZE ? 0 : 1;
     }
@@ -263,6 +308,8 @@ class FakeRedisHandler(socketserver.StreamRequestHandler):
         self.reply(b"+" + text + b"\r\n")
 
     def error(self, text):
+        if isinstance(text, str):
+            text = text.encode()
         self.reply(b"-" + text + b"\r\n")
 
     def handle(self):
@@ -273,6 +320,7 @@ class FakeRedisHandler(socketserver.StreamRequestHandler):
 
     def serve(self):
         server = self.server
+        server.connections += 1
         selected = 0
         authed = server.password is None
         while True:
@@ -327,6 +375,7 @@ class FakeRedis(socketserver.ThreadingTCPServer):
         self.password = password.encode() if password is not None else None
         self.databases = {0: {}}
         self.commands = []
+        self.connections = 0
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
@@ -395,6 +444,31 @@ def offline(harness):
             if required not in server.commands:
                 print(f"FAIL: backend never sent {required}")
                 failures += 1
+
+        # Eight pages must be pipelined over a single connection.
+        for command in ("putbatch", "getbatch"):
+            server.connections = 0
+            server.commands.clear()
+            ok, detail = run_harness(harness, "127.0.0.1", server.port,
+                                     "default", secret, 0, command, key)
+            want = "SET" if command == "putbatch" else "GET"
+            sent = server.commands.count(want)
+            if not ok:
+                print(f"FAIL: {command}: {detail}")
+                failures += 1
+            if server.connections != 1:
+                print(f"FAIL: {command} used {server.connections} "
+                      f"connection(s), expected 1")
+                failures += 1
+            if sent != 8:
+                print(f"FAIL: {command} sent {sent} {want}(s), expected 8")
+                failures += 1
+        for i in range(8):
+            page_key = f"{key[:63]}{i}".encode()
+            if server.databases[0].get(page_key) != page_bytes(page_key.decode()):
+                print(f"FAIL: batched page {i} missing or wrong")
+                failures += 1
+                break
         if not failures:
             print("PASS: RESP client stores and loads pages by user digest")
     finally:

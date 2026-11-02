@@ -27,6 +27,8 @@ SHIMS = r"""
 #define ITER_SOURCE 0
 #define ITER_DEST 1
 #define RSWAP_SHA256_HEXLEN 64
+#define RSWAP_KV_KEY_LEN 65
+#define RSWAP_BATCH_MAX 8
 #define RSWAP_HTTP_MAX_HEADER 2048
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -34,6 +36,8 @@ SHIMS = r"""
 #define pr_err_ratelimited(...) do { } while (0)
 #define kmalloc(size, flags) malloc(size)
 #define kfree(ptr) free(ptr)
+#define kvmalloc_array(count, size, flags) calloc((count), (size))
+#define kvfree(ptr) free(ptr)
 #define PTR_ERR(ptr) ((long)(ptr))
 #define IS_ERR(ptr) ((uintptr_t)(ptr) > (uintptr_t)-4096)
 typedef struct { unsigned long val; } swp_entry_t;
@@ -44,7 +48,11 @@ struct page { unsigned char *data; };
 struct folio {
     swp_entry_t swap;
     unsigned char *data;
-    struct page pages[8];
+    struct page pages[16];
+};
+struct rswap_kv_page {
+    const char *key;
+    void *data;
 };
 struct bio_vec {
     struct folio *folio;
@@ -66,6 +74,7 @@ static size_t response_size, response_offset;
 static int response_error;
 static long completion;
 static int requests;
+static int moved;
 static unsigned long active_key;
 static unsigned char stored[32][PAGE_SIZE * 8];
 static size_t stored_len[32];
@@ -140,23 +149,35 @@ static void set_response(const char *data, size_t len, int error)
     response_offset = 0;
     response_error = error;
 }
-static int rswap_kv_store(const char *key, const void *data, size_t len)
+static int rswap_kv_store(struct rswap_kv_page *pages, unsigned int nr,
+                          size_t len)
 {
-    active_key = strtoul(key, NULL, 16);
-    assert(active_key < 32 && len <= sizeof(stored[0]));
-    memcpy(stored[active_key], data, len);
-    stored_len[active_key] = len;
+    unsigned int i;
+
     requests++;
+    for (i = 0; i < nr; i++) {
+        active_key = strtoul(pages[i].key, NULL, 16);
+        assert(active_key < 32 && len <= sizeof(stored[0]));
+        memcpy(stored[active_key], pages[i].data, len);
+        stored_len[active_key] = len;
+        moved++;
+    }
     return 0;
 }
-static int rswap_kv_load(const char *key, void *data, size_t len)
+static int rswap_kv_load(struct rswap_kv_page *pages, unsigned int nr,
+                         size_t len)
 {
-    active_key = strtoul(key, NULL, 16);
-    assert(active_key < 32);
-    if (stored_len[active_key] != len)
-        return -ENOENT;
-    memcpy(data, stored[active_key], len);
+    unsigned int i;
+
     requests++;
+    for (i = 0; i < nr; i++) {
+        active_key = strtoul(pages[i].key, NULL, 16);
+        assert(active_key < 32);
+        if (stored_len[active_key] != len)
+            return -ENOENT;
+        memcpy(pages[i].data, stored[active_key], len);
+        moved++;
+    }
     return 0;
 }
 """
@@ -232,8 +253,10 @@ int main(void)
     };
     rswap_submit_write(&ctx);
     assert(completion == sizeof(original));
-    if (requests != 8) {
-        printf("FAIL: large folio stored in %d request(s), expected 8\n", requests);
+    /* RSWAP_BATCH_MAX == 8: the whole 8 page folio is one backend call. */
+    if (requests != 1 || moved != 8) {
+        printf("FAIL: 8 page folio stored in %d call(s) moving %d page(s),"
+               " expected 1/8\n", requests, moved);
         return 1;
     }
     /* Read the original large folio back as eight independent base pages. */
@@ -251,6 +274,56 @@ int main(void)
         assert(completion == PAGE_SIZE);
     }
     assert(!memcmp(original, actual, sizeof(original)));
+    if (requests != 9 || moved != 16) {
+        printf("FAIL: 8 single page reads took %d call(s) moving %d page(s),"
+               " expected 9/16\n", requests, moved);
+        return 1;
+    }
+    /* More pages than one batch must be split into full and tail batches. */
+    {
+        unsigned char many[PAGE_SIZE * 12], wide_actual[PAGE_SIZE * 12];
+        /* High entries so the round trip does not disturb the slots above. */
+        struct folio wide = { .swap = { .val = 20 }, .data = many };
+        struct folio back = { .swap = { .val = 20 }, .data = wide_actual };
+        struct swap_iocb wide_sio = { .nr_bvecs = 1, .len = sizeof(many) };
+        struct swap_io_ctx wide_ctx = { .sio = &wide_sio };
+
+        for (i = 0; i < sizeof(many); i++)
+            many[i] = (i * 31 + i / PAGE_SIZE * 17) & 255;
+        for (i = 0; i < 12; i++) {
+            wide.pages[i].data = many + i * PAGE_SIZE;
+            back.pages[i].data = wide_actual + i * PAGE_SIZE;
+        }
+        wide_sio.bvecs[0] = (struct bio_vec) {
+            .folio = &wide, .bv_page = &wide.pages[0],
+            .bv_len = sizeof(many),
+        };
+        memset(wide_actual, 0, sizeof(many));
+        requests = moved = 0;
+        rswap_submit_write(&wide_ctx);
+        assert(completion == sizeof(many));
+        if (requests != 2 || moved != 12) {
+            printf("FAIL: 12 page folio stored in %d call(s) moving %d page(s),"
+                   " expected 2/12\n", requests, moved);
+            return 1;
+        }
+        wide_sio.bvecs[0] = (struct bio_vec) {
+            .folio = &back, .bv_page = &back.pages[0],
+            .bv_len = sizeof(many),
+        };
+        requests = moved = 0;
+        rswap_submit_read(&wide_ctx);
+        assert(completion == sizeof(many));
+        if (requests != 2 || moved != 12) {
+            printf("FAIL: 12 page folio read in %d call(s) moving %d page(s),"
+                   " expected 2/12\n", requests, moved);
+            return 1;
+        }
+        if (memcmp(many, wide_actual, sizeof(many))) {
+            puts("FAIL: batched multi-folio round trip corrupted data");
+            return 1;
+        }
+    }
     /* Read multiple folios in one request, with callback initialized first. */
     struct folio first = { .swap = { .val = 1 }, .data = actual };
     struct folio second = { .swap = { .val = 2 }, .data = actual + PAGE_SIZE };
@@ -266,14 +339,20 @@ int main(void)
     };
     sio.iocb.ki_complete = NULL;
     memset(actual, 0, PAGE_SIZE * 2);
+    requests = moved = 0;
     rswap_submit_read(&ctx);
     assert(completion == PAGE_SIZE * 2);
     assert(!memcmp(original, actual, PAGE_SIZE * 2));
+    if (requests != 1 || moved != 2) {
+        printf("FAIL: two folios read in %d call(s) moving %d page(s),"
+               " expected 1/2\n", requests, moved);
+        return 1;
+    }
     /* A missing page must fail completion and remain not uptodate. */
     stored_len[2] = 0;
     rswap_submit_read(&ctx);
     assert(completion < 0);
-    puts("PASS: actual submit paths preserve split-folio addressing and errors");
+    puts("PASS: actual submit paths batch pages and preserve addressing/errors");
     return 0;
 }
 """
@@ -505,7 +584,9 @@ def main():
                     source[source.index("static int rswap_parse_response("):
                            source.index(
                                "/* ---------- Per-page digests (page_ext)")])
-    start = ("static void rswap_submit(" if "static void rswap_submit(" in source
+    start = ("static int rswap_submit_batch(" if "static int rswap_submit_batch("
+             in source else
+             "static void rswap_submit(" if "static void rswap_submit(" in source
              else "static void rswap_submit_write(")
     submit = source[source.index(start):source.index(
         "/*\n * rswap_can_merge")]
@@ -529,7 +610,10 @@ def main():
             subprocess.run(
                 ["cc", "-O2", "-Wall", "-Werror",
                  "-Wno-unused-function", "-Wno-unused-variable",
-                 "-Wno-sign-compare", str(path), "-o", str(executable)],
+                 # pr_err_ratelimited() is a no-op shim, so the entries it
+                 # would print look unused here.
+                 "-Wno-unused-but-set-variable", "-Wno-sign-compare",
+                 str(path), "-o", str(executable)],
                 check=True)
             failures += subprocess.run([str(executable)], check=False).returncode
     return bool(failures)

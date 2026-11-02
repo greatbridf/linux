@@ -23,6 +23,18 @@ struct socket;
 #define RSWAP_KV_KEY_LEN	65
 /* Room for a host name, an IPv4 literal or a future address family. */
 #define RSWAP_KV_HOST_LEN	64
+/*
+ * Most pages the core hands to one ->store()/->load() call.  A swap request
+ * carries up to SWAP_CLUSTER_MAX pages; batching them lets a backend pay one
+ * round trip for several pages, and the core's bounce buffer stays bounded.
+ */
+#define RSWAP_BATCH_MAX		8
+
+/* One base page image together with the KV key it belongs to. */
+struct rswap_kv_page {
+	const char	*key;		/* 64 digit lowercase hex SHA-256 */
+	void		*data;		/* exactly one base page image */
+};
 
 /*
  * Resolved backend configuration.  Everything a backend needs is filled in
@@ -48,13 +60,19 @@ struct rswap_kv_config {
  * @default_send_timeout_ms:	used when rswap.send_timeout_ms is not set
  * @default_recv_timeout_ms:	used when rswap.recv_timeout_ms is not set
  * @init:			optional; copy @cfg, validate it, return -errno
- * @store:			write @len bytes at @key
- * @load:			read @len bytes from @key
+ * @store:			write @nr page images
+ * @load:			read @nr page images
  *
- * ->store() and ->load() run in swap I/O context under GFP_NOIO and must not
- * touch the filesystem.  They may sleep.  @load() returns -ENOENT when the
- * key is absent; a short or oversized object is an error, never a partial
- * page.
+ * ->store() and ->load() move @nr page images of @len bytes each from and to
+ * @pages[].  @nr is between 1 and RSWAP_BATCH_MAX; keys stay valid only for
+ * the duration of the call.  A backend should spend as few round trips as its
+ * protocol allows, i.e. pipeline all @nr keys over one connection; moving the
+ * pages one at a time is still correct.
+ *
+ * They run in swap I/O context under GFP_NOIO and must not touch the
+ * filesystem.  They may sleep.  ->load() returns -ENOENT when a key is
+ * absent; a short or oversized object is an error, never a partial page.  On
+ * error the caller drops the whole swap request.
  */
 struct rswap_backend {
 	const char	*name;
@@ -65,14 +83,16 @@ struct rswap_backend {
 	unsigned int	default_recv_timeout_ms;
 
 	int		(*init)(const struct rswap_kv_config *cfg);
-	int		(*store)(const char *key, const void *data, size_t len);
-	int		(*load)(const char *key, void *data, size_t len);
+	int		(*store)(struct rswap_kv_page *pages, unsigned int nr,
+				size_t len);
+	int		(*load)(struct rswap_kv_page *pages, unsigned int nr,
+			       size_t len);
 };
 
 /*
  * TCP transport shared by the backends (mm/rswap_sock.c).  A backend opens
- * one connection per page operation and closes it again, so these helpers
- * keep no state and need no locking.
+ * one connection per ->store()/->load() call and closes it again, so these
+ * helpers keep no state and need no locking.
  */
 struct socket *rswap_sock_connect(const char *host, u16 port,
 				  unsigned int send_timeout_ms,

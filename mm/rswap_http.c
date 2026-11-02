@@ -187,36 +187,55 @@ out:
 
 /* ---------- Backend operations ---------- */
 
-static int rswap_http_store(const char *key, const void *data, size_t len)
+/*
+ * HTTP/1.0 carries exactly one object per request, so a batch is a plain
+ * sequence of requests.
+ */
+static int rswap_http_store(struct rswap_kv_page *pages, unsigned int nr,
+			    size_t len)
 {
-	struct socket *sock;
+	unsigned int i;
 	int ret;
 
-	sock = rswap_http_open();
-	if (IS_ERR(sock))
-		return PTR_ERR(sock);
+	for (i = 0; i < nr; i++) {
+		struct socket *sock;
 
-	ret = rswap_http_post(sock, key, data, len);
-	if (!ret)
-		ret = rswap_http_parse_response(sock, NULL, len, false);
-	rswap_sock_close(sock);
-	return ret;
+		sock = rswap_http_open();
+		if (IS_ERR(sock))
+			return PTR_ERR(sock);
+
+		ret = rswap_http_post(sock, pages[i].key, pages[i].data, len);
+		if (!ret)
+			ret = rswap_http_parse_response(sock, NULL, len, false);
+		rswap_sock_close(sock);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
-static int rswap_http_load(const char *key, void *data, size_t len)
+static int rswap_http_load(struct rswap_kv_page *pages, unsigned int nr,
+			   size_t len)
 {
-	struct socket *sock;
+	unsigned int i;
 	int ret;
 
-	sock = rswap_http_open();
-	if (IS_ERR(sock))
-		return PTR_ERR(sock);
+	for (i = 0; i < nr; i++) {
+		struct socket *sock;
 
-	ret = rswap_http_get(sock, key);
-	if (!ret)
-		ret = rswap_http_parse_response(sock, data, len, true);
-	rswap_sock_close(sock);
-	return ret;
+		sock = rswap_http_open();
+		if (IS_ERR(sock))
+			return PTR_ERR(sock);
+
+		ret = rswap_http_get(sock, pages[i].key);
+		if (!ret)
+			ret = rswap_http_parse_response(sock, pages[i].data, len,
+							true);
+		rswap_sock_close(sock);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 /* ---------- Backend registration ---------- */
