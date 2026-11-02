@@ -555,6 +555,21 @@ static int rswap_flush_batch(struct rswap_kv_page *pages,
 }
 
 /*
+ * One swap request in progress: up to RSWAP_BATCH_MAX page images plus the
+ * keys, folio pages and per-device counters that go with them.  Too big for
+ * the stack, so it is kvmalloc'ed for the duration of the request.
+ */
+struct rswap_batch {
+	unsigned int		nr;
+	swp_entry_t		entry;		/* first entry of the batch */
+	char			keys[RSWAP_BATCH_MAX][RSWAP_KV_KEY_LEN];
+	struct rswap_kv_page	pages[RSWAP_BATCH_MAX];
+	struct page		*targets[RSWAP_BATCH_MAX];
+	struct rswap_stats	*stats[RSWAP_BATCH_MAX];
+	char			data[] __aligned(PAGE_SIZE);
+};
+
+/*
  * Submit each base page synchronously and complete the whole swap request.
  *
  * Pages are collected into batches of up to RSWAP_BATCH_MAX so the backend
@@ -565,25 +580,21 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 {
 	struct swap_iocb *sio = ctx->sio;
 	struct iov_iter iter;
-	char keys[RSWAP_BATCH_MAX][RSWAP_SHA256_HEXLEN + 1];
-	struct rswap_kv_page pages[RSWAP_BATCH_MAX];
-	struct page *targets[RSWAP_BATCH_MAX];
-	struct rswap_stats *stats[RSWAP_BATCH_MAX];
-	unsigned int nr = 0;
-	swp_entry_t batch_entry = { };
+	struct rswap_batch *batch;
 	swp_entry_t cur_entry = { };
-	char *data = NULL;
 	int ret = 0;
 	int i;
 	unsigned int noio_flags;
 
 	noio_flags = memalloc_noio_save();
 	swap_fs_prepare_rw(ctx, rw, &iter);
-	data = kvmalloc_array(RSWAP_BATCH_MAX, PAGE_SIZE, GFP_NOIO);
-	if (!data) {
+	batch = kvmalloc(struct_size(batch, data, RSWAP_BATCH_MAX * PAGE_SIZE),
+			 GFP_NOIO);
+	if (!batch) {
 		ret = -ENOMEM;
 		goto out;
 	}
+	batch->nr = 0;
 
 	/*
 	 * Swap-in can split or combine the folios used at swap-out. Store
@@ -606,33 +617,38 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 			void *mapped;
 
 			cur_entry = entry;
-			stats[nr] = si->rswap_stats;
-			ret = rswap_page_key(si, page, entry, rw, keys[nr]);
+			batch->stats[batch->nr] = si->rswap_stats;
+			ret = rswap_page_key(si, page, entry, rw,
+					     batch->keys[batch->nr]);
 			if (ret)
 				goto io_error;
 
-			if (!nr)
-				batch_entry = entry;
-			pages[nr].key = keys[nr];
-			pages[nr].data = data + nr * PAGE_SIZE;
-			targets[nr] = page;
+			if (!batch->nr)
+				batch->entry = entry;
+			batch->pages[batch->nr].key = batch->keys[batch->nr];
+			batch->pages[batch->nr].data =
+				batch->data + batch->nr * PAGE_SIZE;
+			batch->targets[batch->nr] = page;
 			if (rw == WRITE) {
 				mapped = kmap_local_page(page);
-				memcpy(pages[nr].data, mapped, PAGE_SIZE);
+				memcpy(batch->pages[batch->nr].data, mapped,
+				       PAGE_SIZE);
 				kunmap_local(mapped);
 			}
-			nr++;
+			batch->nr++;
 
-			if (nr < RSWAP_BATCH_MAX)
+			if (batch->nr < RSWAP_BATCH_MAX)
 				continue;
-			ret = rswap_flush_batch(pages, targets, stats, nr, rw);
+			ret = rswap_flush_batch(batch->pages, batch->targets,
+						batch->stats, batch->nr, rw);
 			if (ret)
 				goto batch_error;
-			nr = 0;
+			batch->nr = 0;
 		}
 	}
-	if (nr) {
-		ret = rswap_flush_batch(pages, targets, stats, nr, rw);
+	if (batch->nr) {
+		ret = rswap_flush_batch(batch->pages, batch->targets,
+					batch->stats, batch->nr, rw);
 		if (ret)
 			goto batch_error;
 	}
@@ -641,17 +657,17 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 batch_error:
 	pr_err_ratelimited("%s type %u offset %lu..%lu failed: %d\n",
 			   rw == WRITE ? "write" : "read",
-			   swp_type(batch_entry), swp_offset(batch_entry),
-			   swp_offset(batch_entry) + nr - 1, ret);
+			   swp_type(batch->entry), swp_offset(batch->entry),
+			   swp_offset(batch->entry) + batch->nr - 1, ret);
 	goto out;
 io_error:
 	rswap_stats_key_failure(&rswap_total, rw, ret);
-	rswap_stats_key_failure(stats[nr], rw, ret);
+	rswap_stats_key_failure(batch->stats[batch->nr], rw, ret);
 	pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
 			   rw == WRITE ? "write" : "read",
 			   swp_type(cur_entry), swp_offset(cur_entry), ret);
 out:
-	kvfree(data);
+	kvfree(batch);
 	memalloc_noio_restore(noio_flags);
 	sio->iocb.ki_complete(&sio->iocb, ret < 0 ? ret : sio->len);
 }

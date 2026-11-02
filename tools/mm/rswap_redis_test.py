@@ -55,6 +55,7 @@ SHIMS = r"""
 #define RSWAP_REDIS_CMD_SIZE (RSWAP_KV_KEY_LEN + 32)
 #define RSWAP_REDIS_MAX_LINE 256
 #define RSWAP_REDIS_POOL_MAX 8
+#define RSWAP_BATCH_MAX 32
 #define GFP_NOIO 0
 #define WARN_ON_ONCE(cond) (cond)
 #define PAGE_SIZE 4096
@@ -186,20 +187,23 @@ static void fill_page(unsigned char *page, const char *key)
     }
 }
 
-/* Batch keys: the last hex digit of @key selects the page, so every key of
+/* Batch keys: the last two hex digits of @key select the page, so every key of
  * the batch is still a 64 digit digest. */
 static void batch_key(char *out, const char *key, unsigned int index)
 {
+    static const char hex[] = "0123456789abcdef";
+
     strcpy(out, key);
-    out[63] = "01234567"[index];
+    out[62] = hex[index >> 4];
+    out[63] = hex[index & 15];
 }
 
 int main(int argc, char **argv)
 {
     unsigned char page[PAGE_SIZE];
-    unsigned char batch[8][PAGE_SIZE];
-    char keys[8][RSWAP_KV_KEY_LEN];   /* 64 digits plus the NUL */
-    struct rswap_kv_page pages[8];
+    static unsigned char batch[RSWAP_BATCH_MAX][PAGE_SIZE];
+    char keys[RSWAP_BATCH_MAX][RSWAP_KV_KEY_LEN];   /* 64 digits plus NUL */
+    struct rswap_kv_page pages[RSWAP_BATCH_MAX];
     const char *command, *key;
     unsigned int i;
     int ret;
@@ -243,17 +247,17 @@ int main(int argc, char **argv)
     if (!strcmp(command, "putbatch") || !strcmp(command, "getbatch")) {
         int batch_ret = 0, match = 1;
 
-        for (i = 0; i < 8; i++) {
+        for (i = 0; i < RSWAP_BATCH_MAX; i++) {
             batch_key(keys[i], key, i);
             fill_page(batch[i], keys[i]);
             pages[i].key = keys[i];
             pages[i].data = batch[i];
         }
         if (!strcmp(command, "putbatch"))
-            batch_ret = rswap_redis_store(pages, 8, PAGE_SIZE);
+            batch_ret = rswap_redis_store(pages, RSWAP_BATCH_MAX, PAGE_SIZE);
         else
-            batch_ret = rswap_redis_load(pages, 8, PAGE_SIZE);
-        for (i = 0; i < 8; i++) {
+            batch_ret = rswap_redis_load(pages, RSWAP_BATCH_MAX, PAGE_SIZE);
+        for (i = 0; i < RSWAP_BATCH_MAX; i++) {
             unsigned char expected[PAGE_SIZE];
 
             fill_page(expected, keys[i]);
@@ -498,11 +502,11 @@ def offline(harness):
                 print(f"FAIL: {command} used {server.connections} "
                       f"connection(s), expected 1")
                 failures += 1
-            if sent != 8:
-                print(f"FAIL: {command} sent {sent} {want}(s), expected 8")
+            if sent != 32:
+                print(f"FAIL: {command} sent {sent} {want}(s), expected 32")
                 failures += 1
-        for i in range(8):
-            page_key = f"{key[:63]}{i}".encode()
+        for i in range(32):
+            page_key = f"{key[:62]}{i >> 4:x}{i & 15:x}".encode()
             if server.databases[0].get(page_key) != page_bytes(page_key.decode()):
                 print(f"FAIL: batched page {i} missing or wrong")
                 failures += 1
