@@ -47,6 +47,7 @@
 #include <crypto/sha2.h>
 #include <linux/hex.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/debugfs.h>
@@ -54,6 +55,7 @@
 #include <linux/sysctl.h>
 #include <linux/capability.h>
 #include <linux/sched.h>
+#include <linux/seq_file.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
@@ -116,6 +118,8 @@ static const struct rswap_backend *rswap_backend;
 static struct rswap_kv_config rswap_backend_cfg;
 static char rswap_backend_endpoint[RSWAP_KV_HOST_LEN + 8];
 
+static void __init rswap_debugfs_init(void);
+
 static const __initconst struct rswap_backend *rswap_backends[] = {
 #ifdef CONFIG_RSWAP_KV_HTTP
 	&rswap_http_backend,
@@ -167,6 +171,7 @@ static int __init rswap_backend_setup(void)
 	rswap_backend = backend;
 	snprintf(rswap_backend_endpoint, sizeof(rswap_backend_endpoint), "%s:%u",
 		 cfg->host, cfg->port);
+	rswap_debugfs_init();
 	pr_info("using %s KV backend at %s (%s)\n", backend->name,
 		rswap_backend_endpoint, backend->description);
 	return 0;
@@ -190,6 +195,91 @@ static int rswap_kv_load(struct rswap_kv_page *pages, unsigned int nr,
 			 size_t len)
 {
 	return rswap_backend->load(pages, nr, len);
+}
+
+/* ---------- Statistics ---------- */
+
+/*
+ * Per-device I/O counters, reachable from struct swap_info_struct.  They are
+ * lock-free: swap I/O runs on many CPUs at once and stats must never
+ * serialize it, and a lost update on a debugfs read is harmless.
+ */
+struct rswap_stats {
+	atomic64_t	pages_written;
+	atomic64_t	pages_read;
+	atomic64_t	errors_written;
+	atomic64_t	errors_read;
+	atomic64_t	no_digest;	/* writeout, no digest attached */
+	atomic64_t	no_entry;	/* swapin, no digest stored */
+};
+
+/* Backend-wide counters: the sum over all devices plus round trip timing. */
+static struct rswap_stats rswap_total;
+
+struct rswap_io_stats {
+	atomic64_t	batches;
+	atomic64_t	ns;
+	atomic64_t	max_ns;
+};
+
+static struct rswap_io_stats rswap_write_io;
+static struct rswap_io_stats rswap_read_io;
+
+static void rswap_stats_max(atomic64_t *max, s64 value)
+{
+	s64 old = atomic64_read(max);
+
+	while (old < value) {
+		s64 prev = atomic64_cmpxchg(max, old, value);
+
+		if (prev == old)
+			return;
+		old = prev;
+	}
+}
+
+static void rswap_stats_pages(struct rswap_stats *stats, int rw,
+			      unsigned int pages)
+{
+	if (!stats || !pages)
+		return;
+	if (rw == WRITE)
+		atomic64_add(pages, &stats->pages_written);
+	else
+		atomic64_add(pages, &stats->pages_read);
+}
+
+static void rswap_stats_errors(struct rswap_stats *stats, int rw,
+			       unsigned int pages)
+{
+	if (!stats || !pages)
+		return;
+	if (rw == WRITE)
+		atomic64_add(pages, &stats->errors_written);
+	else
+		atomic64_add(pages, &stats->errors_read);
+}
+
+/*
+ * A page that never reached the backend: no digest on writeout, none stored
+ * on swapin.  Both are expected for pages user space never attached.
+ */
+static void rswap_stats_key_failure(struct rswap_stats *stats, int rw, int err)
+{
+	if (!stats)
+		return;
+	if (rw == WRITE && err == -ENODATA)
+		atomic64_inc(&stats->no_digest);
+	else if (rw == READ && err == -ENOENT)
+		atomic64_inc(&stats->no_entry);
+	rswap_stats_errors(stats, rw, 1);
+}
+
+static void rswap_stats_io(struct rswap_io_stats *io, s64 ns)
+{
+	atomic64_inc(&io->batches);
+	atomic64_add(ns, &io->ns);
+	rswap_stats_max(&io->max_ns, ns);
 }
 
 /* ---------- Per-page digests (page_ext) ---------- */
@@ -435,6 +525,36 @@ static int rswap_submit_batch(struct rswap_kv_page *pages,
 }
 
 /*
+ * Flush one batch: time it, move it, and account it per device and in total.
+ * Pages of a failed batch count as failed, not as moved.
+ */
+static int rswap_flush_batch(struct rswap_kv_page *pages,
+			     struct page *const *targets,
+			     struct rswap_stats **stats, unsigned int nr, int rw)
+{
+	s64 started = ktime_get_ns();
+	s64 elapsed;
+	int ret;
+	int i;
+
+	ret = rswap_submit_batch(pages, targets, nr, rw);
+	elapsed = ktime_get_ns() - started;
+	rswap_stats_io(rw == WRITE ? &rswap_write_io : &rswap_read_io, elapsed);
+
+	if (!ret) {
+		rswap_stats_pages(&rswap_total, rw, nr);
+		for (i = 0; i < nr; i++)
+			rswap_stats_pages(stats[i], rw, 1);
+		return 0;
+	}
+
+	rswap_stats_errors(&rswap_total, rw, nr);
+	for (i = 0; i < nr; i++)
+		rswap_stats_errors(stats[i], rw, 1);
+	return ret;
+}
+
+/*
  * Submit each base page synchronously and complete the whole swap request.
  *
  * Pages are collected into batches of up to RSWAP_BATCH_MAX so the backend
@@ -448,6 +568,7 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 	char keys[RSWAP_BATCH_MAX][RSWAP_SHA256_HEXLEN + 1];
 	struct rswap_kv_page pages[RSWAP_BATCH_MAX];
 	struct page *targets[RSWAP_BATCH_MAX];
+	struct rswap_stats *stats[RSWAP_BATCH_MAX];
 	unsigned int nr = 0;
 	swp_entry_t batch_entry = { };
 	swp_entry_t cur_entry = { };
@@ -485,6 +606,7 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 			void *mapped;
 
 			cur_entry = entry;
+			stats[nr] = si->rswap_stats;
 			ret = rswap_page_key(si, page, entry, rw, keys[nr]);
 			if (ret)
 				goto io_error;
@@ -503,14 +625,14 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 
 			if (nr < RSWAP_BATCH_MAX)
 				continue;
-			ret = rswap_submit_batch(pages, targets, nr, rw);
+			ret = rswap_flush_batch(pages, targets, stats, nr, rw);
 			if (ret)
 				goto batch_error;
 			nr = 0;
 		}
 	}
 	if (nr) {
-		ret = rswap_submit_batch(pages, targets, nr, rw);
+		ret = rswap_flush_batch(pages, targets, stats, nr, rw);
 		if (ret)
 			goto batch_error;
 	}
@@ -523,6 +645,8 @@ batch_error:
 			   swp_offset(batch_entry) + nr - 1, ret);
 	goto out;
 io_error:
+	rswap_stats_key_failure(&rswap_total, rw, ret);
+	rswap_stats_key_failure(stats[nr], rw, ret);
 	pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
 			   rw == WRITE ? "write" : "read",
 			   swp_type(cur_entry), swp_offset(cur_entry), ret);
@@ -668,11 +792,20 @@ static int rswap_hashes_alloc(struct swap_info_struct *si)
 				    GFP_KERNEL);
 	if (!si->rswap_hashes)
 		return -ENOMEM;
+
+	si->rswap_stats = kzalloc_obj(*si->rswap_stats, GFP_KERNEL);
+	if (!si->rswap_stats) {
+		kvfree(si->rswap_hashes);
+		si->rswap_hashes = NULL;
+		return -ENOMEM;
+	}
 	return 0;
 }
 
 static void rswap_hashes_free(struct swap_info_struct *si)
 {
+	kfree(si->rswap_stats);
+	si->rswap_stats = NULL;
 	kvfree(si->rswap_hashes);
 	si->rswap_hashes = NULL;
 }
@@ -745,23 +878,104 @@ static struct dentry *rswap_debugfs_root;
 static char *rswap_debugfs_backend = (char *)"none";
 static char *rswap_debugfs_endpoint = rswap_backend_endpoint;
 
+#ifdef CONFIG_DEBUG_FS
+static u64 rswap_stats_avg(atomic64_t *total, atomic64_t *batches)
+{
+	u64 count = atomic64_read(batches);
+
+	return count ? div_u64(atomic64_read(total), count) : 0;
+}
+
+/* Backend-wide counters: /sys/kernel/debug/rswap/stats */
+static int rswap_stats_show(struct seq_file *m, void *unused)
+{
+	u64 written = atomic64_read(&rswap_total.pages_written);
+	u64 read = atomic64_read(&rswap_total.pages_read);
+
+	seq_printf(m, "backend\t\t%s\n", rswap_backend ? rswap_backend->name :
+		   "none");
+	seq_printf(m, "endpoint\t%s\n", rswap_backend_endpoint);
+	seq_printf(m, "batch_max\t%u\n", RSWAP_BATCH_MAX);
+	seq_printf(m, "written_pages\t%llu\n", written);
+	seq_printf(m, "written_bytes\t%llu\n", written << PAGE_SHIFT);
+	seq_printf(m, "written_batches\t%llu\n",
+		   atomic64_read(&rswap_write_io.batches));
+	seq_printf(m, "written_errors\t%llu\n",
+		   atomic64_read(&rswap_total.errors_written));
+	seq_printf(m, "written_no_digest\t%llu\n",
+		   atomic64_read(&rswap_total.no_digest));
+	seq_printf(m, "written_avg_ns\t%llu\n",
+		   rswap_stats_avg(&rswap_write_io.ns, &rswap_write_io.batches));
+	seq_printf(m, "written_max_ns\t%llu\n",
+		   atomic64_read(&rswap_write_io.max_ns));
+	seq_printf(m, "read_pages\t%llu\n", read);
+	seq_printf(m, "read_bytes\t%llu\n", read << PAGE_SHIFT);
+	seq_printf(m, "read_batches\t%llu\n",
+		   atomic64_read(&rswap_read_io.batches));
+	seq_printf(m, "read_errors\t%llu\n",
+		   atomic64_read(&rswap_total.errors_read));
+	seq_printf(m, "read_no_entry\t%llu\n",
+		   atomic64_read(&rswap_total.no_entry));
+	seq_printf(m, "read_avg_ns\t%llu\n",
+		   rswap_stats_avg(&rswap_read_io.ns, &rswap_read_io.batches));
+	seq_printf(m, "read_max_ns\t%llu\n",
+		   atomic64_read(&rswap_read_io.max_ns));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(rswap_stats);
+
+/* Per-device counters: /sys/kernel/debug/rswap/type<N>/stats */
+static int rswap_dev_stats_show(struct seq_file *m, void *unused)
+{
+	struct swap_info_struct *si = m->private;
+	struct rswap_stats *stats = si->rswap_stats;
+
+	if (!stats)
+		return 0;
+	seq_printf(m, "pages_written\t%llu\n",
+		   atomic64_read(&stats->pages_written));
+	seq_printf(m, "errors_written\t%llu\n",
+		   atomic64_read(&stats->errors_written));
+	seq_printf(m, "no_digest\t%llu\n", atomic64_read(&stats->no_digest));
+	seq_printf(m, "pages_read\t%llu\n",
+		   atomic64_read(&stats->pages_read));
+	seq_printf(m, "errors_read\t%llu\n",
+		   atomic64_read(&stats->errors_read));
+	seq_printf(m, "no_entry\t%llu\n", atomic64_read(&stats->no_entry));
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(rswap_dev_stats);
+#endif /* CONFIG_DEBUG_FS */
+
+/*
+ * Create the rswap debugfs tree once, before any device can exist, so the
+ * backend counters are readable even when no rswap device is active.
+ */
+static void __init rswap_debugfs_init(void)
+{
+	rswap_debugfs_root = debugfs_create_dir("rswap", NULL);
+	if (IS_ERR_OR_NULL(rswap_debugfs_root))
+		return;
+
+	if (rswap_backend)
+		rswap_debugfs_backend = (char *)rswap_backend->name;
+	debugfs_create_str("backend", 0444, rswap_debugfs_root,
+			   &rswap_debugfs_backend);
+	debugfs_create_str("endpoint", 0444, rswap_debugfs_root,
+			   &rswap_debugfs_endpoint);
+#ifdef CONFIG_DEBUG_FS
+	debugfs_create_file("stats", 0444, rswap_debugfs_root, NULL,
+			    &rswap_stats_fops);
+#endif
+}
+
 void rswap_debugfs_add(struct swap_info_struct *si)
 {
-	char name[32];
 	struct dentry *dentry;
-	/* Keep a copy of the port in si for debugfs (no UAF). */
+	char name[32];
 
-	if (!rswap_debugfs_root) {
-		rswap_debugfs_root = debugfs_create_dir("rswap", NULL);
-		if (IS_ERR_OR_NULL(rswap_debugfs_root))
-			return;
-		if (rswap_backend)
-			rswap_debugfs_backend = (char *)rswap_backend->name;
-		debugfs_create_str("backend", 0444, rswap_debugfs_root,
-				   &rswap_debugfs_backend);
-		debugfs_create_str("endpoint", 0444, rswap_debugfs_root,
-				   &rswap_debugfs_endpoint);
-	}
+	if (IS_ERR_OR_NULL(rswap_debugfs_root))
+		return;
 
 	snprintf(name, sizeof(name), "type%d", si->type);
 	dentry = debugfs_create_dir(name, rswap_debugfs_root);
@@ -772,11 +986,16 @@ void rswap_debugfs_add(struct swap_info_struct *si)
 	 * Store the port in a heap-allocated variable so debugfs can
 	 * safely reference it.  Freed when the dentry is removed.
 	 */
-	si->rswap_kv_port = kmalloc(sizeof(u32), GFP_KERNEL);
+	si->rswap_kv_port = kmalloc_obj(*si->rswap_kv_port, GFP_KERNEL);
 	if (si->rswap_kv_port) {
 		*si->rswap_kv_port = rswap_backend_cfg.port;
 		debugfs_create_u32("kv_port", 0444, dentry, si->rswap_kv_port);
 	}
+#ifdef CONFIG_DEBUG_FS
+	if (si->rswap_stats)
+		debugfs_create_file("stats", 0444, dentry, si,
+				    &rswap_dev_stats_fops);
+#endif
 }
 
 void rswap_debugfs_del(struct swap_info_struct *si)

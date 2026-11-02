@@ -263,7 +263,8 @@ swap fault
 - `tools/mm/rswap_run_test.py`: cgroup-based live test runner.
 - `tools/mm/rswap_scale_test.py`: scaled live test (512 MiB by default) that
   also sets up the KV server and swap device, then audits the backend keys.
-- `tools/mm/rswap_backend_test.py`: source-level backend and table regressions.
+- `tools/mm/rswap_backend_test.py`: source-level backend, batching, counter and
+  table regressions.
 - `tools/mm/rswap_redis_test.py`: RESP client test against a scripted server,
   plus `--live` against a real Redis server.
 - `tools/mm/kvswap_test.py`: HTTP protocol regression tests.
@@ -308,13 +309,41 @@ rswap.redis_user=default rswap.redis_password=<secret> rswap.redis_db=0
 Redis objects are the raw page images stored under the 64 hex digit digest,
 so `GET <sha256>` on the server must return exactly one base page.
 
-Selected backend information is exposed through debugfs:
+Selected backend information and the I/O counters are exposed through
+debugfs:
 
 ```text
 /sys/kernel/debug/rswap/backend             http | redis
 /sys/kernel/debug/rswap/endpoint            resolved host:port
+/sys/kernel/debug/rswap/stats               backend-wide counters
 /sys/kernel/debug/rswap/type<N>/kv_port     resolved port of type <N>
+/sys/kernel/debug/rswap/type<N>/stats       counters of type <N>
 ```
+
+`stats` reports, per direction, the pages and bytes moved, the number of
+backend batches, the failed pages, and for writeout the pages that had no
+attached digest (`written_no_digest`) resp. for swapin the entries with no
+stored digest (`read_no_entry`). It also reports the average and peak batch
+time in nanoseconds, so `written_avg_ns / (written_pages / written_batches)`
+is the per-page store cost:
+
+```text
+backend             redis
+endpoint            21.6.122.137:6379
+batch_max           8
+written_pages       8192
+written_bytes       134217728
+written_batches     1024
+written_errors      0
+written_no_digest   0
+written_avg_ns      57000000
+written_max_ns      120000000
+read_pages          ...
+```
+
+`type<N>/stats` shows the same page and failure counters for one device. The
+counters are lock-free (`atomic64_t`) and only incremented in the swap I/O
+path; a debugfs read races with them harmlessly.
 
 ## Build and Verification
 
@@ -446,6 +475,10 @@ Batching and its effect (`RSWAP_BATCH_MAX` = 8, remote server, per page):
 - The live verifier used to spend ~60 ms per page operation; that is one TCP
   connect plus one RESP round trip to a proxied endpoint, not kernel time (the
   loopback HTTP backend does 0.09 ms per page operation).
+- `rswap_backend_test.py` also runs the real counter helpers: pages, batches
+  and failed pages are accounted once per page in both the total and the
+  per-device struct, only `-ENODATA`/`-ENOENT` count as `no_digest`/`no_entry`,
+  and peak plus accumulated batch time are checked separately.
 
 Status of the refactor: `mm/rswap.c` no longer contains any socket, HTTP or
 RESP code, and `rswap_backend_test.py` still passes unchanged in substance for
