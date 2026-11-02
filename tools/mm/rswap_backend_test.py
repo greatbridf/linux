@@ -34,6 +34,8 @@ SHIMS = r"""
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define pr_debug_ratelimited(...) do { } while (0)
 #define pr_err_ratelimited(...) do { } while (0)
+typedef int64_t s64;
+#define ktime_get_ns() ((s64)0)
 #define kmalloc(size, flags) malloc(size)
 #define kfree(ptr) free(ptr)
 #define kvmalloc_array(count, size, flags) calloc((count), (size))
@@ -59,8 +61,60 @@ struct bio_vec {
     struct page *bv_page;
     size_t bv_len, bv_offset;
 };
-struct swap_info_struct { unsigned long max; void *rswap_hashes; };
-static struct swap_info_struct swap_info_stub;
+struct rswap_stats { int unused; };
+static struct rswap_stats rswap_total, rswap_write_io, rswap_read_io;
+static struct rswap_stats device_stats;
+static struct {
+    unsigned int pages_written, pages_read, errors_written, errors_read;
+    unsigned int no_digest, no_entry, batches;
+    unsigned int dev_pages_written, dev_pages_read, dev_errors_read;
+} counted;
+struct swap_info_struct {
+    unsigned long max;
+    void *rswap_hashes;
+    struct rswap_stats *rswap_stats;
+};
+static struct swap_info_struct swap_info_stub = { .rswap_stats = &device_stats };
+static void rswap_stats_io(struct rswap_stats *io, int64_t ns)
+{
+    counted.batches++;
+}
+static void rswap_stats_pages(struct rswap_stats *stats, int rw,
+                              unsigned int pages)
+{
+    if (stats == &device_stats) {
+        if (rw == WRITE)
+            counted.dev_pages_written += pages;
+        else
+            counted.dev_pages_read += pages;
+    } else if (stats == &rswap_total) {
+        if (rw == WRITE)
+            counted.pages_written += pages;
+        else
+            counted.pages_read += pages;
+    }
+}
+static void rswap_stats_errors(struct rswap_stats *stats, int rw,
+                               unsigned int pages)
+{
+    if (stats == &device_stats) {
+        if (rw == READ)
+            counted.dev_errors_read += pages;
+    } else if (stats == &rswap_total) {
+        if (rw == WRITE)
+            counted.errors_written += pages;
+        else
+            counted.errors_read += pages;
+    }
+}
+static void rswap_stats_key_failure(struct rswap_stats *stats, int rw, int err)
+{
+    if (rw == WRITE && err == -ENODATA)
+        counted.no_digest++;
+    else if (rw == READ && err == -ENOENT)
+        counted.no_entry++;
+    rswap_stats_errors(stats, rw, 1);
+}
 struct swap_iocb {
     struct kiocb iocb;
     unsigned int nr_bvecs;
@@ -259,6 +313,13 @@ int main(void)
                " expected 1/8\n", requests, moved);
         return 1;
     }
+    if (counted.pages_written != 8 || counted.dev_pages_written != 8 ||
+        counted.batches != 1) {
+        printf("FAIL: counters saw %u total / %u device page(s) in %u"
+               " batch(es), expected 8/8/1\n", counted.pages_written,
+               counted.dev_pages_written, counted.batches);
+        return 1;
+    }
     /* Read the original large folio back as eight independent base pages. */
     for (i = 0; i < 8; i++) {
         struct folio small = {
@@ -277,6 +338,13 @@ int main(void)
     if (requests != 9 || moved != 16) {
         printf("FAIL: 8 single page reads took %d call(s) moving %d page(s),"
                " expected 9/16\n", requests, moved);
+        return 1;
+    }
+    if (counted.pages_read != 8 || counted.dev_pages_read != 8 ||
+        counted.batches != 9) {
+        printf("FAIL: counters saw %u total / %u device read page(s) in %u"
+               " batch(es), expected 8/8/9\n", counted.pages_read,
+               counted.dev_pages_read, counted.batches);
         return 1;
     }
     /* More pages than one batch must be split into full and tail batches. */
@@ -352,8 +420,82 @@ int main(void)
     stored_len[2] = 0;
     rswap_submit_read(&ctx);
     assert(completion < 0);
+    if (counted.errors_read != 2 || counted.dev_errors_read != 2) {
+        printf("FAIL: failed two page batch counted %u total / %u device"
+               " error(s), expected 2/2\n", counted.errors_read,
+               counted.dev_errors_read);
+        return 1;
+    }
     puts("PASS: actual submit paths batch pages and preserve addressing/errors");
     return 0;
+}
+"""
+
+STATS_SHIMS = r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef int64_t s64;
+typedef struct { s64 v; } atomic64_t;
+#define atomic64_read(p) ((p)->v)
+#define atomic64_add(value, p) ((p)->v += (value))
+#define atomic64_inc(p) ((p)->v++)
+#define atomic64_cmpxchg(p, old, new)					\
+	({ s64 __old = (p)->v; if (__old == (old)) (p)->v = (new); __old; })
+#define WRITE 1
+#define READ 0
+"""
+
+STATS_MAIN = r"""
+int main(void)
+{
+    struct rswap_stats stats = { };
+    int failures = 0;
+
+    rswap_stats_pages(&stats, WRITE, 3);
+    rswap_stats_pages(&stats, READ, 2);
+    rswap_stats_errors(&stats, WRITE, 1);
+    assert(atomic64_read(&stats.pages_written) == 3);
+    assert(atomic64_read(&stats.pages_read) == 2);
+    assert(atomic64_read(&stats.errors_written) == 1);
+
+    /* Only the documented failures count as no digest / no entry. */
+    rswap_stats_key_failure(&stats, WRITE, -ENODATA);
+    rswap_stats_key_failure(&stats, READ, -ENOENT);
+    rswap_stats_key_failure(&stats, READ, -EIO);
+    if (atomic64_read(&stats.no_digest) != 1 ||
+        atomic64_read(&stats.no_entry) != 1 ||
+        atomic64_read(&stats.errors_written) != 2 ||
+        atomic64_read(&stats.errors_read) != 2) {
+        puts("FAIL: key failures miscounted");
+        failures++;
+    }
+
+    /* A device without counters (or no pages) must be tolerated. */
+    rswap_stats_pages(NULL, WRITE, 4);
+    rswap_stats_pages(&stats, WRITE, 0);
+    rswap_stats_errors(NULL, READ, 4);
+    rswap_stats_key_failure(NULL, WRITE, -ENODATA);
+    assert(atomic64_read(&stats.pages_written) == 3);
+
+    /* Timing: batch count, accumulated and peak time. */
+    rswap_stats_io(&rswap_write_io, 100);
+    rswap_stats_io(&rswap_write_io, 40);
+    rswap_stats_io(&rswap_write_io, 250);
+    if (atomic64_read(&rswap_write_io.batches) != 3 ||
+        atomic64_read(&rswap_write_io.ns) != 390 ||
+        atomic64_read(&rswap_write_io.max_ns) != 250) {
+        puts("FAIL: batch timing counters are wrong");
+        failures++;
+    }
+    assert(atomic64_read(&rswap_read_io.batches) == 0);
+
+    if (!failures)
+        puts("PASS: actual counters account pages, failures and peak time");
+    return !!failures;
 }
 """
 
@@ -556,7 +698,9 @@ int main(void)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--revision", help="test source at a git revision")
+    parser.add_argument("--revision",
+                        help="test the source at a git revision; it must use "
+                             "the same KV backend interface as HEAD")
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[2]
     if args.revision:
@@ -601,6 +745,11 @@ def main():
         "hashes": HASH_SHIMS + hashes + HASH_MAIN,
         "free": FREE_SHIMS + free + FREE_MAIN,
     }
+    if "struct rswap_stats {" in source:
+        stats = source[source.index("struct rswap_stats {"):
+                       source.index(
+                           "/* ---------- Per-page digests (page_ext)")]
+        snippets["stats"] = STATS_SHIMS + stats + STATS_MAIN
     failures = 0
     with tempfile.TemporaryDirectory(prefix="rswap-backend-") as directory:
         for name, snippet in snippets.items():
