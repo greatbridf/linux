@@ -186,6 +186,8 @@ swap fault
 - `tools/mm/rswap_test.c`: bounded integrity verifier that attaches page
   hashes before reclaim.
 - `tools/mm/rswap_run_test.py`: cgroup-based live test runner.
+- `tools/mm/rswap_scale_test.py`: scaled live test (512 MiB by default) that
+  also sets up the KV server and swap device, then audits the backend keys.
 - `tools/mm/rswap_backend_test.py`: source-level backend and table regressions.
 - `tools/mm/kvswap_test.py`: HTTP protocol regression tests.
 
@@ -253,11 +255,24 @@ Live integrity test, with rswap as the only active swap device:
 sudo python3 tools/mm/rswap_run_test.py --size-kib 8192 --rounds 5
 ```
 
+Scaled live test (512 MiB of anonymous memory by default). It starts the KV
+server, creates the rswap device, runs the verifier in a bounded cgroup, and
+then checks that the backend holds exactly one full page object per base
+page and nothing else. `--takeover-swap` swaps off existing devices for the
+duration of the run and restores them before exit:
+
+```sh
+sudo python3 tools/mm/rswap_scale_test.py --takeover-swap
+sudo python3 tools/mm/rswap_scale_test.py --size-kib 524288 --rounds 2 \
+    --takeover-swap --huge
+```
+
 The verifier now attaches userspace hashes before each round. This update is
 required because unattached pages intentionally fail writeout.
 
 For manual live testing, stop zram swap before creating the remote-only
-configuration:
+configuration (`rswap_scale_test.py --takeover-swap` does this and restores
+it):
 
 ```sh
 sudo swapoff /dev/zram0
@@ -284,6 +299,9 @@ The no-fallback design has been tested live on ARM64 with 16 KiB base pages:
   and read all 512 pages back byte-for-byte.
 - `rswap_run_test.py` passed five rounds with 512/512 pages evicted and all
   8 MiB matching in every round.
+- `rswap_scale_test.py` passed a 512 MiB run with 32768/32768 pages evicted,
+  all 512 MiB matching, and exactly 32768 page-sized backend objects with no
+  extras. A 64 MiB two-round run stored exactly 8192 objects.
 - Backend source regressions and all 11 KV protocol tests passed.
 
 Expected `-ENODATA`/`-61` kernel messages occur during deliberate tests of
