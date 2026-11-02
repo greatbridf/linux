@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * mm/rswap_http.c - rswap KV backend speaking HTTP to kvswap_server
+ *
+ * One base page is one HTTP/1.0 request:
+ *
+ *   write:  POST /v1/folios/<sha256>/write   body = page data
+ *   read:   GET  /v1/folios/<sha256>/read
+ *
+ * The server (tools/mm/kvswap_server.c) stores each page as a file named by
+ * the SHA-256 hex key.
+ */
+
+#define pr_fmt(fmt) "rswap: " fmt
+
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/kstrtox.h>
+#include <linux/net.h>
+
+#include "rswap_backend.h"
+
+#define RSWAP_HTTP_DEFAULT_HOST		"127.0.0.1"
+#define RSWAP_HTTP_DEFAULT_PORT		6789
+#define RSWAP_HTTP_SEND_TIMEOUT_MS	20
+#define RSWAP_HTTP_RECV_TIMEOUT_MS	1000
+#define RSWAP_HTTP_MAX_HEADER		2048
+
+static struct {
+	char		host[RSWAP_KV_HOST_LEN];
+	u16		port;
+	unsigned int	send_timeout_ms;
+	unsigned int	recv_timeout_ms;
+} rswap_http;
+
+static struct socket *rswap_http_open(void)
+{
+	return rswap_sock_connect(rswap_http.host, rswap_http.port,
+				  rswap_http.send_timeout_ms,
+				  rswap_http.recv_timeout_ms);
+}
+
+/* Build and send an HTTP GET request. */
+static int rswap_http_get(struct socket *sock, const char *key)
+{
+	char req[256];
+	int ret;
+
+	ret = snprintf(req, sizeof(req),
+		       "GET /v1/folios/%s/read HTTP/1.0\r\n"
+		       "Host: %s:%u\r\n"
+		       "Connection: close\r\n"
+		       "\r\n",
+		       key, rswap_http.host, rswap_http.port);
+	if (ret >= (int)sizeof(req))
+		return -ENOSPC;
+
+	return rswap_sock_send(sock, req, ret);
+}
+
+/* Build and send an HTTP POST request carrying @len bytes of page data. */
+static int rswap_http_post(struct socket *sock, const char *key,
+			   const void *data, size_t len)
+{
+	char hdr[512];
+	int hlen;
+	int ret;
+
+	hlen = snprintf(hdr, sizeof(hdr),
+			"POST /v1/folios/%s/write HTTP/1.0\r\n"
+			"Host: %s:%u\r\n"
+			"Content-Length: %zu\r\n"
+			"Content-Type: application/octet-stream\r\n"
+			"Connection: close\r\n"
+			"\r\n",
+			key, rswap_http.host, rswap_http.port, len);
+	if (hlen >= (int)sizeof(hdr))
+		return -ENOSPC;
+
+	ret = rswap_sock_send(sock, hdr, hlen);
+	if (ret)
+		return ret;
+	return rswap_sock_send(sock, data, len);
+}
+
+/* ---------- Response parsing ---------- */
+
+/*
+ * Parse the HTTP response.  Extracts the status code and,
+ * for GET requests, copies the body into @data.
+ *
+ * Returns 0 on success (HTTP 200), -errno on failure.
+ */
+static int rswap_http_parse_response(struct socket *sock,
+				     char *data, size_t datalen, bool is_read)
+{
+	/*
+	 * Heap-allocate the header buffer to keep stack usage under the
+	 * 2048-byte warning threshold.  Our responses are tiny.
+	 */
+	char *buf = kmalloc(RSWAP_HTTP_MAX_HEADER, GFP_NOIO);
+	int total = 0;
+	int status = 0;
+	char *line;
+	size_t content_length = 0;
+	size_t received = 0;
+	bool have_length = false;
+	int ret;
+
+	if (!buf)
+		return -ENOMEM;
+
+	/* Read headers (up to 2KB). */
+	while (total < RSWAP_HTTP_MAX_HEADER - 1) {
+		ret = rswap_sock_recv(sock, buf + total, 1);
+		if (ret <= 0) {
+			ret = ret ? ret : -EIO;
+			goto out;
+		}
+		total += ret;
+		buf[total] = '\0';
+
+		/* End of headers: \r\n\r\n */
+		if (total >= 4 &&
+		    memcmp(buf + total - 4, "\r\n\r\n", 4) == 0)
+			break;
+	}
+	if (total >= RSWAP_HTTP_MAX_HEADER - 1) {
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	/* Parse "HTTP/1.x NNN ..." */
+	if (sscanf(buf, "HTTP/%*d.%*d %d", &status) != 1) {
+		ret = -EPROTO;
+		goto out;
+	}
+	if (status != 200) {
+		ret = status == 404 ? -ENOENT : -EIO;
+		goto out;
+	}
+
+	line = strstr(buf, "\r\n");
+	while (line) {
+		char *next;
+
+		line += 2;
+		next = strstr(line, "\r\n");
+		if (!next || next == line)
+			break;
+		*next = '\0';
+		if (!strncasecmp(line, "Content-Length:", 15)) {
+			char *value = skip_spaces(line + 15);
+
+			if (have_length || kstrtoul(value, 10, &content_length)) {
+				ret = -EPROTO;
+				goto out;
+			}
+			have_length = true;
+		} else if (!strncasecmp(line, "Transfer-Encoding:", 18)) {
+			ret = -EPROTO;
+			goto out;
+		}
+		line = next;
+	}
+	if (!have_length || content_length != (is_read ? datalen : 0)) {
+		ret = -EPROTO;
+		goto out;
+	}
+	while (received < content_length) {
+		ret = rswap_sock_recv(sock, data + received,
+				      min_t(size_t, content_length - received,
+					    65536));
+		if (ret <= 0) {
+			ret = ret ? ret : -EIO;
+			goto out;
+		}
+		received += ret;
+	}
+
+	ret = 0;
+out:
+	kfree(buf);
+	return ret;
+}
+
+/* ---------- Backend operations ---------- */
+
+static int rswap_http_store(const char *key, const void *data, size_t len)
+{
+	struct socket *sock;
+	int ret;
+
+	sock = rswap_http_open();
+	if (IS_ERR(sock))
+		return PTR_ERR(sock);
+
+	ret = rswap_http_post(sock, key, data, len);
+	if (!ret)
+		ret = rswap_http_parse_response(sock, NULL, len, false);
+	rswap_sock_close(sock);
+	return ret;
+}
+
+static int rswap_http_load(const char *key, void *data, size_t len)
+{
+	struct socket *sock;
+	int ret;
+
+	sock = rswap_http_open();
+	if (IS_ERR(sock))
+		return PTR_ERR(sock);
+
+	ret = rswap_http_get(sock, key);
+	if (!ret)
+		ret = rswap_http_parse_response(sock, data, len, true);
+	rswap_sock_close(sock);
+	return ret;
+}
+
+/* ---------- Backend registration ---------- */
+
+static int rswap_http_init(const struct rswap_kv_config *cfg)
+{
+	if (strscpy(rswap_http.host, cfg->host, sizeof(rswap_http.host)) < 0)
+		return -EINVAL;
+
+	rswap_http.port = cfg->port;
+	rswap_http.send_timeout_ms = cfg->send_timeout_ms;
+	rswap_http.recv_timeout_ms = cfg->recv_timeout_ms;
+	return 0;
+}
+
+const struct rswap_backend rswap_http_backend = {
+	.name			= "http",
+	.description		= "HTTP/1.0 key-value store (kvswap_server)",
+	.default_host		= RSWAP_HTTP_DEFAULT_HOST,
+	.default_port		= RSWAP_HTTP_DEFAULT_PORT,
+	.default_send_timeout_ms = RSWAP_HTTP_SEND_TIMEOUT_MS,
+	.default_recv_timeout_ms = RSWAP_HTTP_RECV_TIMEOUT_MS,
+	.init			= rswap_http_init,
+	.store			= rswap_http_store,
+	.load			= rswap_http_load,
+};

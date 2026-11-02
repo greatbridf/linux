@@ -1,30 +1,37 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * mm/rswap.h - Remote Swap via HTTP KV Store
+ * mm/rswap.h - Remote Swap life cycle
  *
  * rswap is a swap backend that implements the swap_ops interface to
- * store swap pages in an external key-value store reachable over HTTP.
- * The KV store key is a SHA-256 hash attached by user space through
- * /proc/sys/vm/rswap/attach.  The hash is copied into a per-device table
- * indexed by swap offset at writeout and reused at swapin.  Pages without
- * an attached hash cannot be written to the remote device.
+ * store swap pages in an external key-value store.  The KV store key is a
+ * SHA-256 hash attached by user space through /proc/sys/vm/rswap/attach.
+ * The hash is copied into a per-device table indexed by swap offset at
+ * writeout and reused at swapin.  Pages without an attached hash cannot be
+ * written to the remote device.
  *
  * == Setup ==
  *
- * 1. Start the KV server:
- *      kvswap_server -d /path/to/data
+ * 1. Start a KV server.  Both backends shipped with the kernel store one
+ *    page object per SHA-256 digest:
+ *
+ *      HTTP:  kvswap_server -d /path/to/data
+ *             write:  POST /v1/folios/<sha256>/write   (body = page data)
+ *             read:   GET  /v1/folios/<sha256>/read
+ *
+ *      Redis: any Redis compatible server
+ *             write:  SET <sha256> <page data>
+ *             read:   GET <sha256>
  *
  * 2. Create an rswap device (via xswap sysfs):
  *      echo rswap [prio] > /sys/kernel/mm/xswap/create
  *
- * The kernel now routes all swap I/O on this device through HTTP
- * requests to the KV server at 127.0.0.1:6789.
+ * The backend is chosen at boot, before any device exists:
  *
- *   write:  POST /v1/folios/<sha256>/write   (body = folio data)
- *   read:   GET  /v1/folios/<sha256>/read
+ *      rswap.backend=http|redis	rswap.host=	rswap.port=
+ *      rswap.redis_user=	rswap.redis_password=	rswap.redis_db=
+ *      rswap.send_timeout_ms=	rswap.recv_timeout_ms=
  *
- * The KV server stores each page in a file named by the SHA-256 hex
- * string.
+ * See mm/rswap_backend.h for the backend interface.
  */
 
 #ifdef CONFIG_RSWAP

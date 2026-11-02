@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * mm/rswap.c - Remote Swap via HTTP KV Store
+ * mm/rswap.c - Remote Swap core
  *
  * rswap implements the swap_ops interface to perform swap I/O through an
- * external HTTP key-value store.  On write-out the kernel sends an HTTP
- * POST with the page data; on read-in it sends an HTTP GET.  The KV store
- * key is a SHA-256 digest, encoded as a hex string.
+ * external key-value store.  The KV store key is a SHA-256 digest, encoded as
+ * a hex string.  Which protocol carries the page to that store is decided by
+ * a pluggable backend (see mm/rswap_backend.h); this file owns the keys, the
+ * page_ext digests, the per-device table and the swap_ops wiring.
  *
  * == Keys ==
  *
@@ -20,14 +21,19 @@
  *
  * swap-out (reclaim):
  *   swap_writeout() -> swap_add_folio() -> swap_write_submit()
- *   -> rswap_submit_write() -> HTTP POST /v1/folios/<sha256>/write
+ *   -> rswap_submit_write() -> backend->store(<sha256>, page)
  *
  * swap-in (page fault):
  *   swap_read_folio() -> swap_add_folio() -> swap_read_submit()
- *   -> rswap_submit_read()  -> HTTP GET  /v1/folios/<sha256>/read
+ *   -> rswap_submit_read()  -> backend->load(<sha256>, page)
  *
- * The KV server (tools/mm/kvswap_server.c) stores each page as a file
- * whose name is the SHA-256 hex string.
+ * Backends shipped with rswap:
+ *
+ *   http  (mm/rswap_http.c)   POST/GET /v1/folios/<sha256>/{write,read}
+ *   redis (mm/rswap_redis.c)  RESP SET/GET <sha256>
+ *
+ * The backend is picked with the rswap.backend parameter (or the Kconfig
+ * default).  Both store one page object per SHA-256 hex key.
  */
 
 #define pr_fmt(fmt) "rswap: " fmt
@@ -40,10 +46,6 @@
 #include <linux/highmem.h>
 #include <crypto/sha2.h>
 #include <linux/hex.h>
-#include <linux/socket.h>
-#include <linux/in.h>
-#include <linux/inet.h>
-#include <linux/net.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
@@ -55,246 +57,137 @@
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
-#include <net/sock.h>
 
 #include "swap.h"
 #include "rswap.h"
+#include "rswap_backend.h"
 
 /* ---------- Configuration ---------- */
 
-#define RSWAP_KV_HOST		"127.0.0.1"
-#define RSWAP_KV_PORT		6789
 #define RSWAP_SHA256_HEXLEN	64	/* SHA-256 -> 64 hex chars */
 
-/* ---------- Socket helpers ---------- */
+static_assert(RSWAP_SHA256_HEXLEN + 1 == RSWAP_KV_KEY_LEN);
 
 /*
- * Create a TCP socket and connect to the KV server.
- * Returns the socket struct, or ERR_PTR on error.
+ * Backend selection.  These are boot parameters: switching a live swap device
+ * to a different store would strand every page already written to the old
+ * one, so none of them is writable at runtime.
  */
-static struct socket *rswap_connect(void)
+static char rswap_backend_name[16] = "http";
+module_param_string(backend, rswap_backend_name, sizeof(rswap_backend_name),
+		    0444);
+MODULE_PARM_DESC(backend, "KV backend to use: http or redis");
+
+static char rswap_kv_host[RSWAP_KV_HOST_LEN];
+module_param_string(host, rswap_kv_host, sizeof(rswap_kv_host), 0444);
+MODULE_PARM_DESC(host, "KV endpoint address; empty selects the backend default");
+
+static unsigned short rswap_kv_port;
+module_param_named(port, rswap_kv_port, ushort, 0444);
+MODULE_PARM_DESC(port, "KV endpoint port; 0 selects the backend default");
+
+static char rswap_kv_user[RSWAP_KV_HOST_LEN];
+module_param_string(redis_user, rswap_kv_user, sizeof(rswap_kv_user), 0444);
+MODULE_PARM_DESC(redis_user, "Redis ACL user; empty uses the default user");
+
+static char rswap_kv_password[128];
+module_param_string(redis_password, rswap_kv_password,
+		    sizeof(rswap_kv_password), 0);
+MODULE_PARM_DESC(redis_password, "Redis AUTH secret; empty sends no AUTH");
+
+static unsigned int rswap_kv_db;
+module_param_named(redis_db, rswap_kv_db, uint, 0444);
+MODULE_PARM_DESC(redis_db, "Redis database number");
+
+static unsigned int rswap_kv_send_timeout_ms;
+module_param_named(send_timeout_ms, rswap_kv_send_timeout_ms, uint, 0444);
+MODULE_PARM_DESC(send_timeout_ms,
+		 "Send/connect timeout; 0 selects the backend default");
+
+static unsigned int rswap_kv_recv_timeout_ms;
+module_param_named(recv_timeout_ms, rswap_kv_recv_timeout_ms, uint, 0444);
+MODULE_PARM_DESC(recv_timeout_ms,
+		 "Receive timeout; 0 selects the backend default");
+
+/* ---------- KV backend selection ---------- */
+
+/* Selected backend and its resolved configuration, valid after init. */
+static const struct rswap_backend *rswap_backend;
+static struct rswap_kv_config rswap_backend_cfg;
+static char rswap_backend_endpoint[RSWAP_KV_HOST_LEN + 8];
+
+static const __initconst struct rswap_backend *rswap_backends[] = {
+#ifdef CONFIG_RSWAP_KV_HTTP
+	&rswap_http_backend,
+#endif
+#ifdef CONFIG_RSWAP_KV_REDIS
+	&rswap_redis_backend,
+#endif
+};
+
+static int __init rswap_backend_setup(void)
 {
-	struct socket *sock;
-	struct sockaddr_in sin;
+	const struct rswap_backend *backend = NULL;
+	struct rswap_kv_config *cfg = &rswap_backend_cfg;
+	size_t i;
 	int ret;
 
-	ret = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP,
-			       &sock);
-	if (ret < 0) {
-		pr_err_ratelimited("sock_create_kern failed: %d\n", ret);
-		return ERR_PTR(ret);
+	for (i = 0; i < ARRAY_SIZE(rswap_backends); i++) {
+		if (!strcmp(rswap_backend_name, rswap_backends[i]->name)) {
+			backend = rswap_backends[i];
+			break;
+		}
+	}
+	if (!backend) {
+		pr_err("unknown or disabled KV backend \"%s\"\n",
+		       rswap_backend_name);
+		return -EINVAL;
 	}
 
-	sock_set_sndtimeo(sock->sk, 1);
-	WRITE_ONCE(sock->sk->sk_rcvtimeo, HZ);
+	/* Fill in every default so backends only ever see final values. */
+	cfg->host = rswap_kv_host[0] ? rswap_kv_host : backend->default_host;
+	cfg->port = rswap_kv_port ?: backend->default_port;
+	cfg->user = rswap_kv_user[0] ? rswap_kv_user : NULL;
+	cfg->password = rswap_kv_password[0] ? rswap_kv_password : NULL;
+	cfg->db = rswap_kv_db;
+	cfg->send_timeout_ms = rswap_kv_send_timeout_ms ?:
+		backend->default_send_timeout_ms;
+	cfg->recv_timeout_ms = rswap_kv_recv_timeout_ms ?:
+		backend->default_recv_timeout_ms;
 
-	memset(&sin, 0, sizeof(sin));
-	sin.sin_family = AF_INET;
-	sin.sin_port = htons(RSWAP_KV_PORT);
-	if (in4_pton(RSWAP_KV_HOST, -1, (u8 *)&sin.sin_addr.s_addr, -1, NULL) == 0) {
-		pr_err("bad KV host address: %s\n", RSWAP_KV_HOST);
-		sock_release(sock);
-		return ERR_PTR(-EINVAL);
+	if (backend->init) {
+		ret = backend->init(cfg);
+		if (ret) {
+			pr_err("%s: backend setup failed: %d\n", backend->name,
+			       ret);
+			return ret;
+		}
 	}
 
-	ret = kernel_connect(sock, (struct sockaddr_unsized *)&sin, sizeof(sin), 0);
-	if (ret < 0) {
-		pr_err_ratelimited("kernel_connect to %s:%d failed: %d\n",
-				   RSWAP_KV_HOST, RSWAP_KV_PORT, ret);
-		sock_release(sock);
-		return ERR_PTR(ret);
-	}
-
-	return sock;
-}
-
-/*
- * Send a complete HTTP request message.
- */
-static int rswap_send_request(struct socket *sock, const void *msg, size_t len)
-{
-	struct msghdr mhdr = { .msg_flags = MSG_NOSIGNAL };
-	struct kvec iov = { .iov_base = (void *)msg, .iov_len = len };
-	int ret;
-
-	while (iov.iov_len) {
-		ret = kernel_sendmsg(sock, &mhdr, &iov, 1, iov.iov_len);
-		if (ret <= 0)
-			return ret ? ret : -EIO;
-		iov.iov_base = (char *)iov.iov_base + ret;
-		iov.iov_len -= ret;
-	}
+	rswap_backend = backend;
+	snprintf(rswap_backend_endpoint, sizeof(rswap_backend_endpoint), "%s:%u",
+		 cfg->host, cfg->port);
+	pr_info("using %s KV backend at %s (%s)\n", backend->name,
+		rswap_backend_endpoint, backend->description);
 	return 0;
 }
 
 /*
- * Send an HTTP request with a data payload (two-part iovec).
+ * Before any device can be created from user space, but late enough that the
+ * parameter overrides have been parsed.
  */
-static int rswap_send_post(struct socket *sock, const void *hdr, size_t hlen,
-			   const void *body, size_t bodylen)
-{
-	int ret;
+late_initcall(rswap_backend_setup);
 
-	ret = rswap_send_request(sock, hdr, hlen);
-	if (ret < 0)
-		return ret;
-	return rswap_send_request(sock, body, bodylen);
+/* Store one base page under @key.  @data is a full base page image. */
+static int rswap_kv_store(const char *key, const void *data, size_t len)
+{
+	return rswap_backend->store(key, data, len);
 }
 
-/* Receive data into a buffer. */
-static int rswap_recv(struct socket *sock, char *buf, int len)
+/* Load one base page stored under @key into @data. */
+static int rswap_kv_load(const char *key, void *data, size_t len)
 {
-	struct msghdr mhdr = { .msg_flags = MSG_NOSIGNAL };
-	struct kvec iov = { .iov_base = buf, .iov_len = len };
-	int ret;
-
-	ret = kernel_recvmsg(sock, &mhdr, &iov, 1, len, 0);
-	if (ret < 0)
-		return ret;
-	return ret;
-}
-
-/* ---------- HTTP request/response helpers ---------- */
-
-/*
- * Build and send an HTTP GET request.
- */
-static int rswap_http_get(struct socket *sock, const char *sha256_hex)
-{
-	char req[256];
-	int ret;
-
-	ret = snprintf(req, sizeof(req),
-		       "GET /v1/folios/%s/read HTTP/1.0\r\n"
-		       "Host: " RSWAP_KV_HOST ":%d\r\n"
-		       "Connection: close\r\n"
-		       "\r\n",
-		       sha256_hex, RSWAP_KV_PORT);
-	if (ret >= (int)sizeof(req))
-		return -ENOSPC;
-
-	return rswap_send_request(sock, req, ret);
-}
-
-/*
- * Build and send an HTTP POST request with folio data.
- */
-static int rswap_http_post(struct socket *sock, const char *sha256_hex,
-			   const void *data, size_t datalen)
-{
-	char hdr[512];
-	int hlen;
-
-	hlen = snprintf(hdr, sizeof(hdr),
-			"POST /v1/folios/%s/write HTTP/1.0\r\n"
-			"Host: " RSWAP_KV_HOST ":%d\r\n"
-			"Content-Length: %zu\r\n"
-			"Content-Type: application/octet-stream\r\n"
-			"Connection: close\r\n"
-			"\r\n",
-			sha256_hex, RSWAP_KV_PORT, datalen);
-	if (hlen >= (int)sizeof(hdr))
-		return -ENOSPC;
-
-	return rswap_send_post(sock, hdr, hlen, data, datalen);
-}
-
-/*
- * Parse the HTTP response.  Extracts the status code and,
- * for GET requests, copies the body into @data.
- *
- * Returns 0 on success (HTTP 200), -errno on failure.
- */
-static int rswap_parse_response(struct socket *sock,
-				char *data, size_t datalen, bool is_read)
-{
-	/*
-	 * Heap-allocate the header buffer to keep stack usage under the
-	 * 2048-byte warning threshold.  Our responses are tiny.
-	 */
-	char *buf = kmalloc(2048, GFP_NOIO);
-	int total = 0;
-	int status = 0;
-	char *line;
-	size_t content_length = 0;
-	size_t received = 0;
-	bool have_length = false;
-	int ret;
-
-	if (!buf)
-		return -ENOMEM;
-
-	/* Read headers (up to 2KB). */
-	while (total < 2047) {
-		ret = rswap_recv(sock, buf + total, 1);
-		if (ret <= 0) {
-			ret = ret ? ret : -EIO;
-			goto out;
-		}
-		total += ret;
-		buf[total] = '\0';
-
-		/* End of headers: \r\n\r\n */
-		if (total >= 4 &&
-		    memcmp(buf + total - 4, "\r\n\r\n", 4) == 0)
-			break;
-	}
-	if (total >= 2047) {
-		ret = -ENOSPC;
-		goto out;
-	}
-
-	/* Parse "HTTP/1.x NNN ..." */
-	if (sscanf(buf, "HTTP/%*d.%*d %d", &status) != 1) {
-		ret = -EPROTO;
-		goto out;
-	}
-	if (status != 200) {
-		ret = status == 404 ? -ENOENT : -EIO;
-		goto out;
-	}
-
-	line = strstr(buf, "\r\n");
-	while (line) {
-		char *next;
-
-		line += 2;
-		next = strstr(line, "\r\n");
-		if (!next || next == line)
-			break;
-		*next = '\0';
-		if (!strncasecmp(line, "Content-Length:", 15)) {
-			char *value = skip_spaces(line + 15);
-
-			if (have_length || kstrtoul(value, 10, &content_length)) {
-				ret = -EPROTO;
-				goto out;
-			}
-			have_length = true;
-		} else if (!strncasecmp(line, "Transfer-Encoding:", 18)) {
-			ret = -EPROTO;
-			goto out;
-		}
-		line = next;
-	}
-	if (!have_length || content_length != (is_read ? datalen : 0)) {
-		ret = -EPROTO;
-		goto out;
-	}
-	while (received < content_length) {
-		ret = rswap_recv(sock, data + received,
-				 min_t(size_t, content_length - received, 65536));
-		if (ret <= 0) {
-			ret = ret ? ret : -EIO;
-			goto out;
-		}
-		received += ret;
-	}
-
-	ret = 0;
-out:
-	kfree(buf);
-	return ret;
+	return rswap_backend->load(key, data, len);
 }
 
 /* ---------- Per-page digests (page_ext) ---------- */
@@ -545,7 +438,6 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 			swp_entry_t entry = folio_swap_entry(folio, idx);
 			struct swap_info_struct *si =
 				__swap_entry_to_info(entry);
-			struct socket *sock;
 			void *mapped;
 
 			ret = rswap_page_key(si, page, entry, rw, sha256_hex);
@@ -555,22 +447,10 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 				mapped = kmap_local_page(page);
 				memcpy(data, mapped, PAGE_SIZE);
 				kunmap_local(mapped);
+				ret = rswap_kv_store(sha256_hex, data, PAGE_SIZE);
+			} else {
+				ret = rswap_kv_load(sha256_hex, data, PAGE_SIZE);
 			}
-			sock = rswap_connect();
-			if (IS_ERR(sock)) {
-				ret = PTR_ERR(sock);
-				goto io_error;
-			}
-			if (rw == WRITE)
-				ret = rswap_http_post(sock, sha256_hex,
-						     data, PAGE_SIZE);
-			else
-				ret = rswap_http_get(sock, sha256_hex);
-			if (!ret)
-				ret = rswap_parse_response(sock, data,
-							   PAGE_SIZE, rw == READ);
-			kernel_sock_shutdown(sock, SHUT_RDWR);
-			sock_release(sock);
 			if (ret)
 				goto io_error;
 			if (rw == READ) {
@@ -598,7 +478,7 @@ static void rswap_submit_write(struct swap_io_ctx *ctx)
 }
 
 /*
- * rswap_submit_read - Read folio data from the KV server via HTTP GET.
+ * rswap_submit_read - Read folio data from the selected KV backend.
  *
  * Called from swap_read_submit().
  */
@@ -610,7 +490,7 @@ static void rswap_submit_read(struct swap_io_ctx *ctx)
 /*
  * rswap_can_merge - Check whether two folios can share a single request.
  *
- * For the KV store each folio is a separate HTTP request, so merging is
+ * For a KV store each folio is a separate request, so merging is
  * not supported.
  */
 static bool rswap_can_merge(struct folio *folio, struct folio *prev_folio,
@@ -761,6 +641,10 @@ int rswap_enable(struct swap_info_struct *si)
 	if (!(si->flags & SWP_XSWAP))
 		return -EINVAL;
 
+	/* Never hand I/O to a device whose store was never set up. */
+	if (!rswap_backend)
+		return -ENODEV;
+
 	ret = rswap_hashes_alloc(si);
 	if (ret)
 		return ret;
@@ -794,6 +678,12 @@ void rswap_swapoff(struct swap_info_struct *si)
 /* ---------- debugfs interface ---------- */
 
 static struct dentry *rswap_debugfs_root;
+/*
+ * debugfs_create_str() wants a stable char **, so point it at the resolved
+ * backend name and endpoint, both of which live for the whole boot.
+ */
+static char *rswap_debugfs_backend = (char *)"none";
+static char *rswap_debugfs_endpoint = rswap_backend_endpoint;
 
 void rswap_debugfs_add(struct swap_info_struct *si)
 {
@@ -805,6 +695,12 @@ void rswap_debugfs_add(struct swap_info_struct *si)
 		rswap_debugfs_root = debugfs_create_dir("rswap", NULL);
 		if (IS_ERR_OR_NULL(rswap_debugfs_root))
 			return;
+		if (rswap_backend)
+			rswap_debugfs_backend = (char *)rswap_backend->name;
+		debugfs_create_str("backend", 0444, rswap_debugfs_root,
+				   &rswap_debugfs_backend);
+		debugfs_create_str("endpoint", 0444, rswap_debugfs_root,
+				   &rswap_debugfs_endpoint);
 	}
 
 	snprintf(name, sizeof(name), "type%d", si->type);
@@ -818,7 +714,7 @@ void rswap_debugfs_add(struct swap_info_struct *si)
 	 */
 	si->rswap_kv_port = kmalloc(sizeof(u32), GFP_KERNEL);
 	if (si->rswap_kv_port) {
-		*si->rswap_kv_port = RSWAP_KV_PORT;
+		*si->rswap_kv_port = rswap_backend_cfg.port;
 		debugfs_create_u32("kv_port", 0444, dentry, si->rswap_kv_port);
 	}
 }
