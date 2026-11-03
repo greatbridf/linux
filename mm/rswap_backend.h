@@ -37,7 +37,7 @@ struct socket;
 /* One base page image together with the KV key it belongs to. */
 struct rswap_kv_page {
 	const char	*key;		/* 64 digit lowercase hex SHA-256 */
-	void		*data;		/* exactly one base page image */
+	struct page	*page;		/* exactly one base page image */
 };
 
 /*

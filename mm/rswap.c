@@ -500,29 +500,16 @@ static int rswap_page_key(struct swap_info_struct *si, struct page *page,
  * @nr:		number of pages in the batch
  * @rw:		WRITE or READ
  */
-static int rswap_submit_batch(struct rswap_kv_page *pages,
-			      struct page *const *targets, unsigned int nr,
-			      int rw)
+static int rswap_submit_batch(struct rswap_kv_page *pages, unsigned int nr, int rw)
 {
-	void *mapped;
-	int ret;
-	int i;
+	int ret = 0;
 
 	if (rw == WRITE)
 		ret = rswap_kv_store(pages, nr, PAGE_SIZE);
 	else
 		ret = rswap_kv_load(pages, nr, PAGE_SIZE);
-	if (ret)
-		return ret;
 
-	if (rw == READ) {
-		for (i = 0; i < nr; i++) {
-			mapped = kmap_local_page(targets[i]);
-			memcpy(mapped, pages[i].data, PAGE_SIZE);
-			kunmap_local(mapped);
-		}
-	}
-	return 0;
+	return ret;
 }
 
 /*
@@ -530,28 +517,27 @@ static int rswap_submit_batch(struct rswap_kv_page *pages,
  * Pages of a failed batch count as failed, not as moved.
  */
 static int rswap_flush_batch(struct rswap_kv_page *pages,
-			     struct page *const *targets,
-			     struct rswap_stats **stats, unsigned int nr, int rw)
+			     struct rswap_stats *stats, unsigned int nr, int rw)
 {
 	s64 started = ktime_get_ns();
 	s64 elapsed;
 	int ret;
 	int i;
 
-	ret = rswap_submit_batch(pages, targets, nr, rw);
+	ret = rswap_submit_batch(pages, nr, rw);
 	elapsed = ktime_get_ns() - started;
 	rswap_stats_io(rw == WRITE ? &rswap_write_io : &rswap_read_io, elapsed);
 
 	if (!ret) {
 		rswap_stats_pages(&rswap_total, rw, nr);
 		for (i = 0; i < nr; i++)
-			rswap_stats_pages(stats[i], rw, 1);
+			rswap_stats_pages(stats, rw, 1);
 		return 0;
 	}
 
 	rswap_stats_errors(&rswap_total, rw, nr);
 	for (i = 0; i < nr; i++)
-		rswap_stats_errors(stats[i], rw, 1);
+		rswap_stats_errors(stats, rw, 1);
 	return ret;
 }
 
@@ -569,26 +555,28 @@ struct rswap_read_req;
  * drains the read workqueue before it frees the device table.
  */
 struct rswap_batch {
+	struct swap_info_struct	*si;
 	unsigned int		nr;
-	swp_entry_t		entry;		/* first entry of the batch */
-	swp_entry_t		last_entry;	/* last entry added, for errors */
+
 	struct rswap_read_req	*req;		/* NULL on the synchronous path */
 	struct work_struct	work;
 	char			keys[RSWAP_BATCH_MAX][RSWAP_KV_KEY_LEN];
 	struct rswap_kv_page	pages[RSWAP_BATCH_MAX];
-	struct page		*targets[RSWAP_BATCH_MAX];
-	struct rswap_stats	*stats[RSWAP_BATCH_MAX];
 	char			data[] __aligned(PAGE_SIZE);
 };
 
-static struct rswap_batch *rswap_batch_alloc(void)
+static struct rswap_batch *rswap_batch_alloc(struct swap_info_struct *si)
 {
 	struct rswap_batch *batch;
 
 	batch = kvmalloc(struct_size(batch, data, RSWAP_BATCH_MAX * PAGE_SIZE),
 			 GFP_NOIO);
-	if (batch)
-		batch->nr = 0;
+	if (unlikely(!batch))
+		return NULL;
+
+	batch->nr = 0;
+	batch->si = si;
+
 	return batch;
 }
 
@@ -599,37 +587,23 @@ static struct rswap_batch *rswap_batch_alloc(void)
  * dereferences the swap device after the caller's context is gone.  Returns
  * -ENODATA on writeout resp. -ENOENT on swapin when the page has no digest.
  */
-static int rswap_batch_add(struct rswap_batch *batch, struct bio_vec *bv,
-			   size_t offset, int rw)
+static int rswap_batch_add(struct rswap_batch *batch, struct swap_info_struct *si,
+			   struct page *page, int rw)
 {
-	struct folio *folio = bvec_folio(bv);
-	size_t folio_offset = folio_page_idx(folio, bv->bv_page) * PAGE_SIZE +
-			      bv->bv_offset + offset;
-	unsigned int idx = folio_offset / PAGE_SIZE;
-	unsigned int nr = batch->nr;
-	struct page *page = folio_page(folio, idx);
-	swp_entry_t entry = folio_swap_entry(folio, idx);
-	struct swap_info_struct *si = __swap_entry_to_info(entry);
-	void *mapped;
+	struct folio *folio = page_folio(page);
+	swp_entry_t entry = folio_page_swap_entry(folio, page);
+	struct rswap_kv_page *kv_page = &batch->pages[batch->nr];
+	char *key = batch->keys[batch->nr];
 	int ret;
 
-	batch->last_entry = entry;
-	batch->stats[nr] = si->rswap_stats;
-	ret = rswap_page_key(si, page, entry, rw, batch->keys[nr]);
+	ret = rswap_page_key(si, page, entry, rw, key);
 	if (ret)
 		return ret;
 
-	if (!nr)
-		batch->entry = entry;
-	batch->pages[nr].key = batch->keys[nr];
-	batch->pages[nr].data = batch->data + nr * PAGE_SIZE;
-	batch->targets[nr] = page;
-	if (rw == WRITE) {
-		mapped = kmap_local_page(page);
-		memcpy(batch->pages[nr].data, mapped, PAGE_SIZE);
-		kunmap_local(mapped);
-	}
-	batch->nr = nr + 1;
+	kv_page->key = key;
+	kv_page->page = page;
+	batch->nr++;
+
 	return 0;
 }
 
@@ -637,17 +611,15 @@ static int rswap_batch_add(struct rswap_batch *batch, struct bio_vec *bv,
 static int rswap_batch_flush(struct rswap_batch *batch, int rw)
 {
 	unsigned int nr = batch->nr;
+	struct rswap_stats *stats = batch->si->rswap_stats;
 	int ret;
 
 	batch->nr = 0;
-	ret = rswap_flush_batch(batch->pages, batch->targets, batch->stats, nr,
-				rw);
+	ret = rswap_flush_batch(batch->pages, stats, nr, rw);
 	if (ret)
-		pr_err_ratelimited("%s type %u offset %lu..%lu failed: %d\n",
+		pr_err_ratelimited("%s type %u failed: %d\n",
 				   rw == WRITE ? "write" : "read",
-				   swp_type(batch->entry),
-				   swp_offset(batch->entry),
-				   swp_offset(batch->last_entry), ret);
+				   batch->si->type, ret);
 	return ret;
 }
 
@@ -664,13 +636,15 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 	struct swap_iocb *sio = ctx->sio;
 	struct iov_iter iter;
 	struct rswap_batch *batch;
+	struct folio *folio;
+	struct page *page;
 	int ret = 0;
 	int i;
 	unsigned int noio_flags;
 
 	noio_flags = memalloc_noio_save();
 	swap_fs_prepare_rw(ctx, rw, &iter);
-	batch = rswap_batch_alloc();
+	batch = rswap_batch_alloc(ctx->sis);
 	if (!batch) {
 		ret = -ENOMEM;
 		goto out;
@@ -682,10 +656,12 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 	 */
 	for (i = 0; i < sio->nr_bvecs; i++) {
 		struct bio_vec *bv = &sio->bvecs[i];
+		page = bv->bv_page;
+		folio = page_folio(page);
 		size_t offset;
 
-		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE) {
-			ret = rswap_batch_add(batch, bv, offset, rw);
+		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE, page++) {
+			ret = rswap_batch_add(batch, ctx->sis, page, rw);
 			if (ret)
 				goto key_error;
 			if (batch->nr < RSWAP_BATCH_MAX)
@@ -701,11 +677,12 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 
 key_error:
 	rswap_stats_key_failure(&rswap_total, rw, ret);
-	rswap_stats_key_failure(batch->stats[batch->nr], rw, ret);
+	rswap_stats_key_failure(ctx->sis->rswap_stats, rw, ret);
 	pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
 			   rw == WRITE ? "write" : "read",
-			   swp_type(batch->last_entry),
-			   swp_offset(batch->last_entry), ret);
+			   ctx->sis->type,
+			   swp_offset(folio_page_swap_entry(folio, page)),
+			   ret);
 out:
 	kvfree(batch);
 	memalloc_noio_restore(noio_flags);
@@ -908,6 +885,8 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 	struct iov_iter iter;
 	struct rswap_read_req *req;
 	struct rswap_batch *batch;
+	struct folio *folio;
+	struct page *page;
 	s64 started = ktime_get_ns();
 	unsigned int noio_flags;
 	int ret = 0;
@@ -926,7 +905,7 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 	/* Set sio->iocb.ki_complete before any batch can be published. */
 	swap_fs_prepare_rw(ctx, READ, &iter);
 
-	batch = rswap_batch_alloc();
+	batch = rswap_batch_alloc(ctx->sis);
 	if (!batch) {
 		ret = -ENOMEM;
 		goto out_error;
@@ -938,10 +917,12 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 	 */
 	for (i = 0; i < sio->nr_bvecs; i++) {
 		struct bio_vec *bv = &sio->bvecs[i];
+		page = bv->bv_page;
+		folio = page_folio(page);
 		size_t offset;
 
-		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE) {
-			ret = rswap_batch_add(batch, bv, offset, READ);
+		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE, page++) {
+			ret = rswap_batch_add(batch, ctx->sis, page, READ);
 			if (ret)
 				goto key_error;
 			if (batch->nr < RSWAP_BATCH_MAX)
@@ -949,7 +930,7 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 
 			batch->req = req;
 			rswap_read_dispatch(batch);
-			batch = rswap_batch_alloc();
+			batch = rswap_batch_alloc(ctx->sis);
 			if (!batch) {
 				ret = -ENOMEM;
 				goto out_error;
@@ -965,10 +946,11 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 
 key_error:
 	rswap_stats_key_failure(&rswap_total, READ, ret);
-	rswap_stats_key_failure(batch->stats[batch->nr], READ, ret);
+	rswap_stats_key_failure(batch->si->rswap_stats, READ, ret);
 	pr_err_ratelimited("read type %u offset %lu failed: %d\n",
-			   swp_type(batch->last_entry),
-			   swp_offset(batch->last_entry), ret);
+			   ctx->sis->type,
+			   swp_offset(folio_page_swap_entry(folio, page)),
+			   ret);
 out_error:
 	rswap_read_req_error(req, ret);
 out:
