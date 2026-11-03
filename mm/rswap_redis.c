@@ -25,6 +25,7 @@
 
 #define pr_fmt(fmt) "rswap: " fmt
 
+#include <linux/bvec.h>
 #include <linux/highmem.h>
 #include <linux/kernel.h>
 #include <linux/seq_file.h>
@@ -45,6 +46,10 @@
 #define RSWAP_REDIS_MAX_LINE		256
 /* Cached connections; more concurrent batches than this fall back to new. */
 #define RSWAP_REDIS_POOL_MAX		8
+/* A request consists of header, len and data at most. */
+#define RSWAP_CMD_BVECS			3 * RSWAP_BATCH_MAX
+/* A small buffer for common use just in case. */
+#define RSWAP_CMD_BUF_SIZE		256
 
 static struct {
 	char		host[RSWAP_KV_HOST_LEN];
@@ -58,12 +63,39 @@ static struct {
 
 /* ---------- RESP wire format ---------- */
 
+enum {
+	RSWAP_CMD_AUTH,
+	RSWAP_CMD_GET,
+	RSWAP_CMD_SET,
+
+	RSWAP_CMD_ARG_2,
+	RSWAP_CMD_ARG_3,
+
+	RSWAP_CMD_BULK_2,
+	RSWAP_CMD_BULK_3,
+	RSWAP_CMD_BULK_PAGE_SIZE,
+
+	// and necessary items...
+
+	NR_RSWAP_CMD_PARTS,
+};
+
+// initialize in __init, alloc one folio, store strings and then fill them.
+static struct bio_vec rswap_common_part_bios[NR_RSWAP_CMD_PARTS];
+
 /* Builder for a run of pipelined commands inside one write buffer. */
 struct rswap_redis_cmd {
-	char	*buf;
-	size_t	size;
-	size_t	len;
+	size_t		size;
+	size_t		len;
+
+	struct bio_vec	bvecs[RSWAP_CMD_BVECS];
+	char		buf[RSWAP_CMD_BUF_SIZE];
 };
+
+static struct rswap_redis_cmd rswap_redis_cmd_alloc(void)
+{
+	// alloc from a slab or mempool
+}
 
 /* Append a "*<argc>\r\n" array header. */
 static int rswap_redis_add_array(struct rswap_redis_cmd *cmd, unsigned int argc)
@@ -429,18 +461,9 @@ static int rswap_redis_do_load(struct rswap_redis_conn *conn,
 			       size_t len)
 {
 	struct rswap_redis_cmd cmd;
-	char *request;
 	void *data;
 	unsigned int i;
 	int ret = 0;
-
-	request = kvmalloc(nr * RSWAP_REDIS_CMD_SIZE, GFP_NOIO);
-	if (!request)
-		return -ENOMEM;
-
-	cmd.buf = request;
-	cmd.size = nr * RSWAP_REDIS_CMD_SIZE;
-	cmd.len = 0;
 
 	for (i = 0; !ret && i < nr; i++) {
 		ret = rswap_redis_add_array(&cmd, 2);
