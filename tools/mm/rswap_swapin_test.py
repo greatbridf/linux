@@ -64,9 +64,10 @@ def idle_counters():
 def batch_trace():
     group = f'rswap_swapin_{os.getpid()}'
     instance = TRACE / 'instances' / group
+    load = f"rswap_{(DEBUG / 'backend').read_text().strip()}_load"
     definitions = {
-        'batch_enter': 'rswap_flush_batch nr=$arg4:u32 rw=$arg5:s32',
-        'batch_exit': 'rswap_flush_batch%return ret=$retval:s32 rw=$arg5:s32',
+        'batch_enter': f'{load} nr=$arg2:u32',
+        'batch_exit': f'{load}%return ret=$retval:s32',
         'advice_enter': 'do_madvise start=$arg2:x64 len=$arg3:u64 behavior=$arg4:s32',
         'advice_exit': 'do_madvise%return ret=$retval:s32 behavior=$arg4:s32',
     }
@@ -81,9 +82,9 @@ def batch_trace():
                           f'f:{group}/{name} {definition}')
             created.append(name)
             event = instance / 'events' / group / name
-            write_control(event / 'filter',
-                          'rw == 0' if name.startswith('batch') else
-                          f'behavior == {MADV_WILLNEED}')
+            if name.startswith('advice'):
+                write_control(event / 'filter',
+                              f'behavior == {MADV_WILLNEED}')
             write_control(event / 'enable', '1')
         yield instance
     finally:
