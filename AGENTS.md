@@ -76,22 +76,47 @@ A fault that finds no readahead window still submits one page
 
 ### Submission and completion
 
-The current rswap submission path is synchronous, even when reached through
-`read_swap_cache_async()` or `MADV_WILLNEED`. `swap_read_submit()` calls
-`rswap_submit_read()` directly; `rswap_submit()` waits for each
-`rswap_flush_batch()` before advancing. Redis pipelines up to 32 GET commands,
-then receives all responses in that batch before the next batch is sent.
-Pooling reuses connections and permits overlap between callers; a single
-caller still has only one batch in flight. WILLNEED fills larger batches but
-does not make this backend asynchronous.
+Swapin is asynchronous, writeout is not. `swap_read_submit()` calls
+`rswap_submit_read()`, which resolves every key and base page address in the
+submitting task, prepares `sio->iocb`, hands each batch to the `rswap_read`
+workqueue and returns; the caller's stack-allocated `struct swap_io_ctx` is
+dropped there, and nothing dereferences `struct swap_info_struct` afterwards.
+Writeout still calls `rswap_submit()` and waits for each
+`rswap_flush_batch()`, because reclaim wants the folio writeback flag cleared
+before it continues.
 
-The planned optimization is recorded in `TODOS.md`: dispatch/queue reads and
-return promptly, allow bounded concurrent I/O, and invoke the existing swap
-completion callback when each request finishes. Preserve request, folio,
-buffer and device lifetimes, complete exactly once, and drain outstanding
-work safely during teardown. This is pending work, not implemented behavior.
-The swapin performance test must then separate submission time from actual
-I/O completion instead of assuming WILLNEED has finished loading on return.
+One work item is one `rswap_flush_batch()` call, so Redis still pipelines up
+to 32 GET commands and HTTP still sends one object per request; the difference
+is that batches of one request now overlap instead of being serialized.
+`RSWAP_READ_MAX_INFLIGHT` (8) bounds queued plus running batches, which bounds
+the 32-page bounce buffers (1-4 MiB) and the pinned folios. 8 matches
+`RSWAP_REDIS_POOL_MAX` and the point where measured WILLNEED throughput
+stopped improving. When no slot is free, the workqueue refuses the item or the
+request structure cannot be allocated, that batch is moved in the submitting
+task instead, i.e. the previous synchronous behaviour, so swapin always makes
+forward progress under memory pressure. `WQ_MEM_RECLAIM` keeps a worker
+runnable while reclaim waits for it.
+
+Completion is exactly once, through a `refcount_t` held once by the submitter
+and once per dispatched batch: the last batch to finish calls
+`sio->iocb.ki_complete(&sio->iocb, ret ? ret : sio->len)`, and the normal
+`swap_read_end()` marks the folios uptodate, unlocks them and frees the
+`swap_iocb`. The first negative errno fails the whole request, so a partial
+success is never exposed as uptodate. All batches of a request share one
+completion, and no batch touches the request after `ki_complete()`.
+
+Teardown is fenced in `rswap_disable()`: it calls
+`flush_workqueue(rswap_read_wq)` before freeing the per-device table and
+counters, which is what makes the per-batch device pointers safe. `__swapoff()`
+kills `si->users`, runs `synchronize_rcu()` and waits for its holders before
+calling it, and runs without a lock held there, so the drain cannot deadlock.
+
+`read_avg_ns`/`read_max_ns` are measured around the backend call in the
+worker, so they are real remote batch latency. `read_inflight`,
+`read_peak_inflight` (a boot-lifetime maximum, reset when a device is created),
+`read_fallbacks` and `read_submits` describe the queue itself. The swapin
+performance test separates `SUBMITTED` from `LOADED` for the same reason:
+only `LOADED` means the remote reads finished.
 
 ### Endpoint and build scope
 
@@ -320,8 +345,8 @@ swap fault
 - `tools/mm/rswap_redis_test.py`: RESP client test against a scripted server,
   plus `--live` against a real Redis server.
 - `tools/mm/kvswap_test.py`: HTTP protocol regression tests.
-- `TODOS.md`: pending asynchronous `submit_read` design, lifecycle requirements,
-  and validation criteria.
+- `TODOS.md`: asynchronous `submit_read` design, validation results and the
+  follow-ups it did not cover.
 
 ## Interfaces and Operations
 
@@ -380,6 +405,26 @@ attached digest (`written_no_digest`) resp. for swapin the entries with no
 stored digest (`read_no_entry`). Failed pages count attempts: reclaim retries
 a page it could not move, so one such page is counted more than once. Such a
 failure happens before the backend is called, so it costs no round trip.
+
+Swapin additionally reports its queue and submission cost:
+
+```text
+read_inflight          1
+read_peak_inflight     8
+read_fallbacks         0
+read_submits           1024
+read_submit_avg_ns     210000
+```
+
+`read_inflight` is the number of read batches queued or running,
+`read_peak_inflight` the largest value it reached since the device was
+created, `read_fallbacks` batches that had to be moved in the submitting task
+(no free queue slot or no workqueue), `read_submits` read requests queued and
+`read_submit_avg_ns` the average time a submission spent before returning to
+the caller. A request that finds no memory for its queue bookkeeping at all
+runs the previous synchronous path inside `rswap_submit()` instead and shows
+up only in `read_pages`/`read_batches`. `read_batches` and `read_avg_ns` still count
+and time the backend calls themselves, now from the worker.
 
 Backends may add their own lines at the end of `stats`; the Redis backend
 reports its connection pool:
@@ -514,9 +559,14 @@ do not prove RAM was freed: `mincore()` can still find pages in swap cache.
 The swapin test therefore follows pageout with bounded cgroup reclaim and
 requires every page nonresident before timing. It checks actual remote byte
 counts, then verifies every word with no additional remote reads. Preparation
-time is excluded. Report batch latency as backend-call latency, not bare RTT
-or individual page-fault latency. Under concurrency, compute bandwidth from
-wall time rather than summed overlapping batch durations.
+time is excluded. Because swapin is asynchronous, the test reports two
+instants: `SUBMITTED`, when the WILLNEED calls and the page-fault loads
+returned, and `LOADED`, when `mincore()` finds every page resident again
+(which for a swap-cache folio only happens after the remote read completed).
+The load-time and bandwidth numbers use `LOADED`; the difference between the
+two is the completion tail. Report batch latency as backend-call latency, not
+bare RTT or individual page-fault latency. Under concurrency, compute
+bandwidth from wall time rather than summed overlapping batch durations.
 
 For manual live testing, stop zram swap before creating the remote-only
 configuration (`rswap_scale_test.py --takeover-swap` does this and restores
@@ -649,7 +699,10 @@ about eight pages per batch. WILLNEED batch p50/p95 latency increased from
 48.70/67.96 ms with one caller to 148.24/300.49 ms with eight, while total
 load time fell because requests overlapped. Throughput flattened around
 four to eight callers; individual runs do not establish physical link
-capacity. These findings motivate the asynchronous `submit_read` TODO.
+capacity. Those findings motivated the asynchronous `submit_read` path, which
+turns one WILLNEED caller into up to `RSWAP_READ_MAX_INFLIGHT` overlapping
+batches; the numbers in this table predate it and were measured with a
+synchronous backend.
 
 The cold tests recorded a 2,129,920-byte cgroup swap charge after verifier
 exit, before device teardown; its cause was not established and it is not
@@ -675,14 +728,17 @@ are not backend transport failures or evidence of a fallback path.
 - The HTTP KV server has no authentication and the kernel sends no
   credentials to it. Redis supports `AUTH`/`SELECT`, but its secret is a boot
   parameter and is stored in plain text while the kernel runs.
-- One caller waits for each batch to finish before submitting the next,
-  including on WILLNEED. Redis leases and reuses a pooled connection for each
-  batch and sends one command per page; overlapping callers can use multiple
-  connections. Asynchronous read submission is pending in `TODOS.md`. Both
-  the single-threaded HTTP server and this design are for testing, not
-  production throughput. A backend switch needs a reboot, and the backend
-  for a device is never recorded, so a device written with one backend cannot
-  be read back with another.
+- Swapin batches overlap, but at most `RSWAP_READ_MAX_INFLIGHT` (8) are in
+  flight, so a single caller of `MADV_WILLNEED` reaches at most the throughput
+  of eight concurrent round trips. The depth is a compile-time constant, and
+  the HTTP backend still opens one connection per object. Both the
+  single-threaded HTTP server and this depth are for testing, not production
+  throughput. A backend switch needs a reboot, and the backend for a device is
+  never recorded, so a device written with one backend cannot be read back
+  with another.
+- Read batches queue up to 8 bounce buffers of `RSWAP_BATCH_MAX` pages each
+  (1-4 MiB), so the transient memory of asynchronous swapin is bounded by the
+  queue depth, not by the number of swapin callers.
 - `RSWAP_BATCH_MAX` also bounds the core's per-request batch buffer (32 base
   pages: 128 KiB with 4 KiB pages, 512 KiB with 16 KiB pages), kvmalloc'ed for
   the duration of a request, plus the same amount again in the Redis request

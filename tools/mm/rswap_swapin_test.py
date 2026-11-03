@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 from rswap_scale_test import read_swaps, restore_swap
 
@@ -43,6 +44,22 @@ def counters():
             if value.isdecimal()}
 
 
+def idle_counters():
+    """Read the counters once no read batch is in flight any more.
+
+    A worker releases its slot right after the completion callback marked the
+    folios uptodate, so the last batch of the run can still be visible for a
+    moment after mincore() reported the whole mapping loaded.  Wait that out
+    instead of sampling a gauge that is legitimately one off.
+    """
+    deadline = time.monotonic() + 5
+    while True:
+        stats = counters()
+        if not stats['read_inflight'] or time.monotonic() > deadline:
+            return stats
+        time.sleep(0.02)
+
+
 @contextlib.contextmanager
 def batch_trace():
     group = f'rswap_swapin_{os.getpid()}'
@@ -58,7 +75,7 @@ def batch_trace():
     try:
         write_control(instance / 'tracing_on', '0')
         write_control(instance / 'trace_clock', 'global')
-        write_control(instance / 'buffer_size_kb', '2048')
+        write_control(instance / 'buffer_size_kb', '8192')
         for name, definition in definitions.items():
             write_control(TRACE / 'dynamic_events',
                           f'f:{group}/{name} {definition}')
@@ -84,6 +101,13 @@ def percentile(values, percent):
 
 
 def trace_result(text, ready):
+    """Pair batch and advice entry/return events per thread.
+
+    An asynchronous backend moves a read batch on a worker thread, so the
+    batches of one WILLNEED caller are neither on its thread nor inside its
+    advice window.  What still holds is the per-thread pairing of every entry
+    with its return, and that the WILLNEED calls cover the mapping exactly.
+    """
     pattern = re.compile(r'-(\d+)\s+\[\d+\].*?\s(\d+\.\d+): '
                          r'(batch_enter|batch_exit|advice_enter|advice_exit): (.*)')
     active = {}
@@ -115,8 +139,6 @@ def trace_result(text, ready):
             if tid in active:
                 raise RuntimeError('nested batch or missing return event')
             active[tid] = timestamp
-            if ready['willneed'] and tid not in advice:
-                raise RuntimeError('read batch outside WILLNEED')
             tids.add(tid)
             histogram[fields['nr']] += 1
             pages += fields['nr']
@@ -159,7 +181,7 @@ def run_test(args, output, instance, cg):
     proc = subprocess.Popen(command, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
-    before = after = ready = cold = loaded = verify = evidence = None
+    before = after = ready = cold = submitted = loaded = verify = evidence = None
     log = []
     try:
         for line in proc.stdout:
@@ -173,10 +195,14 @@ def run_test(args, output, instance, cg):
                 write_control(instance / 'tracing_on', '1')
                 proc.stdin.write('G')
                 proc.stdin.flush()
+            elif line.startswith('SUBMITTED '):
+                submitted = fields(line)
             elif line.startswith('LOADED '):
+                if submitted is None:
+                    raise RuntimeError('LOADED before SUBMITTED')
                 loaded = fields(line)
                 write_control(instance / 'tracing_on', '0')
-                after = counters()
+                after = idle_counters()
                 evidence = (instance / 'trace').read_text()
                 (output / 'trace.txt').write_text(evidence)
                 for path in (instance / 'per_cpu').glob('cpu*/stats'):
@@ -198,14 +224,15 @@ def run_test(args, output, instance, cg):
         proc.stdin.close()
         proc.stdout.close()
         (output / 'verifier.log').write_text(''.join(log))
-    if not ready or not loaded or not cold or evidence is None:
+    if not ready or not submitted or not loaded or not cold or evidence is None:
         raise RuntimeError(f'verifier did not finish swapin (exit {ret})')
     verified = counters()
     delta = {key: after[key] - before[key] for key in after
              if key not in ('batch_max',) and not key.endswith(('_avg_ns', '_max_ns'))}
     result = {'kernel': os.uname().release, 'backend': (DEBUG / 'backend').read_text().strip(),
               'size_kib': args.size_kib, 'mode': args.mode, 'workers': args.workers,
-              'ready': ready, 'cold': cold, 'loaded': loaded, 'verify': verify,
+              'ready': ready, 'cold': cold, 'submitted': submitted, 'loaded': loaded,
+              'verify': verify,
               'before': before, 'after_load': after, 'after_verify': verified,
               'delta_load': delta, 'verifier_exit': ret,
               'memory_events': (cg / 'memory.events').read_text(),
@@ -214,17 +241,34 @@ def run_test(args, output, instance, cg):
     traced = trace_result(evidence, ready)
     result['trace'] = traced
     result['payload_mib_s'] = ready['bytes'] / (1024 * 1024) / (loaded['ns'] / 1e9)
+    result['submit_mib_s'] = (ready['bytes'] / (1024 * 1024) /
+                              (max(submitted['ns'], 1) / 1e9))
+    result['completion_tail_s'] = (loaded['ns'] - submitted['ns']) / 1e9
+    result['read_peak_inflight'] = after['read_peak_inflight']
+    result['read_fallbacks'] = delta['read_fallbacks']
+    result['read_submits'] = delta['read_submits']
     (output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+    print(f"SUBMIT: {submitted['ns'] / 1e9:.3f}s, {result['submit_mib_s']:.3f} MiB/s, "
+          f"completion tail {result['completion_tail_s']:.3f}s")
     print(f"LOAD: {loaded['ns'] / 1e9:.3f}s, {result['payload_mib_s']:.3f} MiB/s, "
           f"{loaded['nonresident']} nonresident pages remaining")
     print('Batch histogram (pages: calls):', traced['batch_histogram'])
-    print('Peak simultaneous read batches:', traced['peak_inflight_batches'])
+    print('Peak simultaneous read batches:', traced['peak_inflight_batches'],
+          '(debugfs read_peak_inflight', after['read_peak_inflight'], ')')
+    print('Read submits:', delta['read_submits'], 'inline fallbacks:', delta['read_fallbacks'])
     print('Batch latency ms:', traced['batch_latency_ms'])
     print('Load counters:', delta)
     if ret or loaded['nonresident'] or cold['nonresident'] != cold['pages']:
         raise RuntimeError('incomplete eviction, swapin, or corrupt data')
+    if after['read_inflight']:
+        raise RuntimeError(f"{after['read_inflight']} read batch(es) still in flight "
+                           'after the mapping finished loading')
+    if args.mode == 'willneed' and after['read_peak_inflight'] < 1:
+        raise RuntimeError('WILLNEED never had a read batch in flight')
     if traced['pages'] != ready['pages'] or traced['pages'] != delta['read_pages'] or traced['batches'] != delta['read_batches']:
         raise RuntimeError('trace, page count, and counters disagree')
+    if delta['read_pages'] != ready['pages']:
+        raise RuntimeError('swapin did not read exactly the mapping')
     if delta['read_bytes'] != ready['bytes'] or max(traced['batch_histogram']) > before['batch_max']:
         raise RuntimeError('wrong byte count or backend exceeded batch_max')
     if delta['read_errors'] or delta['written_pages']:

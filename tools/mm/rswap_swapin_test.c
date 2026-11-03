@@ -151,6 +151,13 @@ out:
 
 #define MAX_WORKERS 32
 
+/*
+ * Upper bound on waiting for the remote reads a submission queued.  512 MiB
+ * over a slow path takes tens of seconds; the runner enforces the real
+ * timeout, this only keeps a broken kernel from spinning forever.
+ */
+#define COMPLETION_TIMEOUT_NS	(600ULL * 1000000000)
+
 struct reader {
 	uint64_t *data;
 	size_t bytes;
@@ -211,7 +218,7 @@ int main(int argc, char **argv)
 	size_t mismatches = 0;
 	unsigned long long size_kib;
 	unsigned long workers;
-	uint64_t seed, started, elapsed, verify_ns;
+	uint64_t seed, started, submitted, loaded, verify_ns;
 	unsigned char *resident;
 	uint64_t *data;
 	char *end;
@@ -321,10 +328,27 @@ int main(int argc, char **argv)
 	pthread_barrier_wait(&barrier);
 	for (i = 0; i < workers; i++)
 		pthread_join(threads[i], NULL);
-	elapsed = monotonic_ns() - started;
+	submitted = monotonic_ns() - started;
 	missing = nonresident(data, size, page_size, resident);
+	printf("SUBMITTED ns=%" PRIu64 " nonresident=%zu pages=%zu\n",
+	       submitted, missing, pages);
+
+	/*
+	 * mincore() reports a swap-cache folio as resident only once it is
+	 * uptodate, which swap_read_end() sets when the remote read of that
+	 * folio completed.  Waiting here, after submission returned, is what
+	 * turns a WILLNEED call into a real completion gate on an asynchronous
+	 * backend instead of a submission-time snapshot.
+	 */
+	for (;;) {
+		missing = nonresident(data, size, page_size, resident);
+		if (!missing || monotonic_ns() - started > COMPLETION_TIMEOUT_NS)
+			break;
+		usleep(200);
+	}
+	loaded = monotonic_ns() - started;
 	printf("LOADED ns=%" PRIu64 " nonresident=%zu pages=%zu\n",
-	       elapsed, missing, pages);
+	       loaded, missing, pages);
 	for (i = 0; i < workers; i++)
 		printf("WORKER index=%zu ns=%" PRIu64 " error=%d checksum=%" PRIu64 "\n",
 		       i, readers[i].ns, readers[i].error, readers[i].checksum);

@@ -39,35 +39,47 @@ barrier. Each worker owns one contiguous, disjoint slice of the mapping:
 * ``fault`` loads one word per native page, retaining a checksum so the
   compiler cannot remove the accesses.
 
-The main thread waits for all workers and records elapsed wall time. It
-checks residency again, pauses for the runner to capture counters and
-traces, and verifies every word against the original pattern. Full content
-verification has its own timing and must require no additional remote reads.
+The main thread waits for all workers, records how long their submission took
+(``SUBMITTED``), and then waits until ``mincore()`` reports every page
+resident again (``LOADED``). For a swap-cache folio that only happens once
+the folio is uptodate, which the completion path sets when the remote read
+finished, so on an asynchronous backend ``LOADED`` is a real completion gate
+and the gap between the two is the completion tail. It then verifies every
+word against the original pattern. Full content verification has its own
+timing and must require no additional remote reads.
 
 What the measurements mean
 --------------------------
 
-``result.json`` includes cold-page counts, load and verification times,
-actual remote bytes/pages/batches, payload MiB/s, worker count, connection
-reuse/retry counters, and integrity status. Every successful run must read
-exactly one mapping's worth of remote data with no I/O errors or writes
+``result.json`` includes cold-page counts, submission and load times, actual
+remote bytes/pages/batches, payload MiB/s, submission MiB/s, completion-tail
+seconds, worker count, connection reuse/retry counters, and integrity status.
+Load time and bandwidth use ``LOADED``; the submission figures only cover the
+``MADV_WILLNEED`` calls resp. the page-fault loads. Every successful run must
+read exactly one mapping's worth of remote data with no I/O errors or writes
 during the measured read phase.
+
+WILLNEED is a hint and does not promise completed I/O on return. This test
+measures the installed backend's behavior and requires completion instead of
+assuming it: every page must be resident and every expected remote read done
+by ``LOADED``, and ``read_inflight`` must be zero at that point. A single
+WILLNEED call now batches pages and overlaps several batches without further
+userspace callers; the trace's peak active batch count and the debugfs
+``read_peak_inflight`` line report whether it did, and ``read_fallbacks``
+counts batches that had to be moved in the submitting task (no queue slot or
+no workqueue). ``read_submits`` and ``read_submit_avg_ns`` describe the
+submission path itself. Throughput is computed from total wall time, not the
+sum of overlapping batch durations.
 
 Temporary fprobe entry/return events on ``rswap_flush_batch`` measure the
 batch-size histogram, peak simultaneous read batches, and per-batch p50,
 p95, p99 and maximum latency. These are backend-call latencies, not individual
 page-fault latency or bare network RTT. ``do_madvise`` probes validate that
-the WILLNEED calls cover the mapping exactly once with disjoint ranges.
-The runner rejects incomplete traces and trace-buffer overruns. Raw traces
-and per-CPU trace statistics are retained alongside the results.
-
-WILLNEED is a hint and does not universally promise completed I/O on return.
-This test measures the installed backend's behavior: it requires all pages
-resident and all expected remote reads complete when the workers finish.
-A single WILLNEED call can batch pages without overlapping backend calls.
-Multiple workers demonstrate overlap only when the trace reports more than
-one active batch. Throughput is computed from total wall time, not the sum
-of overlapping batch durations.
+the WILLNEED calls cover the mapping exactly once with disjoint ranges. Read
+batches run on the backend's worker threads, so a batch is paired per thread
+but is not confined to the calling worker's advice window. The runner rejects
+incomplete traces and trace-buffer overruns. Raw traces and per-CPU trace
+statistics are retained alongside the results.
 
 Cleanup and limits
 ------------------
