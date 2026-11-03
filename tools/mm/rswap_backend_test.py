@@ -13,6 +13,7 @@ SHIMS = r"""
 #include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,11 +35,16 @@ typedef uint8_t u8;
 #define RSWAP_HTTP_MAX_HEADER 2048
 #define min_t(type, a, b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
 #define pr_debug_ratelimited(...) do { } while (0)
 #define pr_err_ratelimited(...) do { } while (0)
+#define pr_warn(...) do { } while (0)
 typedef int64_t s64;
 #define ktime_get_ns() ((s64)0)
 #define kmalloc(size, flags) malloc(size)
+#define kzalloc(size, flags) calloc(1, size)
+#define kzalloc_obj(obj, flags) calloc(1, sizeof(obj))
 #define kfree(ptr) free(ptr)
 #define kvmalloc_array(count, size, flags) calloc((count), (size))
 #define kvmalloc(size, flags) malloc(size)
@@ -47,6 +53,53 @@ typedef int64_t s64;
 #define struct_size(ptr, member, count) (sizeof(*(ptr)) + (count))
 #define PTR_ERR(ptr) ((long)(ptr))
 #define IS_ERR(ptr) ((uintptr_t)(ptr) > (uintptr_t)-4096)
+/*
+ * The asynchronous swapin bookkeeping.  queue_work() runs the work item inline
+ * in the submitting task, so the queued path is exercised end to end here.
+ */
+typedef struct { int v; } atomic_t;
+#define atomic_read(p) ((p)->v)
+#define atomic_set(p, value) ((p)->v = (value))
+#define atomic_inc_return(p) (++(p)->v)
+#define atomic_dec(p) (--(p)->v)
+#define atomic_try_cmpxchg(p, old, new) \
+    ({ int __cur = (p)->v; \
+       bool __ok = __cur == *(old); \
+       if (__ok) (p)->v = (new); else *(old) = __cur; __ok; })
+typedef struct { int64_t v; } atomic64_t;
+#define atomic64_read(p) ((p)->v)
+#define atomic64_set(p, value) ((p)->v = (value))
+#define atomic64_add(value, p) ((p)->v += (value))
+#define atomic64_inc(p) ((p)->v++)
+typedef struct { int v; } refcount_t;
+#define refcount_set(p, value) ((p)->v = (value))
+#define refcount_inc(p) ((p)->v++)
+#define refcount_dec(p) ((p)->v--)
+#define refcount_dec_and_test(p) (--(p)->v == 0)
+struct workqueue_struct { int unused; };
+struct work_struct { void (*func)(struct work_struct *); };
+#define WQ_MEM_RECLAIM 0
+#define INIT_WORK(w, f) ((w)->func = (f))
+static struct workqueue_struct wq_stub;
+static bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
+{
+    work->func(work);
+    return true;
+}
+static void flush_workqueue(struct workqueue_struct *wq) { }
+static struct workqueue_struct *alloc_workqueue(const char *name,
+                                                unsigned int flags,
+                                                unsigned int max_active)
+{
+    return &wq_stub;
+}
+static void destroy_workqueue(struct workqueue_struct *wq) { }
+#define cmpxchg(p, old, new) \
+    ({ __typeof__(*(p)) __prev = *(p); \
+       if (__prev == (old)) { \
+           *(p) = (new); \
+       } \
+       __prev; })
 typedef struct { unsigned long val; } swp_entry_t;
 struct socket { int unused; };
 struct iov_iter { int unused; };
@@ -328,6 +381,12 @@ int main(void)
     sio.bvecs[0] = (struct bio_vec) {
         .folio = &big, .bv_page = &big.pages[0], .bv_len = sizeof(original),
     };
+    /*
+     * Only the workqueue itself is missing here: queue_work() runs the work
+     * item inline, so every read below goes through the queued path and
+     * completes from rswap_read_batch_work().
+     */
+    assert(rswap_read_wq_init() == 0);
     rswap_submit_write(&ctx);
     assert(completion == sizeof(original));
     /* RSWAP_BATCH_MAX == 8: the whole 8 page folio is one backend call. */
@@ -521,6 +580,26 @@ int main(void)
         printf("FAIL: failed two page batch counted %u total / %u device"
                " error(s), expected 2/2\n", counted.errors_read,
                counted.dev_errors_read);
+        return 1;
+    }
+    /* Every request completed once and released its queue slot. */
+    if (atomic_read(&rswap_read_inflight) ||
+        atomic64_read(&rswap_read_fallbacks) ||
+        !atomic64_read(&rswap_read_submits)) {
+        puts("FAIL: reads bypassed or leaked the asynchronous path");
+        return 1;
+    }
+    /* Without a workqueue the same request completes in the submitting task. */
+    stored_len[2] = PAGE_SIZE;
+    rswap_read_wq = NULL;
+    memset(actual, 0, PAGE_SIZE * 2);
+    requests = moved = 0;
+    rswap_submit_read(&ctx);
+    assert(completion == PAGE_SIZE * 2);
+    assert(!memcmp(original, actual, PAGE_SIZE * 2));
+    if (atomic64_read(&rswap_read_fallbacks) != 1 ||
+        atomic_read(&rswap_read_inflight)) {
+        puts("FAIL: swapin without a workqueue did not fall back inline");
         return 1;
     }
     puts("PASS: actual submit paths batch pages and preserve addressing/errors");

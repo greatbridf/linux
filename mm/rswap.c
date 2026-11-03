@@ -49,6 +49,7 @@
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/kthread.h>
+#include <linux/workqueue.h>
 #include <linux/delay.h>
 #include <linux/debugfs.h>
 #include <linux/page_ext.h>
@@ -554,14 +555,25 @@ static int rswap_flush_batch(struct rswap_kv_page *pages,
 	return ret;
 }
 
+struct rswap_read_req;
+
 /*
- * One swap request in progress: up to RSWAP_BATCH_MAX page images plus the
- * keys, folio pages and per-device counters that go with them.  Too big for
- * the stack, so it is kvmalloc'ed for the duration of the request.
+ * One batch of up to RSWAP_BATCH_MAX base page images: the keys they are
+ * stored under, the folio pages they belong to and, for swapin, the work item
+ * that moves them.  Too big for the stack, so it is kvmalloc'ed for the
+ * duration of the batch.
+ *
+ * A batch belongs to one asynchronous read request while it is queued or
+ * running in a worker (@req is NULL on the synchronous write path).  The
+ * per-device counters in @stats stay valid until the batch is freed: swapoff
+ * drains the read workqueue before it frees the device table.
  */
 struct rswap_batch {
 	unsigned int		nr;
 	swp_entry_t		entry;		/* first entry of the batch */
+	swp_entry_t		last_entry;	/* last entry added, for errors */
+	struct rswap_read_req	*req;		/* NULL on the synchronous path */
+	struct work_struct	work;
 	char			keys[RSWAP_BATCH_MAX][RSWAP_KV_KEY_LEN];
 	struct rswap_kv_page	pages[RSWAP_BATCH_MAX];
 	struct page		*targets[RSWAP_BATCH_MAX];
@@ -569,32 +581,100 @@ struct rswap_batch {
 	char			data[] __aligned(PAGE_SIZE);
 };
 
+static struct rswap_batch *rswap_batch_alloc(void)
+{
+	struct rswap_batch *batch;
+
+	batch = kvmalloc(struct_size(batch, data, RSWAP_BATCH_MAX * PAGE_SIZE),
+			 GFP_NOIO);
+	if (batch)
+		batch->nr = 0;
+	return batch;
+}
+
+/*
+ * Add the base page of @bv at @offset to @batch.
+ *
+ * The digest is looked up here, in the submitting task, so that a worker never
+ * dereferences the swap device after the caller's context is gone.  Returns
+ * -ENODATA on writeout resp. -ENOENT on swapin when the page has no digest.
+ */
+static int rswap_batch_add(struct rswap_batch *batch, struct bio_vec *bv,
+			   size_t offset, int rw)
+{
+	struct folio *folio = bvec_folio(bv);
+	size_t folio_offset = folio_page_idx(folio, bv->bv_page) * PAGE_SIZE +
+			      bv->bv_offset + offset;
+	unsigned int idx = folio_offset / PAGE_SIZE;
+	unsigned int nr = batch->nr;
+	struct page *page = folio_page(folio, idx);
+	swp_entry_t entry = folio_swap_entry(folio, idx);
+	struct swap_info_struct *si = __swap_entry_to_info(entry);
+	void *mapped;
+	int ret;
+
+	batch->last_entry = entry;
+	batch->stats[nr] = si->rswap_stats;
+	ret = rswap_page_key(si, page, entry, rw, batch->keys[nr]);
+	if (ret)
+		return ret;
+
+	if (!nr)
+		batch->entry = entry;
+	batch->pages[nr].key = batch->keys[nr];
+	batch->pages[nr].data = batch->data + nr * PAGE_SIZE;
+	batch->targets[nr] = page;
+	if (rw == WRITE) {
+		mapped = kmap_local_page(page);
+		memcpy(batch->pages[nr].data, mapped, PAGE_SIZE);
+		kunmap_local(mapped);
+	}
+	batch->nr = nr + 1;
+	return 0;
+}
+
+/* Move a full or partial batch and empty it again. */
+static int rswap_batch_flush(struct rswap_batch *batch, int rw)
+{
+	unsigned int nr = batch->nr;
+	int ret;
+
+	batch->nr = 0;
+	ret = rswap_flush_batch(batch->pages, batch->targets, batch->stats, nr,
+				rw);
+	if (ret)
+		pr_err_ratelimited("%s type %u offset %lu..%lu failed: %d\n",
+				   rw == WRITE ? "write" : "read",
+				   swp_type(batch->entry),
+				   swp_offset(batch->entry),
+				   swp_offset(batch->last_entry), ret);
+	return ret;
+}
+
 /*
  * Submit each base page synchronously and complete the whole swap request.
  *
  * Pages are collected into batches of up to RSWAP_BATCH_MAX so the backend
  * can move several pages per round trip; the batch is flushed whenever it is
- * full or the request runs out of pages.
+ * full or the request runs out of pages.  Writeout always runs here; swapin
+ * only gets here when no request bookkeeping memory was available.
  */
 static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 {
 	struct swap_iocb *sio = ctx->sio;
 	struct iov_iter iter;
 	struct rswap_batch *batch;
-	swp_entry_t cur_entry = { };
 	int ret = 0;
 	int i;
 	unsigned int noio_flags;
 
 	noio_flags = memalloc_noio_save();
 	swap_fs_prepare_rw(ctx, rw, &iter);
-	batch = kvmalloc(struct_size(batch, data, RSWAP_BATCH_MAX * PAGE_SIZE),
-			 GFP_NOIO);
+	batch = rswap_batch_alloc();
 	if (!batch) {
 		ret = -ENOMEM;
 		goto out;
 	}
-	batch->nr = 0;
 
 	/*
 	 * Swap-in can split or combine the folios used at swap-out. Store
@@ -602,74 +682,302 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 	 */
 	for (i = 0; i < sio->nr_bvecs; i++) {
 		struct bio_vec *bv = &sio->bvecs[i];
-		struct folio *folio = bvec_folio(bv);
 		size_t offset;
 
 		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE) {
-			size_t folio_offset =
-				folio_page_idx(folio, bv->bv_page) * PAGE_SIZE +
-				bv->bv_offset + offset;
-			unsigned int idx = folio_offset / PAGE_SIZE;
-			struct page *page = folio_page(folio, idx);
-			swp_entry_t entry = folio_swap_entry(folio, idx);
-			struct swap_info_struct *si =
-				__swap_entry_to_info(entry);
-			void *mapped;
-
-			cur_entry = entry;
-			batch->stats[batch->nr] = si->rswap_stats;
-			ret = rswap_page_key(si, page, entry, rw,
-					     batch->keys[batch->nr]);
+			ret = rswap_batch_add(batch, bv, offset, rw);
 			if (ret)
-				goto io_error;
-
-			if (!batch->nr)
-				batch->entry = entry;
-			batch->pages[batch->nr].key = batch->keys[batch->nr];
-			batch->pages[batch->nr].data =
-				batch->data + batch->nr * PAGE_SIZE;
-			batch->targets[batch->nr] = page;
-			if (rw == WRITE) {
-				mapped = kmap_local_page(page);
-				memcpy(batch->pages[batch->nr].data, mapped,
-				       PAGE_SIZE);
-				kunmap_local(mapped);
-			}
-			batch->nr++;
-
+				goto key_error;
 			if (batch->nr < RSWAP_BATCH_MAX)
 				continue;
-			ret = rswap_flush_batch(batch->pages, batch->targets,
-						batch->stats, batch->nr, rw);
+			ret = rswap_batch_flush(batch, rw);
 			if (ret)
-				goto batch_error;
-			batch->nr = 0;
+				goto out;
 		}
 	}
-	if (batch->nr) {
-		ret = rswap_flush_batch(batch->pages, batch->targets,
-					batch->stats, batch->nr, rw);
-		if (ret)
-			goto batch_error;
-	}
+	if (batch->nr)
+		ret = rswap_batch_flush(batch, rw);
 	goto out;
 
-batch_error:
-	pr_err_ratelimited("%s type %u offset %lu..%lu failed: %d\n",
-			   rw == WRITE ? "write" : "read",
-			   swp_type(batch->entry), swp_offset(batch->entry),
-			   swp_offset(batch->entry) + batch->nr - 1, ret);
-	goto out;
-io_error:
+key_error:
 	rswap_stats_key_failure(&rswap_total, rw, ret);
 	rswap_stats_key_failure(batch->stats[batch->nr], rw, ret);
 	pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
 			   rw == WRITE ? "write" : "read",
-			   swp_type(cur_entry), swp_offset(cur_entry), ret);
+			   swp_type(batch->last_entry),
+			   swp_offset(batch->last_entry), ret);
 out:
 	kvfree(batch);
 	memalloc_noio_restore(noio_flags);
 	sio->iocb.ki_complete(&sio->iocb, ret < 0 ? ret : sio->len);
+}
+
+/* ---------- asynchronous swapin ---------- */
+
+/*
+ * How many read batches may be outstanding at once.  Each one holds its
+ * bounce buffer (RSWAP_BATCH_MAX pages: 128 KiB with 4 KiB pages, 512 KiB
+ * with 16 KiB pages) and pins the folios it fills, so this bound is what
+ * keeps the transient read memory at 1-4 MiB.  Eight matches
+ * RSWAP_REDIS_POOL_MAX: a ninth concurrent batch would only wait for a pooled
+ * connection, and the measured WILLNEED throughput of the remote Redis test
+ * server stopped improving beyond eight concurrent batches (22.5 MiB/s with
+ * eight callers against 9.7 MiB/s with one).
+ */
+#define RSWAP_READ_MAX_INFLIGHT	8
+
+/* Batches between dispatch and completion, including any queued ones. */
+static atomic_t rswap_read_inflight;
+/* Largest value the above reached; reset when a device is created. */
+static atomic_t rswap_read_peak_inflight;
+/* Batches moved in the submitting task instead (queue full or absent). */
+static atomic64_t rswap_read_fallbacks;
+/* Submissions and the time they spent before returning to the caller. */
+static atomic64_t rswap_read_submits;
+static atomic64_t rswap_read_submit_ns;
+
+/*
+ * Reads run on their own workqueue.  More than one worker is the point:
+ * MADV_WILLNEED submits from a single task, and overlapping the remote round
+ * trips is what turns one caller into the throughput of several.  The
+ * workqueue lives for the whole boot; the backend can never change, so there
+ * is nothing to tear it down for.
+ */
+static struct workqueue_struct *rswap_read_wq;
+
+static void rswap_read_peak_update(int value)
+{
+	int old = atomic_read(&rswap_read_peak_inflight);
+
+	while (old < value &&
+	       !atomic_try_cmpxchg(&rswap_read_peak_inflight, &old, value))
+		;
+}
+
+/* Take one of the RSWAP_READ_MAX_INFLIGHT slots; false when saturated. */
+static bool rswap_read_enter(void)
+{
+	int value = atomic_read(&rswap_read_inflight);
+
+	do {
+		if (value >= RSWAP_READ_MAX_INFLIGHT)
+			return false;
+	} while (!atomic_try_cmpxchg(&rswap_read_inflight, &value, value + 1));
+
+	rswap_read_peak_update(value + 1);
+	return true;
+}
+
+/* Account a batch moved in the submitting task: no slot was taken for it. */
+static void rswap_read_enter_inline(void)
+{
+	rswap_read_peak_update(atomic_inc_return(&rswap_read_inflight));
+}
+
+/*
+ * Release the slot only after the request completion ran, so that a reader
+ * which observes read_inflight == 0 also observes the finished request.
+ */
+static void rswap_read_leave(void)
+{
+	atomic_dec(&rswap_read_inflight);
+}
+
+/*
+ * One asynchronous read request.  The submitting task holds one reference and
+ * every batch handed to the workqueue holds one more, so the last batch to
+ * finish reports the request result - after all batches finished, and exactly
+ * once.
+ */
+struct rswap_read_req {
+	struct swap_iocb	*sio;
+	refcount_t		refs;
+	atomic_t		error;		/* first negative errno, 0 if none */
+};
+
+/* Keep the first failure; a request either fully succeeds or fully fails. */
+static void rswap_read_req_error(struct rswap_read_req *req, int ret)
+{
+	int error = 0;
+
+	if (ret < 0)
+		atomic_try_cmpxchg(&req->error, &error, ret);
+}
+
+/*
+ * Report the request result.  swap_read_end() releases the swap_iocb, so
+ * nothing may touch @req or its sio after this returns.
+ */
+static void rswap_read_request_end(struct rswap_read_req *req)
+{
+	struct swap_iocb *sio = req->sio;
+	int ret = atomic_read(&req->error);
+
+	kfree(req);
+	sio->iocb.ki_complete(&sio->iocb, ret ? ret : sio->len);
+}
+
+static void rswap_read_req_put(struct rswap_read_req *req)
+{
+	if (refcount_dec_and_test(&req->refs))
+		rswap_read_request_end(req);
+}
+
+/* One worker batch: move it, account it, drop one request reference. */
+static void rswap_read_batch_work(struct work_struct *work)
+{
+	struct rswap_batch *batch = container_of(work, struct rswap_batch, work);
+	struct rswap_read_req *req = batch->req;
+	unsigned int noio_flags;
+	int ret;
+
+	noio_flags = memalloc_noio_save();
+	ret = rswap_batch_flush(batch, READ);
+	memalloc_noio_restore(noio_flags);
+
+	rswap_read_req_error(req, ret);
+	kvfree(batch);
+	rswap_read_req_put(req);
+	rswap_read_leave();
+}
+
+/*
+ * Hand one batch to a worker, or move it in the submitting task when the
+ * queue is saturated, the workqueue is unavailable or it refuses the item.
+ * The inline path is exactly the previous synchronous behaviour, so swapin
+ * always makes forward progress under memory pressure.
+ */
+static void rswap_read_dispatch(struct rswap_batch *batch)
+{
+	struct rswap_read_req *req = batch->req;
+	int ret;
+
+	if (rswap_read_wq && rswap_read_enter()) {
+		refcount_inc(&req->refs);
+		INIT_WORK(&batch->work, rswap_read_batch_work);
+		if (queue_work(rswap_read_wq, &batch->work))
+			return;
+		refcount_dec(&req->refs);
+		rswap_read_leave();
+	}
+
+	atomic64_inc(&rswap_read_fallbacks);
+	rswap_read_enter_inline();
+	ret = rswap_batch_flush(batch, READ);
+	rswap_read_leave();
+
+	rswap_read_req_error(req, ret);
+	kvfree(batch);
+}
+
+static int rswap_read_wq_init(void)
+{
+	struct workqueue_struct *wq;
+
+	if (rswap_read_wq)
+		return 0;
+	/* WQ_MEM_RECLAIM: the workers must run while reclaim waits for them. */
+	wq = alloc_workqueue("rswap_read", WQ_MEM_RECLAIM,
+			     RSWAP_READ_MAX_INFLIGHT);
+	if (!wq) {
+		pr_warn("no read workqueue, swapin stays synchronous\n");
+		return -ENOMEM;
+	}
+	if (cmpxchg(&rswap_read_wq, NULL, wq))
+		destroy_workqueue(wq);
+	return 0;
+}
+
+/*
+ * rswap_read_async - Queue the reads of one swap request and return.
+ *
+ * Everything that needs the swap device - the per-entry digest lookup, the
+ * base page addressing - happens here, in the submitting task, as does the
+ * preparation of the completion callback.  The batches themselves are moved
+ * by the read workqueue, which calls sio->iocb.ki_complete() once every batch
+ * of the request finished, i.e. through the normal asynchronous swapin
+ * lifecycle.
+ *
+ * Batch buffers are kvmalloc'ed under GFP_NOIO one batch at a time, so the
+ * submitter never needs memory for the whole request.  When even that fails,
+ * or no batch slot is free, the batch is moved right here.
+ */
+static void rswap_read_async(struct swap_io_ctx *ctx)
+{
+	struct swap_iocb *sio = ctx->sio;
+	struct iov_iter iter;
+	struct rswap_read_req *req;
+	struct rswap_batch *batch;
+	s64 started = ktime_get_ns();
+	unsigned int noio_flags;
+	int ret = 0;
+	int i;
+
+	noio_flags = memalloc_noio_save();
+	req = kzalloc_obj(*req, GFP_NOIO);
+	if (!req) {
+		/* No bookkeeping memory: do what rswap always did. */
+		memalloc_noio_restore(noio_flags);
+		rswap_submit(ctx, READ);
+		return;
+	}
+	req->sio = sio;
+	refcount_set(&req->refs, 1);
+	/* Set sio->iocb.ki_complete before any batch can be published. */
+	swap_fs_prepare_rw(ctx, READ, &iter);
+
+	batch = rswap_batch_alloc();
+	if (!batch) {
+		ret = -ENOMEM;
+		goto out_error;
+	}
+
+	/*
+	 * Swap-in can split or combine the folios used at swap-out. Store
+	 * each base page under its own entry, independent of folio order.
+	 */
+	for (i = 0; i < sio->nr_bvecs; i++) {
+		struct bio_vec *bv = &sio->bvecs[i];
+		size_t offset;
+
+		for (offset = 0; offset < bv->bv_len; offset += PAGE_SIZE) {
+			ret = rswap_batch_add(batch, bv, offset, READ);
+			if (ret)
+				goto key_error;
+			if (batch->nr < RSWAP_BATCH_MAX)
+				continue;
+
+			batch->req = req;
+			rswap_read_dispatch(batch);
+			batch = rswap_batch_alloc();
+			if (!batch) {
+				ret = -ENOMEM;
+				goto out_error;
+			}
+		}
+	}
+	if (batch->nr) {
+		batch->req = req;
+		rswap_read_dispatch(batch);
+		batch = NULL;
+	}
+	goto out;
+
+key_error:
+	rswap_stats_key_failure(&rswap_total, READ, ret);
+	rswap_stats_key_failure(batch->stats[batch->nr], READ, ret);
+	pr_err_ratelimited("read type %u offset %lu failed: %d\n",
+			   swp_type(batch->last_entry),
+			   swp_offset(batch->last_entry), ret);
+out_error:
+	rswap_read_req_error(req, ret);
+out:
+	kvfree(batch);
+	memalloc_noio_restore(noio_flags);
+	atomic64_inc(&rswap_read_submits);
+	atomic64_add(ktime_get_ns() - started, &rswap_read_submit_ns);
+	/* Drop the submitting task's reference; the last batch completes. */
+	rswap_read_req_put(req);
 }
 
 static void rswap_submit_write(struct swap_io_ctx *ctx)
@@ -678,13 +986,15 @@ static void rswap_submit_write(struct swap_io_ctx *ctx)
 }
 
 /*
- * rswap_submit_read - Read folio data from the selected KV backend.
+ * rswap_submit_read - Queue folio reads from the selected KV backend.
  *
- * Called from swap_read_submit().
+ * Called from swap_read_submit().  Returns once every batch is dispatched;
+ * the folios are unlocked by the normal completion callback when the remote
+ * reads finished.
  */
 static void rswap_submit_read(struct swap_io_ctx *ctx)
 {
-	rswap_submit(ctx, READ);
+	rswap_read_async(ctx);
 }
 
 /* Can every base page of @folio be moved right now? */
@@ -881,6 +1191,10 @@ int rswap_enable(struct swap_info_struct *si)
 	if (!rswap_backend)
 		return -ENODEV;
 
+	/* Best effort: without it swapin simply stays synchronous. */
+	rswap_read_wq_init();
+	atomic_set(&rswap_read_peak_inflight, 0);
+
 	ret = rswap_hashes_alloc(si);
 	if (ret)
 		return ret;
@@ -903,6 +1217,19 @@ int rswap_enable(struct swap_info_struct *si)
 
 void rswap_disable(struct swap_info_struct *si)
 {
+	/*
+	 * Every queued or running read batch still updates si->rswap_stats and
+	 * points into si->rswap_hashes, so drain the workqueue before freeing
+	 * either.  The drain is what makes the per-batch device pointers safe;
+	 * each batch completes its request from the worker, which also unlocks
+	 * the folios it holds.
+	 *
+	 * No new submit can be in flight here: __swapoff() killed si->users,
+	 * synchronized RCU and waited for its holders before calling us, and
+	 * we run without a lock held.
+	 */
+	if (rswap_read_wq)
+		flush_workqueue(rswap_read_wq);
 	rswap_hashes_free(si);
 }
 
@@ -963,6 +1290,16 @@ static int rswap_stats_show(struct seq_file *m, void *unused)
 		   rswap_stats_avg(&rswap_read_io.ns, &rswap_read_io.batches));
 	seq_printf(m, "read_max_ns\t%llu\n",
 		   atomic64_read(&rswap_read_io.max_ns));
+	seq_printf(m, "read_inflight\t%u\n",
+		   atomic_read(&rswap_read_inflight));
+	seq_printf(m, "read_peak_inflight\t%u\n",
+		   atomic_read(&rswap_read_peak_inflight));
+	seq_printf(m, "read_fallbacks\t%llu\n",
+		   atomic64_read(&rswap_read_fallbacks));
+	seq_printf(m, "read_submits\t%llu\n",
+		   atomic64_read(&rswap_read_submits));
+	seq_printf(m, "read_submit_avg_ns\t%llu\n",
+		   rswap_stats_avg(&rswap_read_submit_ns, &rswap_read_submits));
 	if (rswap_backend && rswap_backend->show_stats)
 		rswap_backend->show_stats(m);
 	return 0;
