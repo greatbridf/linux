@@ -25,6 +25,7 @@
 
 #define pr_fmt(fmt) "rswap: " fmt
 
+#include <linux/highmem.h>
 #include <linux/kernel.h>
 #include <linux/seq_file.h>
 #include <linux/semaphore.h>
@@ -378,6 +379,7 @@ static int rswap_redis_do_store(struct rswap_redis_conn *conn,
 {
 	struct rswap_redis_cmd cmd;
 	char *request;
+	void *data;
 	unsigned int i;
 	int ret = 0;
 
@@ -400,8 +402,11 @@ static int rswap_redis_do_store(struct rswap_redis_conn *conn,
 		if (!ret)
 			ret = rswap_redis_add_bulk_header(&cmd, len);
 		/* A bulk payload must follow its own header directly. */
-		if (!ret)
-			ret = rswap_redis_add_raw(&cmd, pages[i].data, len);
+		if (!ret) {
+			data = kmap_local_page(pages[i].page);
+			ret = rswap_redis_add_raw(&cmd, data, len);
+			kunmap_local(data);
+		}
 		if (!ret)
 			ret = rswap_redis_add_raw(&cmd, "\r\n", 2);
 	}
@@ -425,6 +430,7 @@ static int rswap_redis_do_load(struct rswap_redis_conn *conn,
 {
 	struct rswap_redis_cmd cmd;
 	char *request;
+	void *data;
 	unsigned int i;
 	int ret = 0;
 
@@ -448,8 +454,11 @@ static int rswap_redis_do_load(struct rswap_redis_conn *conn,
 		goto out_free;
 
 	ret = rswap_sock_send(conn->sock, request, cmd.len);
-	for (i = 0; !ret && i < nr; i++)
-		ret = rswap_redis_read_bulk(conn->sock, pages[i].data, len);
+	for (i = 0; !ret && i < nr; i++) {
+		data = kmap_local_page(pages[i].page);
+		ret = rswap_redis_read_bulk(conn->sock, data, len);
+		kunmap_local(data);
+	}
 
 out_free:
 	kvfree(request);
