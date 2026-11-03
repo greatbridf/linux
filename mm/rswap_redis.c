@@ -26,13 +26,17 @@
 #define pr_fmt(fmt) "rswap: " fmt
 
 #include <linux/bvec.h>
-#include <linux/highmem.h>
+#include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/mempool.h>
+#include <linux/mm.h>
 #include <linux/seq_file.h>
 #include <linux/semaphore.h>
 #include <linux/string.h>
 #include <linux/kstrtox.h>
 #include <linux/net.h>
+#include <linux/uio.h>
+#include <linux/vmalloc.h>
 
 #include "rswap_backend.h"
 
@@ -40,16 +44,12 @@
 #define RSWAP_REDIS_DEFAULT_PORT	6379
 #define RSWAP_REDIS_SEND_TIMEOUT_MS	10000
 #define RSWAP_REDIS_RECV_TIMEOUT_MS	10000
-/* Upper bound for one command: array and bulk headers plus a 64 digit key. */
-#define RSWAP_REDIS_CMD_SIZE		(RSWAP_KV_KEY_LEN + 32)
 /* Status, error and bulk length lines are all tiny. */
 #define RSWAP_REDIS_MAX_LINE		256
 /* Cached connections; more concurrent batches than this fall back to new. */
 #define RSWAP_REDIS_POOL_MAX		8
-/* A request consists of header, len and data at most. */
-#define RSWAP_CMD_BVECS			3 * RSWAP_BATCH_MAX
-/* A small buffer for common use just in case. */
-#define RSWAP_CMD_BUF_SIZE		256
+/* Flush a full vector array without waiting for the pipelined replies. */
+#define RSWAP_CMD_BVECS			(3 * RSWAP_BATCH_MAX)
 
 static struct {
 	char		host[RSWAP_KV_HOST_LEN];
@@ -67,90 +67,141 @@ enum {
 	RSWAP_CMD_AUTH,
 	RSWAP_CMD_GET,
 	RSWAP_CMD_SET,
+	RSWAP_CMD_SELECT,
 
 	RSWAP_CMD_ARG_2,
 	RSWAP_CMD_ARG_3,
 
-	RSWAP_CMD_BULK_2,
-	RSWAP_CMD_BULK_3,
+	RSWAP_CMD_BULK_KEY,
 	RSWAP_CMD_BULK_PAGE_SIZE,
-
-	// and necessary items...
+	RSWAP_CMD_CRLF,
+	RSWAP_CMD_USER,
+	RSWAP_CMD_PASSWORD,
+	RSWAP_CMD_DB,
 
 	NR_RSWAP_CMD_PARTS,
 };
 
-// initialize in __init, alloc one folio, store strings and then fill them.
 static struct bio_vec rswap_common_part_bios[NR_RSWAP_CMD_PARTS];
+static struct mempool *rswap_redis_cmd_pool;
 
-/* Builder for a run of pipelined commands inside one write buffer. */
+/* All vectors reference the original fragments, keys and page payloads. */
 struct rswap_redis_cmd {
-	size_t		size;
+	struct socket	*sock;
 	size_t		len;
+	unsigned int	nr;
 
 	struct bio_vec	bvecs[RSWAP_CMD_BVECS];
-	char		buf[RSWAP_CMD_BUF_SIZE];
 };
 
-static struct rswap_redis_cmd rswap_redis_cmd_alloc(void)
+static int rswap_redis_send_cmd(struct socket *sock,
+				struct rswap_redis_cmd *cmd);
+
+static struct rswap_redis_cmd *rswap_redis_cmd_alloc(struct socket *sock)
 {
-	// alloc from a slab or mempool
+	struct rswap_redis_cmd *cmd;
+
+	cmd = mempool_alloc(rswap_redis_cmd_pool, GFP_NOIO);
+	if (cmd) {
+		cmd->sock = sock;
+		cmd->len = 0;
+		cmd->nr = 0;
+	}
+	return cmd;
+}
+
+static int rswap_redis_add_bvec(struct rswap_redis_cmd *cmd,
+				const struct bio_vec *bv)
+{
+	int ret;
+
+	if (cmd->nr == ARRAY_SIZE(cmd->bvecs)) {
+		ret = rswap_redis_send_cmd(cmd->sock, cmd);
+		if (ret)
+			return ret;
+	}
+	cmd->bvecs[cmd->nr++] = *bv;
+	cmd->len += bv->bv_len;
+	return 0;
+}
+
+static int rswap_redis_add_part(struct rswap_redis_cmd *cmd, unsigned int part)
+{
+	return rswap_redis_add_bvec(cmd, &rswap_common_part_bios[part]);
 }
 
 /* Append a "*<argc>\r\n" array header. */
 static int rswap_redis_add_array(struct rswap_redis_cmd *cmd, unsigned int argc)
 {
-	char prefix[16];
-	int len;
-
-	len = snprintf(prefix, sizeof(prefix), "*%u\r\n", argc);
-	if (len < 0 || cmd->len + len > cmd->size)
-		return -ENOSPC;
-	memcpy(cmd->buf + cmd->len, prefix, len);
-	cmd->len += len;
-	return 0;
+	if (argc != 2 && argc != 3)
+		return -EINVAL;
+	return rswap_redis_add_part(cmd, argc == 2 ? RSWAP_CMD_ARG_2 :
+				  RSWAP_CMD_ARG_3);
 }
 
-/* Append the "$<len>\r\n" prefix of a bulk string, without its payload. */
-static int rswap_redis_add_bulk_header(struct rswap_redis_cmd *cmd, size_t len)
+static int rswap_redis_add_key(struct rswap_redis_cmd *cmd, const char *key)
 {
-	char prefix[24];
-	int plen;
-
-	plen = snprintf(prefix, sizeof(prefix), "$%zu\r\n", len);
-	if (plen < 0 || cmd->len + plen + 2 > cmd->size)
-		return -ENOSPC;
-	memcpy(cmd->buf + cmd->len, prefix, plen);
-	cmd->len += plen;
-	return 0;
-}
-
-/* Append raw bytes, used for bulk payloads that are already in memory. */
-static int rswap_redis_add_raw(struct rswap_redis_cmd *cmd, const void *data,
-			       size_t len)
-{
-	if (cmd->len + len > cmd->size)
-		return -ENOSPC;
-	memcpy(cmd->buf + cmd->len, data, len);
-	cmd->len += len;
-	return 0;
-}
-
-/* Append a complete bulk string argument. */
-static int rswap_redis_add_bulk(struct rswap_redis_cmd *cmd, const void *arg,
-				size_t len)
-{
+	size_t remaining = RSWAP_KV_KEY_LEN - 1;
+	struct bio_vec bv;
+	struct page *page;
+	size_t len;
 	int ret;
 
-	ret = rswap_redis_add_bulk_header(cmd, len);
-	if (ret)
-		return ret;
-	if (cmd->len + len + 2 > cmd->size)
-		return -ENOSPC;
-	memcpy(cmd->buf + cmd->len, arg, len);
-	cmd->len += len;
-	memcpy(cmd->buf + cmd->len, "\r\n", 2);
-	cmd->len += 2;
+	/* Core batch keys can live in a vmalloc allocation and cross a page. */
+	while (remaining) {
+		len = min_t(size_t, remaining, PAGE_SIZE - offset_in_page(key));
+		page = is_vmalloc_addr(key) ? vmalloc_to_page(key) :
+			virt_to_page(key);
+		bvec_set_page(&bv, page, len, offset_in_page(key));
+		ret = rswap_redis_add_bvec(cmd, &bv);
+		if (ret)
+			return ret;
+		key += len;
+		remaining -= len;
+	}
+	return 0;
+}
+
+/* Append the prefilled wire fragments and the original key pages. */
+static int rswap_redis_add_header(struct rswap_redis_cmd *cmd, const char *key,
+				  bool store)
+{
+	unsigned int array = store ? RSWAP_CMD_ARG_3 : RSWAP_CMD_ARG_2;
+	unsigned int verb = store ? RSWAP_CMD_SET : RSWAP_CMD_GET;
+	int ret;
+
+	ret = rswap_redis_add_bvec(cmd, &rswap_common_part_bios[array]);
+	if (!ret)
+		ret = rswap_redis_add_bvec(cmd, &rswap_common_part_bios[verb]);
+	if (!ret)
+		ret = rswap_redis_add_bvec(cmd,
+				 &rswap_common_part_bios[RSWAP_CMD_BULK_KEY]);
+	if (!ret)
+		ret = rswap_redis_add_key(cmd, key);
+	if (!ret)
+		ret = rswap_redis_add_bvec(cmd,
+				 &rswap_common_part_bios[RSWAP_CMD_CRLF]);
+	if (!ret && store)
+		ret = rswap_redis_add_bvec(cmd,
+				 &rswap_common_part_bios[RSWAP_CMD_BULK_PAGE_SIZE]);
+	return ret;
+}
+
+static int rswap_redis_send_cmd(struct socket *sock,
+				struct rswap_redis_cmd *cmd)
+{
+	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
+	int ret;
+
+	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, cmd->bvecs, cmd->nr,
+		      cmd->len);
+	while (iov_iter_count(&msg.msg_iter)) {
+		ret = sock_sendmsg(sock, &msg);
+		if (ret <= 0)
+			return ret ? ret : -EIO;
+	}
+	cmd->nr = 0;
+	cmd->len = 0;
 	return 0;
 }
 
@@ -205,9 +256,12 @@ static int rswap_redis_status(struct socket *sock, const char *expected)
 	return 0;
 }
 
-/* Read a bulk reply into @data, which must be exactly @len bytes long. */
-static int rswap_redis_read_bulk(struct socket *sock, void *data, size_t len)
+/* Read a bulk reply into @page, which must be exactly @len bytes long. */
+static int rswap_redis_read_bulk(struct socket *sock, struct page *page,
+				 size_t len)
 {
+	struct msghdr msg = { };
+	struct bio_vec bv;
 	char line[RSWAP_REDIS_MAX_LINE];
 	char trailer[2];
 	size_t received = 0;
@@ -232,12 +286,12 @@ static int rswap_redis_read_bulk(struct socket *sock, void *data, size_t len)
 	if ((size_t)value_len != len)
 		return -EMSGSIZE;
 
-	while (received < len) {
-		ret = rswap_sock_recv(sock, (char *)data + received,
-				      min_t(size_t, len - received, 65536));
+	bvec_set_page(&bv, page, len, 0);
+	iov_iter_bvec(&msg.msg_iter, ITER_DEST, &bv, 1, len);
+	while (iov_iter_count(&msg.msg_iter)) {
+		ret = sock_recvmsg(sock, &msg, 0);
 		if (ret <= 0)
 			return ret ? ret : -ECONNRESET;
-		received += ret;
 	}
 
 	/* Trailing CRLF of the bulk string. */
@@ -267,30 +321,22 @@ static int rswap_redis_queue_preamble(struct rswap_redis_cmd *cmd,
 	if (rswap_redis.password[0]) {
 		ret = rswap_redis_add_array(cmd, rswap_redis.user[0] ? 3 : 2);
 		if (!ret)
-			ret = rswap_redis_add_bulk(cmd, "AUTH", 4);
+			ret = rswap_redis_add_part(cmd, RSWAP_CMD_AUTH);
 		if (!ret && rswap_redis.user[0])
-			ret = rswap_redis_add_bulk(cmd, rswap_redis.user,
-						   strlen(rswap_redis.user));
+			ret = rswap_redis_add_part(cmd, RSWAP_CMD_USER);
 		if (!ret)
-			ret = rswap_redis_add_bulk(cmd, rswap_redis.password,
-						   strlen(rswap_redis.password));
+			ret = rswap_redis_add_part(cmd, RSWAP_CMD_PASSWORD);
 		if (ret)
 			return ret;
 		(*replies)++;
 	}
 
 	if (rswap_redis.db) {
-		char db[16];
-		int dblen;
-
-		dblen = snprintf(db, sizeof(db), "%u", rswap_redis.db);
-		if (dblen < 0)
-			return -EINVAL;
 		ret = rswap_redis_add_array(cmd, 2);
 		if (!ret)
-			ret = rswap_redis_add_bulk(cmd, "SELECT", 6);
+			ret = rswap_redis_add_part(cmd, RSWAP_CMD_SELECT);
 		if (!ret)
-			ret = rswap_redis_add_bulk(cmd, db, dblen);
+			ret = rswap_redis_add_part(cmd, RSWAP_CMD_DB);
 		if (ret)
 			return ret;
 		(*replies)++;
@@ -333,9 +379,7 @@ static void rswap_redis_drop(struct rswap_redis_conn *conn)
 /* Open a connection if @conn has none, and authenticate it. */
 static int rswap_redis_ensure(struct rswap_redis_conn *conn)
 {
-	struct rswap_redis_cmd cmd;
-	/* Holds AUTH (user + secret) and SELECT, far below the limits below. */
-	char buf[512];
+	struct rswap_redis_cmd *cmd;
 	unsigned int replies;
 	unsigned int i;
 	int ret;
@@ -358,15 +402,18 @@ static int rswap_redis_ensure(struct rswap_redis_conn *conn)
 	}
 	atomic64_inc(&rswap_redis_connects);
 
-	cmd.buf = buf;
-	cmd.size = sizeof(buf);
-	cmd.len = 0;
-	ret = rswap_redis_queue_preamble(&cmd, &replies);
+	cmd = rswap_redis_cmd_alloc(conn->sock);
+	if (!cmd) {
+		rswap_redis_drop(conn);
+		return -ENOMEM;
+	}
+	ret = rswap_redis_queue_preamble(cmd, &replies);
 	if (!ret && replies) {
-		ret = rswap_sock_send(conn->sock, cmd.buf, cmd.len);
+		ret = rswap_redis_send_cmd(conn->sock, cmd);
 		for (i = 0; !ret && i < replies; i++)
 			ret = rswap_redis_status(conn->sock, "OK");
 	}
+	mempool_free(cmd, rswap_redis_cmd_pool);
 	if (ret)
 		rswap_redis_drop(conn);
 	return ret;
@@ -409,48 +456,34 @@ static int rswap_redis_do_store(struct rswap_redis_conn *conn,
 				struct rswap_kv_page *pages, unsigned int nr,
 				size_t len)
 {
-	struct rswap_redis_cmd cmd;
-	char *request;
-	void *data;
+	struct rswap_redis_cmd *cmd;
+	struct bio_vec bv;
 	unsigned int i;
 	int ret = 0;
 
-	/* Command headers plus every payload. */
-	request = kvmalloc(nr * (RSWAP_REDIS_CMD_SIZE + len + 2), GFP_NOIO);
-	if (!request)
+	cmd = rswap_redis_cmd_alloc(conn->sock);
+	if (!cmd)
 		return -ENOMEM;
 
-	cmd.buf = request;
-	cmd.size = nr * (RSWAP_REDIS_CMD_SIZE + len + 2);
-	cmd.len = 0;
-
 	for (i = 0; !ret && i < nr; i++) {
-		ret = rswap_redis_add_array(&cmd, 3);
-		if (!ret)
-			ret = rswap_redis_add_bulk(&cmd, "SET", 3);
-		if (!ret)
-			ret = rswap_redis_add_bulk(&cmd, pages[i].key,
-						   strlen(pages[i].key));
-		if (!ret)
-			ret = rswap_redis_add_bulk_header(&cmd, len);
+		ret = rswap_redis_add_header(cmd, pages[i].key, true);
 		/* A bulk payload must follow its own header directly. */
 		if (!ret) {
-			data = kmap_local_page(pages[i].page);
-			ret = rswap_redis_add_raw(&cmd, data, len);
-			kunmap_local(data);
+			bvec_set_page(&bv, pages[i].page, len, 0);
+			ret = rswap_redis_add_bvec(cmd, &bv);
 		}
 		if (!ret)
-			ret = rswap_redis_add_raw(&cmd, "\r\n", 2);
+			ret = rswap_redis_add_part(cmd, RSWAP_CMD_CRLF);
 	}
 	if (ret)
 		goto out_free;
 
-	ret = rswap_sock_send(conn->sock, request, cmd.len);
+	ret = rswap_redis_send_cmd(conn->sock, cmd);
 	for (i = 0; !ret && i < nr; i++)
 		ret = rswap_redis_status(conn->sock, "OK");
 
 out_free:
-	kvfree(request);
+	mempool_free(cmd, rswap_redis_cmd_pool);
 	if (rswap_redis_transport_error(ret))
 		rswap_redis_drop(conn);
 	return ret;
@@ -460,32 +493,27 @@ static int rswap_redis_do_load(struct rswap_redis_conn *conn,
 			       struct rswap_kv_page *pages, unsigned int nr,
 			       size_t len)
 {
-	struct rswap_redis_cmd cmd;
-	void *data;
+	struct rswap_redis_cmd *cmd;
 	unsigned int i;
 	int ret = 0;
 
-	for (i = 0; !ret && i < nr; i++) {
-		ret = rswap_redis_add_array(&cmd, 2);
-		if (!ret)
-			ret = rswap_redis_add_bulk(&cmd, "GET", 3);
-		if (!ret)
-			ret = rswap_redis_add_bulk(&cmd, pages[i].key,
-						   strlen(pages[i].key));
-	}
+	cmd = rswap_redis_cmd_alloc(conn->sock);
+	if (!cmd)
+		return -ENOMEM;
+
+	for (i = 0; !ret && i < nr; i++)
+		ret = rswap_redis_add_header(cmd, pages[i].key, false);
 	if (ret)
 		goto out_free;
 
-	ret = rswap_sock_send(conn->sock, request, cmd.len);
-	for (i = 0; !ret && i < nr; i++) {
-		data = kmap_local_page(pages[i].page);
-		ret = rswap_redis_read_bulk(conn->sock, data, len);
-		kunmap_local(data);
-	}
+	ret = rswap_redis_send_cmd(conn->sock, cmd);
+	for (i = 0; !ret && i < nr; i++)
+		ret = rswap_redis_read_bulk(conn->sock, pages[i].page, len);
 
 out_free:
-	kvfree(request);
-	if (rswap_redis_transport_error(ret))
+	mempool_free(cmd, rswap_redis_cmd_pool);
+	/* Unread replies or payload must never reach the next pooled request. */
+	if (ret)
 		rswap_redis_drop(conn);
 	return ret;
 }
@@ -497,7 +525,7 @@ static int rswap_redis_store(struct rswap_kv_page *pages, unsigned int nr,
 	unsigned int tries = 0;
 	int ret;
 
-	if (!nr)
+	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
 		return -EINVAL;
 
 	conn = rswap_redis_conn_get();
@@ -523,7 +551,7 @@ static int rswap_redis_load(struct rswap_kv_page *pages, unsigned int nr,
 	unsigned int tries = 0;
 	int ret;
 
-	if (!nr)
+	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
 		return -EINVAL;
 
 	conn = rswap_redis_conn_get();
@@ -556,7 +584,83 @@ static void rswap_redis_show_stats(struct seq_file *m)
 		   atomic64_read(&rswap_redis_retries));
 }
 
-static int rswap_redis_init(const struct rswap_kv_config *cfg)
+static int __init rswap_redis_init_parts(void)
+{
+	static const char * const parts[NR_RSWAP_CMD_PARTS] = {
+		[RSWAP_CMD_AUTH] = "$4\r\nAUTH\r\n",
+		[RSWAP_CMD_GET] = "$3\r\nGET\r\n",
+		[RSWAP_CMD_SET] = "$3\r\nSET\r\n",
+		[RSWAP_CMD_SELECT] = "$6\r\nSELECT\r\n",
+		[RSWAP_CMD_ARG_2] = "*2\r\n",
+		[RSWAP_CMD_ARG_3] = "*3\r\n",
+		[RSWAP_CMD_CRLF] = "\r\n",
+	};
+	struct folio *folio;
+	char db[16];
+	char *buf;
+	size_t offset = 0;
+	unsigned int i;
+	int len;
+	int ret = -ENOSPC;
+
+	folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
+	if (!folio)
+		return -ENOMEM;
+	buf = folio_address(folio);
+	snprintf(db, sizeof(db), "%u", rswap_redis.db);
+	for (i = 0; i < NR_RSWAP_CMD_PARTS; i++) {
+		const char *arg;
+		size_t remaining = PAGE_SIZE - offset;
+
+		if (parts[i]) {
+			len = snprintf(buf + offset, remaining, "%s", parts[i]);
+		} else if (i == RSWAP_CMD_BULK_KEY ||
+			   i == RSWAP_CMD_BULK_PAGE_SIZE) {
+			len = snprintf(buf + offset, remaining, "$%zu\r\n",
+				       i == RSWAP_CMD_BULK_KEY ?
+				       (size_t)RSWAP_KV_KEY_LEN - 1 : PAGE_SIZE);
+		} else {
+			switch (i) {
+			case RSWAP_CMD_USER:
+				arg = rswap_redis.user;
+				break;
+			case RSWAP_CMD_PASSWORD:
+				arg = rswap_redis.password;
+				break;
+			case RSWAP_CMD_DB:
+				arg = db;
+				break;
+			default:
+				ret = -EINVAL;
+				goto out_free;
+			}
+			len = snprintf(buf + offset, remaining, "$%zu\r\n%s\r\n",
+				       strlen(arg), arg);
+		}
+		if (len < 0 || len >= remaining)
+			goto out_free;
+		bvec_set_folio(&rswap_common_part_bios[i], folio, len, offset);
+		offset += len;
+	}
+
+	/* Each connection holds at most one command, including its preamble. */
+	rswap_redis_cmd_pool = mempool_create_kmalloc_pool(RSWAP_REDIS_POOL_MAX,
+						 sizeof(struct rswap_redis_cmd));
+	if (!rswap_redis_cmd_pool) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	/* The common folio and command pool live as long as this boot backend. */
+	return 0;
+
+out_free:
+	memzero_explicit(buf, PAGE_SIZE);
+	memset(rswap_common_part_bios, 0, sizeof(rswap_common_part_bios));
+	folio_put(folio);
+	return ret;
+}
+
+static int __init rswap_redis_init(const struct rswap_kv_config *cfg)
 {
 	if (strscpy(rswap_redis.host, cfg->host, sizeof(rswap_redis.host)) < 0)
 		return -EINVAL;
@@ -571,10 +675,11 @@ static int rswap_redis_init(const struct rswap_kv_config *cfg)
 	rswap_redis.db = cfg->db;
 	rswap_redis.send_timeout_ms = cfg->send_timeout_ms;
 	rswap_redis.recv_timeout_ms = cfg->recv_timeout_ms;
-	return 0;
+	return rswap_redis_init_parts();
 }
 
-const struct rswap_backend rswap_redis_backend = {
+/* Only ->init points into init text; the core calls it during boot setup. */
+const struct rswap_backend rswap_redis_backend __refconst = {
 	.name			= "redis",
 	.description		= "Redis RESP key-value store",
 	.default_host		= RSWAP_REDIS_DEFAULT_HOST,
