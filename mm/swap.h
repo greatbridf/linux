@@ -64,6 +64,9 @@ struct swap_cluster_info {
 #if !SWAP_TABLE_HAS_ZEROFLAG
 	unsigned long *zero_bitmap;
 #endif
+#ifdef CONFIG_RSWAP
+	struct rswap_hash_table *hash_table;
+#endif
 	struct list_head list;
 };
 

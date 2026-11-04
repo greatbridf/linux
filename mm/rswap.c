@@ -1376,3 +1376,37 @@ free_port:
 	kfree(si->rswap_kv_port);
 	si->rswap_kv_port = NULL;
 }
+
+static struct rswap_hash *rswap_get_hash(struct swap_cluster_info *ci,
+		unsigned long off)
+{
+	struct rswap_hash_table *hash_table = ci->hash_table;
+
+	if (!hash_table)
+		return NULL;
+
+	return hash_table->hashes[off];
+}
+
+static bool __rswap_should_alloc_hash(struct vm_area_struct *vma,
+		struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	swp_entry_t entry = folio_page_swap_entry(folio, page);
+	struct swap_cluster_info *ci = __swap_entry_to_cluster(entry);
+
+	return !rswap_get_hash(ci, swp_cluster_offset(entry));
+}
+
+bool rswap_should_alloc_hash(struct vm_area_struct *vma, struct page *page)
+{
+	if (rswap_vma_needs_hash(vma))
+		return false;
+
+	return __rswap_should_alloc_hash(vma, page);
+}
+
+void rswap_alloc_hash_slot(struct page *page)
+{
+	// todo
+}

@@ -37,6 +37,19 @@
 #ifdef CONFIG_RSWAP
 
 #include <linux/types.h>
+#include <linux/swap.h>
+
+#include "swap.h"
+
+#define RSWAP_HASH_LEN 48
+
+struct rswap_hash {
+	char data[RSWAP_HASH_LEN];
+};
+
+struct rswap_hash_table {
+	struct rswap_hash *hashes[SWAPFILE_CLUSTER];
+};
 
 /* ---------- Life-cycle helpers (called from swapfile.c) ---------- */
 
@@ -50,6 +63,21 @@ void rswap_hash_invalidate(struct swap_info_struct *si, unsigned long offset,
 void rswap_debugfs_add(struct swap_info_struct *si);
 void rswap_debugfs_del(struct swap_info_struct *si);
 
+/* hash related */
+void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
+		struct vm_area_struct *vma);
+
+void rswap_attach_hash_shmem(struct page *page, unsigned long addr,
+		struct vm_area_struct *vma);
+
+bool rswap_should_alloc_hash(struct vm_area_struct *vma, struct page *page);
+void rswap_alloc_hash_slot(struct page *page);
+
+static inline bool rswap_vma_needs_hash(struct vm_area_struct *vma)
+{
+	return vma->vm_flags & VM_HASHED;
+}
+
 #else /* !CONFIG_RSWAP */
 
 static inline int  rswap_enable(struct swap_info_struct *si) { return -EOPNOTSUPP; }
@@ -60,5 +88,16 @@ static inline void rswap_hash_invalidate(struct swap_info_struct *si,
 					 unsigned int nr_entries) { }
 static inline void rswap_debugfs_add(struct swap_info_struct *si) { }
 static inline void rswap_debugfs_del(struct swap_info_struct *si) { }
+
+static inline bool rswap_should_alloc_hash(struct vm_area_struct *vma,
+		struct page *page)
+{
+	return false;
+}
+
+static inline bool rswap_vma_is_hashed(struct vm_area_struct *vma)
+{
+	return false;
+}
 
 #endif /* CONFIG_RSWAP */
