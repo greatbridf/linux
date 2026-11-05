@@ -640,6 +640,12 @@ static void swap_cluster_free_table(struct swap_cluster_info *ci)
 {
 	struct swap_table *table;
 
+	/*
+	 * The digest slots go away with the cluster: the cluster is only freed
+	 * once it is empty, so no swap entry can reach them any more.
+	 */
+	rswap_hash_table_free(ci);
+
 #ifdef CONFIG_MEMCG
 	kfree(ci->memcg_table);
 	ci->memcg_table = NULL;
@@ -2076,6 +2082,9 @@ again:
 
 	if (unlikely(!folio_test_swapcache(folio)))
 		goto failed;
+
+	/* Give the new entries their digest slots while we may still sleep. */
+	rswap_prepare_hashes(folio);
 
 	return 0;
 

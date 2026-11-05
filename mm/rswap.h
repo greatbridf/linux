@@ -4,10 +4,13 @@
  *
  * rswap is a swap backend that implements the swap_ops interface to
  * store swap pages in an external key-value store.  The KV store key is a
- * SHA-256 hash attached by user space through /proc/sys/vm/rswap/attach.
- * The hash is copied into a per-device table indexed by swap offset at
- * writeout and reused at swapin.  Pages without an attached hash cannot be
- * written to the remote device.
+ * SHA-256 hash supplied by user space; the kernel never derives it from the
+ * page contents or from the swap entry.
+ *
+ * The hash is resolved while the folio is still mapped, at unmap time, and
+ * stored in the swap cluster that backs the folio.  Swapin reads the same
+ * table, so the key never depends on the page still existing.  Pages whose
+ * hash was not resolved cannot be written to the remote device.
  *
  * == Setup ==
  *
@@ -47,6 +50,11 @@ struct rswap_hash {
 	char data[RSWAP_HASH_LEN];
 };
 
+/*
+ * One table per swap cluster, allocated when the cluster is first used and
+ * freed with it.  Slot i describes swap offset
+ * cluster_start + i; a NULL slot means "no hash resolved".
+ */
 struct rswap_hash_table {
 	struct rswap_hash *hashes[SWAPFILE_CLUSTER];
 };
@@ -63,15 +71,31 @@ void rswap_hash_invalidate(struct swap_info_struct *si, unsigned long offset,
 void rswap_debugfs_add(struct swap_info_struct *si);
 void rswap_debugfs_del(struct swap_info_struct *si);
 
-/* hash related */
+/* ---------- Hash slots (called from swapfile.c) ---------- */
+
+/* Allocate the slots of a folio that just entered the swap cache. */
+void rswap_prepare_hashes(struct folio *folio);
+/* Free the table of a cluster that is being released. */
+void rswap_hash_table_free(struct swap_cluster_info *ci);
+
+/* ---------- Hash attach (called from rmap.c) ---------- */
+
+/* Anonymous folio: the swap entry already exists, store the hash in it. */
 void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
 		struct vm_area_struct *vma);
 
-void rswap_attach_hash_shmem(struct page *page, unsigned long addr,
+/* Shmem folio: no swap entry yet, stage the hash in the inode. */
+void rswap_attach_hash_shmem(struct folio *folio, unsigned long addr,
 		struct vm_area_struct *vma);
 
-bool rswap_should_alloc_hash(struct vm_area_struct *vma, struct page *page);
-void rswap_alloc_hash_slot(struct page *page);
+/* ---------- Shmem staging area (called from shmem.c) ---------- */
+
+/* Move the staged hashes of @folio into its swap cluster. */
+void rswap_shmem_move_hashes(struct folio *folio);
+/* Drop the staged hashes of an index range. */
+void rswap_shmem_drop_hashes(struct inode *inode, pgoff_t start, pgoff_t end);
+/* Drop every staged hash of an inode that is going away. */
+void rswap_shmem_free_hashes(struct inode *inode);
 
 static inline bool rswap_vma_needs_hash(struct vm_area_struct *vma)
 {
@@ -89,13 +113,18 @@ static inline void rswap_hash_invalidate(struct swap_info_struct *si,
 static inline void rswap_debugfs_add(struct swap_info_struct *si) { }
 static inline void rswap_debugfs_del(struct swap_info_struct *si) { }
 
-static inline bool rswap_should_alloc_hash(struct vm_area_struct *vma,
-		struct page *page)
-{
-	return false;
-}
+static inline void rswap_prepare_hashes(struct folio *folio) { }
+static inline void rswap_hash_table_free(struct swap_cluster_info *ci) { }
+static inline void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
+		struct vm_area_struct *vma) { }
+static inline void rswap_attach_hash_shmem(struct folio *folio,
+		unsigned long addr, struct vm_area_struct *vma) { }
+static inline void rswap_shmem_move_hashes(struct folio *folio) { }
+static inline void rswap_shmem_drop_hashes(struct inode *inode, pgoff_t start,
+		pgoff_t end) { }
+static inline void rswap_shmem_free_hashes(struct inode *inode) { }
 
-static inline bool rswap_vma_is_hashed(struct vm_area_struct *vma)
+static inline bool rswap_vma_needs_hash(struct vm_area_struct *vma)
 {
 	return false;
 }

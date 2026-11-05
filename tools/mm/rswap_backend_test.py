@@ -132,6 +132,7 @@ struct swap_info_struct {
     unsigned long max;
     void *rswap_hashes;
     struct rswap_stats *rswap_stats;
+    int type;
 };
 static struct swap_info_struct swap_info_stub = { .rswap_stats = &device_stats };
 static void rswap_stats_io(struct rswap_stats *io, int64_t ns)
@@ -180,7 +181,10 @@ struct swap_iocb {
     size_t len;
     struct bio_vec bvecs[4];
 };
-struct swap_io_ctx { struct swap_iocb *sio; };
+struct swap_io_ctx {
+    struct swap_iocb *sio;
+    struct swap_info_struct *sis;
+};
 static struct socket socket_stub;
 static const char *response_data;
 static size_t response_size, response_offset;
@@ -685,22 +689,39 @@ HASH_SHIMS = r"""
 #include <string.h>
 #define SHA256_DIGEST_SIZE 32
 #define RSWAP_SHA256_HEXLEN 64
-#define RSWAP_HTTP_MAX_HEADER 2048
 #define WRITE 1
+#define RSWAP_HASH_LEN 48
+#define SWAPFILE_CLUSTER 4
+#define GFP_NOWAIT 0
 #define smp_store_release(ptr, value) \
     __atomic_store_n((ptr), (value), __ATOMIC_RELEASE)
 #define smp_load_acquire(ptr) __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
+#define READ_ONCE(x) (x)
+#define cmpxchg(ptr, old, new) __sync_val_compare_and_swap((ptr), (old), (new))
+#define kzalloc_obj(obj, gfp) calloc(1, sizeof(obj))
+#define kfree(ptr) free(ptr)
 typedef struct { unsigned long val; } swp_entry_t;
 typedef uint8_t u8;
+typedef unsigned int gfp_t;
 struct page { int unused; };
-struct rswap_hash_entry {
-    uint8_t hash[SHA256_DIGEST_SIZE];
-    uint8_t valid;
+struct rswap_hash {
+    uint8_t data[RSWAP_HASH_LEN];
+};
+struct rswap_hash_table {
+    struct rswap_hash *hashes[SWAPFILE_CLUSTER];
+};
+struct swap_cluster_info {
+    struct rswap_hash_table *hash_table;
 };
 struct swap_info_struct {
     unsigned long max;
-    struct rswap_hash_entry *rswap_hashes;
+    struct swap_cluster_info *cluster_info;
 };
+static struct swap_cluster_info *__swap_offset_to_cluster(
+        struct swap_info_struct *si, unsigned long offset)
+{
+    return &si->cluster_info[offset / SWAPFILE_CLUSTER];
+}
 static bool page_hash_available;
 static uint8_t attached_hash[SHA256_DIGEST_SIZE];
 static unsigned long swp_offset(swp_entry_t entry) { return entry.val; }
@@ -722,45 +743,58 @@ static void bin2hex(char *dst, const u8 *src, size_t len)
 HASH_MAIN = r"""
 int main(void)
 {
-    struct rswap_hash_entry entries[4] = { };
-    struct swap_info_struct si = { .max = 4, .rswap_hashes = entries };
+    struct swap_cluster_info clusters[2] = { };
+    struct swap_info_struct si = { .max = 2 * SWAPFILE_CLUSTER,
+                                   .cluster_info = clusters };
     uint8_t first[SHA256_DIGEST_SIZE], second[SHA256_DIGEST_SIZE], actual[32];
     char expected_hex[RSWAP_SHA256_HEXLEN + 1], hex[RSWAP_SHA256_HEXLEN + 1];
     struct page page = { };
-    swp_entry_t entry = { .val = 2 };
+    swp_entry_t entry = { .val = SWAPFILE_CLUSTER + 1 };
     size_t i;
 
     for (i = 0; i < sizeof(first); i++) {
         first[i] = i;
         second[i] = 255 - i;
     }
+
+    /* The digest resolved at unmap time is what writeout uses. */
     assert(rswap_hash_store(&si, entry, first) == 0);
     assert(rswap_hash_load(&si, entry, actual));
     assert(!memcmp(actual, first, sizeof(actual)));
-    page_hash_available = true;
-    memcpy(attached_hash, first, sizeof(attached_hash));
     assert(rswap_page_key(&si, &page, entry, WRITE, expected_hex) == 0);
     assert(rswap_page_key(&si, &page, entry, 0, hex) == 0);
     assert(!strcmp(hex, expected_hex));
 
+    /* A slot in another cluster is independent of it. */
+    entry.val = 1;
+    assert(!rswap_hash_load(&si, entry, actual));
     assert(rswap_hash_store(&si, entry, second) == 0);
     assert(rswap_hash_load(&si, entry, actual));
     assert(!memcmp(actual, second, sizeof(actual)));
-    memcpy(attached_hash, second, sizeof(attached_hash));
-    entry.val = 3;
-    assert(rswap_page_key(&si, &page, entry, WRITE, hex) == 0);
-    assert(rswap_page_key(&si, &page, entry, 0, expected_hex) == 0);
-    assert(!strcmp(hex, expected_hex));
+
+    /* Releasing the swap entry drops the digest it held. */
+    i = entry.val % SWAPFILE_CLUSTER;
+    smp_store_release(&clusters[0].hash_table->hashes[i], NULL);
+    assert(!rswap_hash_load(&si, entry, actual));
 
     /* Missing user digests fail writeout, and swapin has no fallback. */
     page_hash_available = false;
-    entry.val = 1;
-    assert(!rswap_hash_load(&si, entry, actual));
     assert(rswap_page_key(&si, &page, entry, 0, hex) == -ENOENT);
     assert(rswap_page_key(&si, &page, entry, WRITE, hex) == -ENODATA);
-    entry.val = 4;
-    assert(rswap_hash_store(&si, entry, first) == -ENOENT);
+
+    /* Offsets beyond the device are rejected, never indexed. */
+    entry.val = si.max;
+    assert(rswap_hash_store(&si, entry, first) == -ENOMEM);
     assert(!rswap_hash_load(&si, entry, actual));
+
+    /* A page_ext digest still reaches the table on writeout. */
+    page_hash_available = true;
+    memcpy(attached_hash, first, sizeof(attached_hash));
+    entry.val = 0;
+    assert(rswap_page_key(&si, &page, entry, WRITE, expected_hex) == 0);
+    assert(rswap_hash_load(&si, entry, actual));
+    assert(!memcmp(actual, first, sizeof(actual)));
+
     puts("PASS: actual per-entry key path stores and reloads writeout digests");
     return 0;
 }
@@ -911,8 +945,10 @@ def main():
     submit = source[source.index(start):
                     source.index("/* The rswap operations vector. */")]
     hashes = source[source.index(
-        "static struct rswap_hash_entry *rswap_hash_slot("):
-        source.index("/* ---------- swap_ops implementations")]
+        "static struct rswap_hash *rswap_slot_lookup("):
+        source.index("/*\n * Resolve the digest user space supplied")]
+    hashes += source[source.index("static int rswap_page_key("):
+                     source.index("/* ---------- swap_ops implementations")]
     free = swapfile[swapfile.index("static void swap_range_free("):
                     swapfile.index("static bool get_swap_device_info(")]
     snippets = {

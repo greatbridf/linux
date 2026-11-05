@@ -11,6 +11,7 @@ struct mempolicy;
 struct swap_iocb;
 struct swap_memcg_table;
 struct swap_io_ctx;
+struct rswap_hash_table;
 
 #if defined(MAX_POSSIBLE_PHYSMEM_BITS)
 #define SWAP_CACHE_PFN_BITS (MAX_POSSIBLE_PHYSMEM_BITS - PAGE_SHIFT)
@@ -65,7 +66,7 @@ struct swap_cluster_info {
 	unsigned long *zero_bitmap;
 #endif
 #ifdef CONFIG_RSWAP
-	struct rswap_hash_table *hash_table;
+	struct rswap_hash_table *hash_table;	/* digest slots of this cluster */
 #endif
 	struct list_head list;
 };

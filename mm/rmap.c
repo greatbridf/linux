@@ -2244,6 +2244,20 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 				address, range.end);
 	mmu_notifier_invalidate_range_start(&range);
 
+#ifdef CONFIG_RSWAP
+	/*
+	 * A shmem folio is not in the swap cache yet -- shmem_writeout()
+	 * allocates its swap entry once the folio is fully unmapped -- so its
+	 * digest is staged in the inode here.  Resolve it before any page table
+	 * lock is taken: the lookup may allocate, which is not allowed under
+	 * the PTL.  @address is the first page of the folio in this vma and the
+	 * rest of the folio follows it contiguously.
+	 */
+	if (rswap_vma_needs_hash(vma) && !folio_test_anon(folio) &&
+	    folio_test_swapbacked(folio))
+		rswap_attach_hash_shmem(folio, address, vma);
+#endif
+
 	while (page_vma_mapped_walk(&pvmw)) {
 		nr_pages = 1;
 
@@ -2393,13 +2407,6 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 			 * See Documentation/mm/mmu_notifier.rst
 			 */
 			add_mm_counter(mm, mm_counter_file(folio), -nr_pages);
-
-			/*
-			 * shmem pages aren't in swap cache right now. Get the
-			 * hash value and store it in private.
-			 */
-			if (shmem_mapping(folio_mapping(folio)))
-				rswap_attach_hash_shmem(page, address, vma);
 		}
 finish_unmap:
 		folio_remove_rmap_ptes(folio, page, nr_pages, vma);
