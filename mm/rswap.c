@@ -64,6 +64,9 @@
 #include <linux/uio.h>
 #include <linux/shmem_fs.h>
 #include <linux/xarray.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <linux/mman.h>
 
 #include "swap.h"
 #include "rswap.h"
@@ -71,9 +74,11 @@
 
 /* ---------- Configuration ---------- */
 
-#define RSWAP_SHA256_HEXLEN	64	/* SHA-256 -> 64 hex chars */
+#define RSWAP_HASH_HEXLEN	(2 * RSWAP_HASH_LEN)
+/* Legacy /proc/sys/vm/rswap/attach digests are still SHA-256. */
+#define RSWAP_SHA256_HEXLEN	64
 
-static_assert(RSWAP_SHA256_HEXLEN + 1 == RSWAP_KV_KEY_LEN);
+static_assert(RSWAP_HASH_HEXLEN + 1 == RSWAP_KV_KEY_LEN);
 
 /*
  * Backend selection.  These are boot parameters: switching a live swap device
@@ -495,7 +500,7 @@ static int rswap_hash_store(struct swap_info_struct *si, swp_entry_t entry,
 	if (!slot)
 		return -ENOMEM;
 
-	memcpy(slot->data, hash, SHA256_DIGEST_SIZE);
+	memcpy(slot->data, hash, RSWAP_HASH_LEN);
 	return 0;
 }
 
@@ -507,23 +512,36 @@ static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
 	if (!slot)
 		return false;
 
-	memcpy(hash, slot->data, SHA256_DIGEST_SIZE);
+	memcpy(hash, slot->data, RSWAP_HASH_LEN);
 	return true;
 }
 
 /*
- * Resolve the digest user space supplied for @addr.
+ * Resolve the digest user space supplied for @addr in @vma.
  *
- * The kernel never computes the digest itself; it asks the provider user
- * space installed.  Until that provider exists the lookup fails, and the
- * page_ext attach path below is the only source of digests.
+ * The kernel never computes the digest itself.  User space attaches a
+ * BPF_PROG_TYPE_SYSCALL program to the VMA and the kernel runs it with a
+ * writable context: the program fills ctx->hash and returns non-zero.  That
+ * program type may write to its context, which a raw tracepoint program
+ * cannot.
  *
- * The anonymous caller runs under the page table lock, so a provider must
- * not sleep.
+ * The anonymous caller runs under the page table lock, so the program must
+ * not sleep and must not fault.
  */
-static int rswap_hash_lookup(struct mm_struct *mm, unsigned long addr, u8 *hash)
+static int rswap_hash_lookup(struct vm_area_struct *vma, unsigned long addr,
+			     u8 *hash)
 {
-	return -ENOENT;
+	struct rswap_hash_ctx ctx = { .vaddr = addr };
+	struct bpf_prog *prog = vma->rswap_prog;
+
+	if (!prog)
+		return -ENOENT;
+
+	if (!bpf_prog_run(prog, &ctx))
+		return -ENOENT;
+
+	memcpy(hash, ctx.hash, RSWAP_HASH_LEN);
+	return 0;
 }
 
 /* Reserve the slots of a folio that just entered the swap cache. */
@@ -545,6 +563,92 @@ void rswap_prepare_hashes(struct folio *folio)
 		if (!rswap_slot_get(si, swp_offset(entry), GFP_NOWAIT))
 			return;
 	}
+}
+
+/*
+ * ---------- Per-VMA digest program ----------
+ *
+ * User space attaches a BPF program to a VMA; the kernel calls it to ask for
+ * the digest of one base page.  The program stores the digest in the value of
+ * an ARRAY map the kernel also holds, because the read-only raw tracepoint
+ * context gives it nowhere else to write.
+ */
+
+void rswap_vma_dup(struct vm_area_struct *vma)
+{
+	/* Digests are a property of the mapping that attached them. */
+	vma->rswap_prog = NULL;
+	vm_flags_clear(vma, VM_HASHED);
+}
+
+void rswap_vma_free(struct vm_area_struct *vma)
+{
+	if (vma->rswap_prog) {
+		bpf_prog_put(vma->rswap_prog);
+		vma->rswap_prog = NULL;
+	}
+}
+
+/*
+ * Attach @prog_fd to the VMA holding @vaddr.  A zero @prog_fd detaches.
+ * Called from /sys/kernel/mm/xswap/rswap_attach.
+ */
+int rswap_attach_prog(unsigned long vaddr, int prog_fd)
+{
+	struct bpf_prog *prog = NULL, *old_prog;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm = current->mm;
+	int ret = 0;
+
+	if (prog_fd) {
+		prog = bpf_prog_get(prog_fd);
+		if (IS_ERR(prog))
+			return PTR_ERR(prog);
+		/*
+		 * The program writes the digest into its context, so the
+		 * context it touches must fit the one we hand it.
+		 */
+		if (prog->type != BPF_PROG_TYPE_SYSCALL ||
+		    prog->aux->max_ctx_offset > sizeof(struct rswap_hash_ctx)) {
+			ret = -EINVAL;
+			goto err;
+		}
+	}
+
+	if (!mm) {
+		ret = -ESRCH;
+		goto err;
+	}
+
+	if (mmap_write_lock_killable(mm)) {
+		ret = -EINTR;
+		goto err;
+	}
+	vma = vma_lookup(mm, vaddr);
+	if (!vma) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	old_prog = vma->rswap_prog;
+	WRITE_ONCE(vma->rswap_prog, prog);
+	if (prog)
+		vm_flags_set(vma, VM_HASHED);
+	else
+		vm_flags_clear(vma, VM_HASHED);
+
+	mmap_write_unlock(mm);
+
+	if (old_prog)
+		bpf_prog_put(old_prog);
+	return 0;
+
+unlock:
+	mmap_write_unlock(mm);
+err:
+	if (prog)
+		bpf_prog_put(prog);
+	return ret;
 }
 
 /* Free the digest slots of a cluster that is being released. */
@@ -571,18 +675,18 @@ void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
 {
 	struct swap_info_struct *si = __swap_entry_to_info(entry);
 	struct rswap_hash *slot;
-	u8 hash[SHA256_DIGEST_SIZE];
+	u8 hash[RSWAP_HASH_LEN];
 
 	if (!(si->flags & SWP_RSWAP))
 		return;
-	if (rswap_hash_lookup(vma->vm_mm, addr, hash))
+	if (rswap_hash_lookup(vma, addr, hash))
 		return;
 
 	slot = rswap_slot_get(si, swp_offset(entry), GFP_NOWAIT);
 	if (!slot)
 		return;
 
-	memcpy(slot->data, hash, SHA256_DIGEST_SIZE);
+	memcpy(slot->data, hash, RSWAP_HASH_LEN);
 }
 
 /*
@@ -610,15 +714,15 @@ void rswap_attach_hash_shmem(struct folio *folio, unsigned long addr,
 		pgoff_t index = folio->index + i;
 		struct rswap_hash *slot;
 		void *old;
-		u8 hash[SHA256_DIGEST_SIZE];
+		u8 hash[RSWAP_HASH_LEN];
 
-		if (rswap_hash_lookup(vma->vm_mm, addr + i * PAGE_SIZE, hash))
+		if (rswap_hash_lookup(vma, addr + i * PAGE_SIZE, hash))
 			continue;
 
 		slot = kzalloc_obj(*slot, GFP_NOWAIT);
 		if (!slot)
 			continue;
-		memcpy(slot->data, hash, SHA256_DIGEST_SIZE);
+		memcpy(slot->data, hash, RSWAP_HASH_LEN);
 
 		old = xa_store(&info->rswap_hashes, index, slot, GFP_NOWAIT);
 		if (xa_is_err(old) || old)
@@ -699,7 +803,7 @@ void rswap_shmem_free_hashes(struct inode *inode)
  *
  * @page:  base page of the folio being written or read
  * @entry: swap entry that backs @page
- * @hex:   output buffer, at least RSWAP_SHA256_HEXLEN + 1 bytes
+ * @hex:   output buffer, at least RSWAP_HASH_HEXLEN + 1 bytes
  *
  * On write, use the digest that was resolved at unmap time; a page that
  * never got one falls back to the digest attached through
@@ -710,11 +814,16 @@ void rswap_shmem_free_hashes(struct inode *inode)
 static int rswap_page_key(struct swap_info_struct *si, struct page *page,
 			  swp_entry_t entry, int rw, char *hex)
 {
-	u8 hash[SHA256_DIGEST_SIZE];
+	u8 hash[RSWAP_HASH_LEN];
 	int ret;
 
 	if (rw == WRITE) {
 		if (!rswap_hash_load(si, entry, hash)) {
+			/*
+			 * Legacy fallback: a page_ext digest is a 32-byte
+			 * SHA-256, zero extended to the slot width.
+			 */
+			memset(hash, 0, sizeof(hash));
 			if (!rswap_page_get_hash(page, hash))
 				return -ENODATA;
 			ret = rswap_hash_store(si, entry, hash);
@@ -725,8 +834,8 @@ static int rswap_page_key(struct swap_info_struct *si, struct page *page,
 		return -ENOENT;
 	}
 
-	bin2hex(hex, hash, SHA256_DIGEST_SIZE);
-	hex[RSWAP_SHA256_HEXLEN] = '\0';
+	bin2hex(hex, hash, RSWAP_HASH_LEN);
+	hex[RSWAP_HASH_HEXLEN] = '\0';
 	return 0;
 }
 
@@ -1227,11 +1336,13 @@ static bool rswap_folio_ready(struct folio *folio, int rw)
 	for (i = 0; i < folio_nr_pages(folio); i++) {
 		swp_entry_t entry = folio_swap_entry(folio, i);
 		struct swap_info_struct *si = __swap_entry_to_info(entry);
-		u8 hash[SHA256_DIGEST_SIZE];
+		u8 hash[RSWAP_HASH_LEN];
 
 		if (rw == WRITE) {
-			if (!rswap_hash_load(si, entry, hash) &&
-			    !rswap_page_get_hash(folio_page(folio, i), hash))
+			if (rswap_hash_load(si, entry, hash))
+				continue;
+			memset(hash, 0, sizeof(hash));
+			if (!rswap_page_get_hash(folio_page(folio, i), hash))
 				return false;
 		} else if (!rswap_hash_load(si, entry, hash)) {
 			return false;

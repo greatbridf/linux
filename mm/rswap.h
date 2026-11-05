@@ -40,6 +40,8 @@
 #ifdef CONFIG_RSWAP
 
 #include <linux/types.h>
+
+struct vm_area_struct;
 #include <linux/swap.h>
 
 #include "swap.h"
@@ -48,6 +50,15 @@
 
 struct rswap_hash {
 	char data[RSWAP_HASH_LEN];
+};
+
+/*
+ * Context of the digest program the kernel runs for a base page.  The program
+ * fills @hash; BPF_PROG_TYPE_SYSCALL programs may write to their context.
+ */
+struct rswap_hash_ctx {
+	u64	vaddr;
+	u8	hash[RSWAP_HASH_LEN];
 };
 
 /*
@@ -77,6 +88,12 @@ void rswap_debugfs_del(struct swap_info_struct *si);
 void rswap_prepare_hashes(struct folio *folio);
 /* Free the table of a cluster that is being released. */
 void rswap_hash_table_free(struct swap_cluster_info *ci);
+
+/* ---------- Per-VMA digest program ---------- */
+
+int rswap_attach_prog(unsigned long vaddr, int prog_fd);
+void rswap_vma_dup(struct vm_area_struct *vma);
+void rswap_vma_free(struct vm_area_struct *vma);
 
 /* ---------- Hash attach (called from rmap.c) ---------- */
 
@@ -114,6 +131,10 @@ static inline void rswap_debugfs_add(struct swap_info_struct *si) { }
 static inline void rswap_debugfs_del(struct swap_info_struct *si) { }
 
 static inline void rswap_prepare_hashes(struct folio *folio) { }
+static inline int rswap_attach_prog(unsigned long vaddr, int prog_fd)
+{
+	return -EOPNOTSUPP;
+}
 static inline void rswap_hash_table_free(struct swap_cluster_info *ci) { }
 static inline void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
 		struct vm_area_struct *vma) { }

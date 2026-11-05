@@ -133,7 +133,7 @@ config XSWAP
 
 config RSWAP
 	bool "Remote Swap (rswap) - remote KV store backend"
-	depends on XSWAP && INET && SYSCTL
+	depends on XSWAP && INET && SYSCTL && BPF_SYSCALL
 	select CRYPTO_LIB_SHA256
 	select PAGE_EXTENSION
 	help

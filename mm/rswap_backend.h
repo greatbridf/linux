@@ -21,7 +21,7 @@ struct seq_file;
 struct socket;
 
 /* Longest KV key rswap ever produces: SHA-256 as hex plus the NUL. */
-#define RSWAP_KV_KEY_LEN	65
+#define RSWAP_KV_KEY_LEN	97	/* 2 * RSWAP_HASH_LEN + NUL */
 /* Room for a host name, an IPv4 literal or a future address family. */
 #define RSWAP_KV_HOST_LEN	64
 /*

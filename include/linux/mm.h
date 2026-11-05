@@ -254,6 +254,13 @@ void setup_initial_init_mm(void *start_code, void *end_code,
 
 struct vm_area_struct *vm_area_alloc(struct mm_struct *);
 struct vm_area_struct *vm_area_dup(struct vm_area_struct *);
+#ifdef CONFIG_RSWAP
+void rswap_vma_dup(struct vm_area_struct *vma);
+void rswap_vma_free(struct vm_area_struct *vma);
+#else
+static inline void rswap_vma_dup(struct vm_area_struct *vma) { }
+static inline void rswap_vma_free(struct vm_area_struct *vma) { }
+#endif
 void vm_area_free(struct vm_area_struct *);
 
 #ifndef CONFIG_MMU

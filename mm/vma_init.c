@@ -142,6 +142,8 @@ struct vm_area_struct *vm_area_dup(struct vm_area_struct *orig)
 	INIT_LIST_HEAD(&new->anon_vma_chain);
 	vma_numab_state_init(new);
 	dup_anon_vma_name(orig, new);
+	/* The digest program is not inherited; see mm/rswap.c */
+	rswap_vma_dup(new);
 
 	return new;
 }
@@ -153,5 +155,6 @@ void vm_area_free(struct vm_area_struct *vma)
 	vma_numab_state_free(vma);
 	free_anon_vma_name(vma);
 	vma_pfnmap_track_ctx_release(vma);
+	rswap_vma_free(vma);
 	kmem_cache_free(vm_area_cachep, vma);
 }
