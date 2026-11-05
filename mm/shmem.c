@@ -1923,7 +1923,7 @@ try_split:
 		 * The folio has its swap entries now, so the digests staged at
 		 * unmap time can move from the inode into the swap cluster.
 		 */
-		rswap_shmem_move_hashes(folio);
+		rswap_shmem_move_hashes(&info->vfs_inode, folio);
 
 		folio_dup_swap(folio, NULL);
 		shmem_delete_from_page_cache(folio, swp_to_radix_entry(folio->swap));

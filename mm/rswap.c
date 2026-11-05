@@ -737,15 +737,17 @@ void rswap_attach_hash_shmem(struct folio *folio, unsigned long addr,
  * and a writeout that fails after this point has to be retried from a fresh
  * unmap, which resolves the digest again.
  */
-void rswap_shmem_move_hashes(struct folio *folio)
+void rswap_shmem_move_hashes(struct inode *inode, struct folio *folio)
 {
-	struct address_space *mapping = folio_mapping(folio);
 	struct swap_info_struct *si;
 	struct shmem_inode_info *info;
 	unsigned long i;
 
-	if (!mapping || !shmem_mapping(mapping))
-		return;
+	/*
+	 * The caller has the shmem inode in hand: once the folio is in the swap
+	 * cache, folio_mapping() reports the swap address space, not the inode
+	 * that holds the staged digests.
+	 */
 	if (!folio_test_swapcache(folio))
 		return;
 
@@ -753,7 +755,7 @@ void rswap_shmem_move_hashes(struct folio *folio)
 	if (!(si->flags & SWP_RSWAP))
 		return;
 
-	info = SHMEM_I(mapping->host);
+	info = SHMEM_I(inode);
 
 	for (i = 0; i < folio_nr_pages(folio); i++) {
 		struct rswap_hash *staged, *slot;

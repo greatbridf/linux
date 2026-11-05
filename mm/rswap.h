@@ -108,7 +108,7 @@ void rswap_attach_hash_shmem(struct folio *folio, unsigned long addr,
 /* ---------- Shmem staging area (called from shmem.c) ---------- */
 
 /* Move the staged hashes of @folio into its swap cluster. */
-void rswap_shmem_move_hashes(struct folio *folio);
+void rswap_shmem_move_hashes(struct inode *inode, struct folio *folio);
 /* Drop the staged hashes of an index range. */
 void rswap_shmem_drop_hashes(struct inode *inode, pgoff_t start, pgoff_t end);
 /* Drop every staged hash of an inode that is going away. */
@@ -140,7 +140,7 @@ static inline void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
 		struct vm_area_struct *vma) { }
 static inline void rswap_attach_hash_shmem(struct folio *folio,
 		unsigned long addr, struct vm_area_struct *vma) { }
-static inline void rswap_shmem_move_hashes(struct folio *folio) { }
+static inline void rswap_shmem_move_hashes(struct inode *inode, struct folio *folio) { }
 static inline void rswap_shmem_drop_hashes(struct inode *inode, pgoff_t start,
 		pgoff_t end) { }
 static inline void rswap_shmem_free_hashes(struct inode *inode) { }
