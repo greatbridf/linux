@@ -33,6 +33,7 @@
 
 
 struct address_space;
+struct bpf_prog;
 struct futex_private_hash;
 struct mem_cgroup;
 
@@ -1109,6 +1110,10 @@ struct vm_area_struct {
 	 * unnamed. Serialized by mmap_lock. Use anon_vma_name to access.
 	 */
 	struct anon_vma_name *anon_name;
+#endif
+#ifdef CONFIG_RSWAP
+	/* Digest program of this VMA; see mm/rswap.c */
+	struct bpf_prog		*rswap_prog;
 #endif
 	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
 #ifdef __HAVE_PFNMAP_TRACKING

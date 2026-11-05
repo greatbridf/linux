@@ -75,6 +75,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mm_inline.h>
 #include <linux/oom.h>
+#include <linux/shmem_fs.h>
 
 #include <asm/tlb.h>
 
@@ -83,6 +84,7 @@
 
 #include "internal.h"
 #include "swap.h"
+#include "rswap.h"
 
 static struct kmem_cache *anon_vma_cachep;
 static struct kmem_cache *anon_vma_chain_cachep;
@@ -2169,6 +2171,14 @@ static bool ttu_anon_swapbacked_folio(struct vm_area_struct *vma,
 		return false;
 	}
 
+#ifdef CONFIG_RSWAP
+	/*
+	 * Hash is attached right before unmapping for anon folios.
+	 */
+	if (rswap_vma_needs_hash(vma))
+		rswap_attach_hash(entry, address, vma);
+#endif
+
 	mm_prepare_for_swap_entries(mm);
 	dec_mm_counter(mm, MM_ANONPAGES);
 	inc_mm_counter(mm, MM_SWAPENTS);
@@ -2233,6 +2243,20 @@ static bool try_to_unmap_one(struct folio *folio, struct vm_area_struct *vma,
 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma->vm_mm,
 				address, range.end);
 	mmu_notifier_invalidate_range_start(&range);
+
+#ifdef CONFIG_RSWAP
+	/*
+	 * A shmem folio is not in the swap cache yet -- shmem_writeout()
+	 * allocates its swap entry once the folio is fully unmapped -- so its
+	 * digest is staged in the inode here.  Resolve it before any page table
+	 * lock is taken: the lookup may allocate, which is not allowed under
+	 * the PTL.  @address is the first page of the folio in this vma and the
+	 * rest of the folio follows it contiguously.
+	 */
+	if (rswap_vma_needs_hash(vma) && !folio_test_anon(folio) &&
+	    folio_test_swapbacked(folio))
+		rswap_attach_hash_shmem(folio, address, vma);
+#endif
 
 	while (page_vma_mapped_walk(&pvmw)) {
 		nr_pages = 1;

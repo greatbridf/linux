@@ -43,6 +43,7 @@
 #include <linux/unicode.h>
 #include <linux/swap_ops.h>
 #include "swap.h"
+#include "rswap.h"
 
 static struct vfsmount *shm_mnt __ro_after_init;
 
@@ -1345,6 +1346,9 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, uoff_t lend,
 	if (lend == -1)
 		end = -1;	/* unsigned, so actually very big */
 
+	/* A truncated page can never be written out, so its digest is stale. */
+	rswap_shmem_drop_hashes(inode, start, end);
+
 	if (info->fallocend > start && info->fallocend <= end && !unfalloc)
 		info->fallocend = start;
 
@@ -1640,6 +1644,8 @@ static void shmem_evict_inode(struct inode *inode)
 
 	simple_xattrs_free(&sbinfo->xa_cache, &info->xattrs, sbinfo->max_inodes ? &freed : NULL);
 
+	rswap_shmem_free_hashes(inode);
+
 	shmem_free_inode(inode->i_sb, freed);
 	if (inode->i_blocks)
 		pr_warn("%s: ino=%llu i_blocks=%llu alloced=%lu swapped=%lu nrpages=%lu\n",
@@ -1912,6 +1918,12 @@ try_split:
 				list_add(&info->swaplist, &shmem_swaplist);
 			spin_unlock(&shmem_swaplist_lock);
 		}
+
+		/*
+		 * The folio has its swap entries now, so the digests staged at
+		 * unmap time can move from the inode into the swap cluster.
+		 */
+		rswap_shmem_move_hashes(&info->vfs_inode, folio);
 
 		folio_dup_swap(folio, NULL);
 		shmem_delete_from_page_cache(folio, swp_to_radix_entry(folio->swap));
@@ -5333,6 +5345,9 @@ static struct inode *shmem_alloc_inode(struct super_block *sb)
 	info = alloc_inode_sb(sb, shmem_inode_cachep, GFP_KERNEL);
 	if (!info)
 		return NULL;
+#ifdef CONFIG_RSWAP
+	xa_init(&info->rswap_hashes);
+#endif
 	return &info->vfs_inode;
 }
 

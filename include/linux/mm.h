@@ -254,6 +254,13 @@ void setup_initial_init_mm(void *start_code, void *end_code,
 
 struct vm_area_struct *vm_area_alloc(struct mm_struct *);
 struct vm_area_struct *vm_area_dup(struct vm_area_struct *);
+#ifdef CONFIG_RSWAP
+void rswap_vma_dup(struct vm_area_struct *vma);
+void rswap_vma_free(struct vm_area_struct *vma);
+#else
+static inline void rswap_vma_dup(struct vm_area_struct *vma) { }
+static inline void rswap_vma_free(struct vm_area_struct *vma) { }
+#endif
 void vm_area_free(struct vm_area_struct *);
 
 #ifndef CONFIG_MMU
@@ -346,6 +353,9 @@ enum {
 	DECLARE_VMA_BIT(UFFD_MINOR, 41),
 	DECLARE_VMA_BIT(SEALED, 42),
 	DECLARE_VMA_BIT(UFFD_RWP, 43),
+#ifdef CONFIG_RSWAP
+	DECLARE_VMA_BIT(HASHED, 44),
+#endif
 	/* Flags that reuse flags above. */
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT0, HIGH_ARCH_0),
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT1, HIGH_ARCH_1),
@@ -499,6 +509,9 @@ enum {
 #define VM_UFFD_RWP		INIT_VM_FLAG(UFFD_RWP)
 #else
 #define VM_UFFD_RWP		VM_NONE
+#endif
+#ifdef CONFIG_RSWAP
+#define VM_HASHED	INIT_VM_FLAG(HASHED)
 #endif
 
 /*

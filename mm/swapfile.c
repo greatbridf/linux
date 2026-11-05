@@ -168,9 +168,68 @@ static ssize_t xswap_destroy_store(struct kobject *kobj,
 static struct kobj_attribute xswap_destroy_attr = __ATTR(destroy, 0200, NULL,
 							 xswap_destroy_store);
 
+#ifdef CONFIG_RSWAP
+/*
+ * echo "<vaddr-hex> <prog-fd>" > /sys/kernel/mm/xswap/rswap_attach
+ * echo "<vaddr-hex> 0"         > /sys/kernel/mm/xswap/rswap_attach
+ *
+ * Attach (or with a zero prog fd, detach) the digest BPF program of the VMA
+ * that holds <vaddr> in the writing task.
+ */
+static ssize_t xswap_rswap_attach_store(struct kobject *kobj,
+					struct kobj_attribute *attr,
+					const char *buf, size_t count)
+{
+	char *str, *s, *token;
+	unsigned long vaddr;
+	int prog_fd = 0;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	str = kstrndup(buf, count, GFP_KERNEL);
+	if (!str)
+		return -ENOMEM;
+
+	s = skip_spaces(str);
+	token = strsep(&s, " \t");
+	if (!token || !*token) {
+		err = -EINVAL;
+		goto out;
+	}
+	err = kstrtoul(token, 16, &vaddr);
+	if (err)
+		goto out;
+
+	if (s) {
+		token = strsep(&s, " \t");
+		if (token && *token) {
+			err = kstrtoint(token, 10, &prog_fd);
+			if (err)
+				goto out;
+		}
+	}
+
+	err = rswap_attach_prog(vaddr, prog_fd);
+out:
+	kfree(str);
+	if (err)
+		return err;
+
+	return count;
+}
+
+static struct kobj_attribute xswap_rswap_attach_attr =
+	__ATTR(rswap_attach, 0200, NULL, xswap_rswap_attach_store);
+#endif /* CONFIG_RSWAP */
+
 static struct attribute *xswap_attrs[] = {
 	&xswap_create_attr.attr,
 	&xswap_destroy_attr.attr,
+#ifdef CONFIG_RSWAP
+	&xswap_rswap_attach_attr.attr,
+#endif
 	NULL,
 };
 
@@ -639,6 +698,12 @@ static void swap_cluster_free_count_table(struct swap_table *table)
 static void swap_cluster_free_table(struct swap_cluster_info *ci)
 {
 	struct swap_table *table;
+
+	/*
+	 * The digest slots go away with the cluster: the cluster is only freed
+	 * once it is empty, so no swap entry can reach them any more.
+	 */
+	rswap_hash_table_free(ci);
 
 #ifdef CONFIG_MEMCG
 	kfree(ci->memcg_table);
@@ -2076,6 +2141,9 @@ again:
 
 	if (unlikely(!folio_test_swapcache(folio)))
 		goto failed;
+
+	/* Give the new entries their digest slots while we may still sleep. */
+	rswap_prepare_hashes(folio);
 
 	return 0;
 

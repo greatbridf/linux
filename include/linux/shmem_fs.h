@@ -12,6 +12,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/bits.h>
 #include <linux/list_lru.h>
+#include <linux/xarray.h>
 
 /* inode in-kernel data */
 
@@ -59,6 +60,14 @@ struct shmem_inode_info {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	struct obj_cgroup	*shrinklist_objcg;
 	int			shrinklist_nid;
+#endif
+#ifdef CONFIG_RSWAP
+	/*
+	 * Digests of pages that were unmapped but have no swap entry yet, keyed
+	 * by page index.  shmem_writeout() moves them into the swap cluster
+	 * once the entry exists.
+	 */
+	struct xarray		rswap_hashes;
 #endif
 };
 

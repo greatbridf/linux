@@ -10,12 +10,14 @@
  *
  * == Keys ==
  *
- * The digest is supplied by user space, which knows what a page holds and
- * attaches the digest to it through /proc/sys/vm/rswap/attach.  The digest
- * is kept in page_ext until writeout, then copied into a per-device table
- * indexed by swap offset.  Swapin uses that table entry as the KV key, so
- * the key does not depend on the page remaining in the swap cache.  Pages
- * without an attached digest cannot be written to rswap.
+ * The digest is supplied by user space, which knows what a page holds.  The
+ * kernel never hashes page contents and never derives a key from a swap
+ * entry; it only asks user space for the digest attached to an address.  The
+ * digest is resolved while the folio is still mapped, at unmap time, and
+ * stored in the swap cluster that backs the folio.  Swapin uses that stored
+ * digest as the KV key, so the key does not depend on the page remaining in
+ * the swap cache.  Pages without a resolved digest cannot be written to
+ * rswap.
  *
  * == Data flow ==
  *
@@ -60,6 +62,11 @@
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
+#include <linux/shmem_fs.h>
+#include <linux/xarray.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <linux/mman.h>
 
 #include "swap.h"
 #include "rswap.h"
@@ -67,9 +74,11 @@
 
 /* ---------- Configuration ---------- */
 
-#define RSWAP_SHA256_HEXLEN	64	/* SHA-256 -> 64 hex chars */
+#define RSWAP_HASH_HEXLEN	(2 * RSWAP_HASH_LEN)
+/* Legacy /proc/sys/vm/rswap/attach digests are still SHA-256. */
+#define RSWAP_SHA256_HEXLEN	64
 
-static_assert(RSWAP_SHA256_HEXLEN + 1 == RSWAP_KV_KEY_LEN);
+static_assert(RSWAP_HASH_HEXLEN + 1 == RSWAP_KV_KEY_LEN);
 
 /*
  * Backend selection.  These are boot parameters: switching a live swap device
@@ -296,11 +305,6 @@ struct rswap_page_ext {
 	bool	valid;
 };
 
-struct rswap_hash_entry {
-	u8	hash[SHA256_DIGEST_SIZE];
-	u8	valid;
-};
-
 static bool need_rswap_page_ext(void)
 {
 	return true;
@@ -421,41 +425,379 @@ void rswap_page_ext_copy(struct folio *newfolio, struct folio *folio)
 	}
 }
 
-static struct rswap_hash_entry *rswap_hash_slot(struct swap_info_struct *si,
-						swp_entry_t entry)
+static struct rswap_hash *rswap_slot_lookup(struct swap_info_struct *si,
+					    unsigned long offset)
 {
-	unsigned long offset = swp_offset(entry);
+	struct swap_cluster_info *ci;
+	struct rswap_hash_table *table;
 
-	if (!si->rswap_hashes || offset >= si->max)
+	if (offset >= si->max)
 		return NULL;
-	return &si->rswap_hashes[offset];
+
+	ci = __swap_offset_to_cluster(si, offset);
+	table = READ_ONCE(ci->hash_table);
+	if (!table)
+		return NULL;
+
+	/* Pair with rswap_slot_get(), which publishes the slot. */
+	return smp_load_acquire(&table->hashes[offset % SWAPFILE_CLUSTER]);
+}
+
+/*
+ * Return the slot of @offset, allocating the table and the slot on demand.
+ * Best effort: the callers run in reclaim and must not sleep, so failure only
+ * means that this page has no digest yet.
+ */
+static struct rswap_hash *rswap_slot_get(struct swap_info_struct *si,
+					 unsigned long offset, gfp_t gfp)
+{
+	struct swap_cluster_info *ci;
+	struct rswap_hash_table *table, *new_table;
+	struct rswap_hash *slot, *new_slot;
+	unsigned int ci_off;
+
+	if (offset >= si->max)
+		return NULL;
+
+	ci = __swap_offset_to_cluster(si, offset);
+	ci_off = offset % SWAPFILE_CLUSTER;
+
+	table = READ_ONCE(ci->hash_table);
+	if (!table) {
+		new_table = kzalloc_obj(*new_table, gfp);
+		if (!new_table)
+			return NULL;
+		table = cmpxchg(&ci->hash_table, NULL, new_table);
+		if (table)
+			kfree(new_table);
+		else
+			table = new_table;
+	}
+
+	/* Slots are published by cmpxchg, so they must be loaded with acquire. */
+	slot = smp_load_acquire(&table->hashes[ci_off]);
+	if (slot)
+		return slot;
+
+	new_slot = kzalloc_obj(*new_slot, gfp);
+	if (!new_slot)
+		return NULL;
+
+	slot = cmpxchg(&table->hashes[ci_off], NULL, new_slot);
+	if (slot) {
+		kfree(new_slot);
+		return slot;
+	}
+	return new_slot;
 }
 
 static int rswap_hash_store(struct swap_info_struct *si, swp_entry_t entry,
 			    const u8 *hash)
 {
-	struct rswap_hash_entry *slot = rswap_hash_slot(si, entry);
+	struct rswap_hash *slot;
 
+	slot = rswap_slot_get(si, swp_offset(entry), GFP_NOWAIT);
 	if (!slot)
-		return -ENOENT;
+		return -ENOMEM;
 
-	memcpy(slot->hash, hash, SHA256_DIGEST_SIZE);
-	/* Publish the digest before marking the slot valid. */
-	smp_store_release(&slot->valid, 1);
+	memcpy(slot->data, hash, RSWAP_HASH_LEN);
 	return 0;
 }
 
 static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
 			    u8 *hash)
 {
-	struct rswap_hash_entry *slot = rswap_hash_slot(si, entry);
+	struct rswap_hash *slot = rswap_slot_lookup(si, swp_offset(entry));
 
-	/* Pair with rswap_hash_store() before reading the digest. */
-	if (!slot || !smp_load_acquire(&slot->valid))
+	if (!slot)
 		return false;
 
-	memcpy(hash, slot->hash, SHA256_DIGEST_SIZE);
+	memcpy(hash, slot->data, RSWAP_HASH_LEN);
 	return true;
+}
+
+/*
+ * Resolve the digest user space supplied for @addr in @vma.
+ *
+ * The kernel never computes the digest itself.  User space attaches a
+ * BPF_PROG_TYPE_SYSCALL program to the VMA and the kernel runs it with a
+ * writable context: the program fills ctx->hash and returns non-zero.  That
+ * program type may write to its context, which a raw tracepoint program
+ * cannot.
+ *
+ * The anonymous caller runs under the page table lock, so the program must
+ * not sleep and must not fault.
+ */
+static int rswap_hash_lookup(struct vm_area_struct *vma, unsigned long addr,
+			     u8 *hash)
+{
+	struct rswap_hash_ctx ctx = { .vaddr = addr };
+	struct bpf_prog *prog = vma->rswap_prog;
+
+	if (!prog)
+		return -ENOENT;
+
+	if (!bpf_prog_run(prog, &ctx))
+		return -ENOENT;
+
+	memcpy(hash, ctx.hash, RSWAP_HASH_LEN);
+	return 0;
+}
+
+/* Reserve the slots of a folio that just entered the swap cache. */
+void rswap_prepare_hashes(struct folio *folio)
+{
+	struct swap_info_struct *si;
+	unsigned long i;
+
+	if (!folio_test_swapcache(folio))
+		return;
+
+	si = __swap_entry_to_info(folio->swap);
+	if (!(si->flags & SWP_RSWAP))
+		return;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		swp_entry_t entry = folio_swap_entry(folio, i);
+
+		if (!rswap_slot_get(si, swp_offset(entry), GFP_NOWAIT))
+			return;
+	}
+}
+
+/*
+ * ---------- Per-VMA digest program ----------
+ *
+ * User space attaches a BPF program to a VMA; the kernel calls it to ask for
+ * the digest of one base page.  The program stores the digest in the value of
+ * an ARRAY map the kernel also holds, because the read-only raw tracepoint
+ * context gives it nowhere else to write.
+ */
+
+void rswap_vma_dup(struct vm_area_struct *vma)
+{
+	/* Digests are a property of the mapping that attached them. */
+	vma->rswap_prog = NULL;
+	vm_flags_clear(vma, VM_HASHED);
+}
+
+void rswap_vma_free(struct vm_area_struct *vma)
+{
+	if (vma->rswap_prog) {
+		bpf_prog_put(vma->rswap_prog);
+		vma->rswap_prog = NULL;
+	}
+}
+
+/*
+ * Attach @prog_fd to the VMA holding @vaddr.  A zero @prog_fd detaches.
+ * Called from /sys/kernel/mm/xswap/rswap_attach.
+ */
+int rswap_attach_prog(unsigned long vaddr, int prog_fd)
+{
+	struct bpf_prog *prog = NULL, *old_prog;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm = current->mm;
+	int ret = 0;
+
+	if (prog_fd) {
+		prog = bpf_prog_get(prog_fd);
+		if (IS_ERR(prog))
+			return PTR_ERR(prog);
+		/*
+		 * The program writes the digest into its context, so the
+		 * context it touches must fit the one we hand it.
+		 */
+		if (prog->type != BPF_PROG_TYPE_SYSCALL ||
+		    prog->aux->max_ctx_offset > sizeof(struct rswap_hash_ctx)) {
+			ret = -EINVAL;
+			goto err;
+		}
+	}
+
+	if (!mm) {
+		ret = -ESRCH;
+		goto err;
+	}
+
+	if (mmap_write_lock_killable(mm)) {
+		ret = -EINTR;
+		goto err;
+	}
+	vma = vma_lookup(mm, vaddr);
+	if (!vma) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+
+	old_prog = vma->rswap_prog;
+	WRITE_ONCE(vma->rswap_prog, prog);
+	if (prog)
+		vm_flags_set(vma, VM_HASHED);
+	else
+		vm_flags_clear(vma, VM_HASHED);
+
+	mmap_write_unlock(mm);
+
+	if (old_prog)
+		bpf_prog_put(old_prog);
+	return 0;
+
+unlock:
+	mmap_write_unlock(mm);
+err:
+	if (prog)
+		bpf_prog_put(prog);
+	return ret;
+}
+
+/* Free the digest slots of a cluster that is being released. */
+void rswap_hash_table_free(struct swap_cluster_info *ci)
+{
+	struct rswap_hash_table *table = ci->hash_table;
+	unsigned int i;
+
+	if (!table)
+		return;
+
+	ci->hash_table = NULL;
+	for (i = 0; i < SWAPFILE_CLUSTER; i++)
+		kfree(table->hashes[i]);
+	kfree(table);
+}
+
+/*
+ * Anonymous folio: the swap entry exists and is about to replace the PTE, so
+ * the digest goes straight into the slot that backs it.
+ */
+void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
+		       struct vm_area_struct *vma)
+{
+	struct swap_info_struct *si = __swap_entry_to_info(entry);
+	struct rswap_hash *slot;
+	u8 hash[RSWAP_HASH_LEN];
+
+	if (!(si->flags & SWP_RSWAP))
+		return;
+	if (rswap_hash_lookup(vma, addr, hash))
+		return;
+
+	slot = rswap_slot_get(si, swp_offset(entry), GFP_NOWAIT);
+	if (!slot)
+		return;
+
+	memcpy(slot->data, hash, RSWAP_HASH_LEN);
+}
+
+/*
+ * Shmem folio: shmem_writeout() allocates the swap entry only once the folio
+ * is fully unmapped, so the digest is staged in the inode, keyed by page
+ * index.  The index survives folio split and migration, which matters because
+ * shmem_writeout() may split the folio before the entry exists.
+ */
+void rswap_attach_hash_shmem(struct folio *folio, unsigned long addr,
+			     struct vm_area_struct *vma)
+{
+	struct address_space *mapping = folio_mapping(folio);
+	struct shmem_inode_info *info;
+	unsigned long i;
+
+	if (!mapping || !shmem_mapping(mapping))
+		return;
+	/* Already in the swap cache: the digest belongs with its swap entry. */
+	if (folio_test_swapcache(folio))
+		return;
+
+	info = SHMEM_I(mapping->host);
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		pgoff_t index = folio->index + i;
+		struct rswap_hash *slot;
+		void *old;
+		u8 hash[RSWAP_HASH_LEN];
+
+		if (rswap_hash_lookup(vma, addr + i * PAGE_SIZE, hash))
+			continue;
+
+		slot = kzalloc_obj(*slot, GFP_NOWAIT);
+		if (!slot)
+			continue;
+		memcpy(slot->data, hash, RSWAP_HASH_LEN);
+
+		old = xa_store(&info->rswap_hashes, index, slot, GFP_NOWAIT);
+		if (xa_is_err(old) || old)
+			kfree(slot);
+	}
+}
+
+/*
+ * Move the staged hashes of @folio into the slots of its new swap entries.
+ *
+ * The staged copy is dropped either way: the swap entry now owns the digest,
+ * and a writeout that fails after this point has to be retried from a fresh
+ * unmap, which resolves the digest again.
+ */
+void rswap_shmem_move_hashes(struct inode *inode, struct folio *folio)
+{
+	struct swap_info_struct *si;
+	struct shmem_inode_info *info;
+	unsigned long i;
+
+	/*
+	 * The caller has the shmem inode in hand: once the folio is in the swap
+	 * cache, folio_mapping() reports the swap address space, not the inode
+	 * that holds the staged digests.
+	 */
+	if (!folio_test_swapcache(folio))
+		return;
+
+	si = __swap_entry_to_info(folio->swap);
+	if (!(si->flags & SWP_RSWAP))
+		return;
+
+	info = SHMEM_I(inode);
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		struct rswap_hash *staged, *slot;
+
+		staged = xa_erase(&info->rswap_hashes, folio->index + i);
+		if (!staged)
+			continue;
+
+		slot = rswap_slot_get(si, swp_offset(folio_swap_entry(folio, i)),
+				      GFP_NOWAIT);
+		if (slot)
+			memcpy(slot->data, staged->data, sizeof(slot->data));
+		kfree(staged);
+	}
+}
+
+void rswap_shmem_drop_hashes(struct inode *inode, pgoff_t start, pgoff_t end)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	pgoff_t index = start;
+
+	while (index < end) {
+		struct rswap_hash *slot;
+
+		slot = xa_find(&info->rswap_hashes, &index, end - 1, XA_PRESENT);
+		if (!slot)
+			break;
+		xa_erase(&info->rswap_hashes, index);
+		kfree(slot);
+		index++;
+	}
+}
+
+void rswap_shmem_free_hashes(struct inode *inode)
+{
+	struct shmem_inode_info *info = SHMEM_I(inode);
+	unsigned long index;
+	void *slot;
+
+	xa_for_each(&info->rswap_hashes, index, slot)
+		kfree(slot);
+	xa_destroy(&info->rswap_hashes);
 }
 
 /*
@@ -463,30 +805,39 @@ static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
  *
  * @page:  base page of the folio being written or read
  * @entry: swap entry that backs @page
- * @hex:   output buffer, at least RSWAP_SHA256_HEXLEN + 1 bytes
+ * @hex:   output buffer, at least RSWAP_HASH_HEXLEN + 1 bytes
  *
- * On write, persist the digest attached to @page in the device table.  On
- * read, use the persisted digest so the key does not depend on the page
- * still being in swap cache.
+ * On write, use the digest that was resolved at unmap time; a page that
+ * never got one falls back to the digest attached through
+ * /proc/sys/vm/rswap/attach while that interface still exists.  On read, use
+ * the stored digest so the key does not depend on the page still being in
+ * swap cache.
  */
 static int rswap_page_key(struct swap_info_struct *si, struct page *page,
 			  swp_entry_t entry, int rw, char *hex)
 {
-	u8 hash[SHA256_DIGEST_SIZE];
+	u8 hash[RSWAP_HASH_LEN];
 	int ret;
 
 	if (rw == WRITE) {
-		if (!rswap_page_get_hash(page, hash))
-			return -ENODATA;
-		ret = rswap_hash_store(si, entry, hash);
-		if (ret)
-			return ret;
+		if (!rswap_hash_load(si, entry, hash)) {
+			/*
+			 * Legacy fallback: a page_ext digest is a 32-byte
+			 * SHA-256, zero extended to the slot width.
+			 */
+			memset(hash, 0, sizeof(hash));
+			if (!rswap_page_get_hash(page, hash))
+				return -ENODATA;
+			ret = rswap_hash_store(si, entry, hash);
+			if (ret)
+				return ret;
+		}
 	} else if (!rswap_hash_load(si, entry, hash)) {
 		return -ENOENT;
 	}
 
-	bin2hex(hex, hash, SHA256_DIGEST_SIZE);
-	hex[RSWAP_SHA256_HEXLEN] = '\0';
+	bin2hex(hex, hash, RSWAP_HASH_LEN);
+	hex[RSWAP_HASH_HEXLEN] = '\0';
 	return 0;
 }
 
@@ -987,9 +1338,12 @@ static bool rswap_folio_ready(struct folio *folio, int rw)
 	for (i = 0; i < folio_nr_pages(folio); i++) {
 		swp_entry_t entry = folio_swap_entry(folio, i);
 		struct swap_info_struct *si = __swap_entry_to_info(entry);
-		u8 hash[SHA256_DIGEST_SIZE];
+		u8 hash[RSWAP_HASH_LEN];
 
 		if (rw == WRITE) {
+			if (rswap_hash_load(si, entry, hash))
+				continue;
+			memset(hash, 0, sizeof(hash));
 			if (!rswap_page_get_hash(folio_page(folio, i), hash))
 				return false;
 		} else if (!rswap_hash_load(si, entry, hash)) {
@@ -1121,44 +1475,49 @@ late_initcall(rswap_sysctl_init);
 
 /* ---------- Device setup / teardown ---------- */
 
-static int rswap_hashes_alloc(struct swap_info_struct *si)
+static int rswap_stats_alloc(struct swap_info_struct *si)
 {
-	si->rswap_hashes = kvcalloc(si->max, sizeof(*si->rswap_hashes),
-				    GFP_KERNEL);
-	if (!si->rswap_hashes)
-		return -ENOMEM;
-
 	si->rswap_stats = kzalloc_obj(*si->rswap_stats, GFP_KERNEL);
-	if (!si->rswap_stats) {
-		kvfree(si->rswap_hashes);
-		si->rswap_hashes = NULL;
+	if (!si->rswap_stats)
 		return -ENOMEM;
-	}
 	return 0;
 }
 
-static void rswap_hashes_free(struct swap_info_struct *si)
+static void rswap_stats_free(struct swap_info_struct *si)
 {
 	kfree(si->rswap_stats);
 	si->rswap_stats = NULL;
-	kvfree(si->rswap_hashes);
-	si->rswap_hashes = NULL;
 }
 
+/*
+ * Called when a swap entry is released, before the slot can be reused.  The
+ * digest must not survive into the next user of the slot: it is the only
+ * thing that keeps a key from being reused for different page contents.
+ */
 void rswap_hash_invalidate(struct swap_info_struct *si, unsigned long offset,
 			   unsigned int nr_entries)
 {
 	unsigned long end;
 
-	if (!si->rswap_hashes)
-		return;
 	if (offset >= si->max)
 		return;
 
 	end = offset + min_t(unsigned long, nr_entries, si->max - offset);
 	for (; offset < end; offset++) {
-		/* Pair with rswap_hash_load() as the swap entry is released. */
-		smp_store_release(&si->rswap_hashes[offset].valid, 0);
+		struct swap_cluster_info *ci;
+		struct rswap_hash_table *table;
+
+		ci = __swap_offset_to_cluster(si, offset);
+		table = READ_ONCE(ci->hash_table);
+		if (!table)
+			continue;
+
+		/*
+		 * The swap slot is about to be reused; a published digest must not
+		 * outlive it, or the next page in the slot would be stored under the
+		 * key of the previous one.  Pair with rswap_slot_lookup().
+		 */
+		smp_store_release(&table->hashes[offset % SWAPFILE_CLUSTER], NULL);
 	}
 }
 
@@ -1177,7 +1536,7 @@ int rswap_enable(struct swap_info_struct *si)
 	rswap_read_wq_init();
 	atomic_set(&rswap_read_peak_inflight, 0);
 
-	ret = rswap_hashes_alloc(si);
+	ret = rswap_stats_alloc(si);
 	if (ret)
 		return ret;
 
@@ -1191,7 +1550,7 @@ int rswap_enable(struct swap_info_struct *si)
 	 */
 	ret = swap_fs_activate(si, &kv_swap_ops);
 	if (ret < 0) {
-		rswap_hashes_free(si);
+		rswap_stats_free(si);
 		return ret;
 	}
 	return 0;
@@ -1200,11 +1559,13 @@ int rswap_enable(struct swap_info_struct *si)
 void rswap_disable(struct swap_info_struct *si)
 {
 	/*
-	 * Every queued or running read batch still updates si->rswap_stats and
-	 * points into si->rswap_hashes, so drain the workqueue before freeing
-	 * either.  The drain is what makes the per-batch device pointers safe;
-	 * each batch completes its request from the worker, which also unlocks
-	 * the folios it holds.
+	 * Every queued or running read batch still updates si->rswap_stats, so
+	 * drain the workqueue before freeing it.  The drain is what makes the
+	 * per-batch device pointers safe; each batch completes its request from
+	 * the worker, which also unlocks the folios it holds.
+	 *
+	 * The digest slots themselves belong to the swap clusters, which are
+	 * released by the swap core, so nothing else is ours to free here.
 	 *
 	 * No new submit can be in flight here: __swapoff() killed si->users,
 	 * synchronized RCU and waited for its holders before calling us, and
@@ -1212,7 +1573,7 @@ void rswap_disable(struct swap_info_struct *si)
 	 */
 	if (rswap_read_wq)
 		flush_workqueue(rswap_read_wq);
-	rswap_hashes_free(si);
+	rswap_stats_free(si);
 }
 
 void rswap_swapoff(struct swap_info_struct *si)
