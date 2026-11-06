@@ -402,3 +402,92 @@ dropping `VM_HASHED` on every VMA copy (now documented as a limitation in
   `rswap.redis_password` is not exposed in sysfs.
 - The tools seek the sysctl descriptor to offset zero before each write, which
   matches `*ppos += *lenp`.
+
+## Live findings, 2026-11-06 (DeepSeek-V4.1-Flash geometry, TP=8)
+
+Second round of findings, from a live run against a real workload rather than
+source review. Setup: 8 chunks, 34.5 MiB of KV cache resident, `memory.reclaim`
+as the trigger (plain `MADV_PAGEOUT`, from the worker side or the service side,
+wrote nothing). The run moved real data: `written_pages` 16963 → 19872
+(+2909 pages = 46.5 MiB) at 22.8 ms per 32-page batch, ~22 MB/s, visible in
+`MONITOR` and in the backend counters. That confirms the write path end to end;
+`memory.reclaim` is the trigger that reaches vmscan, which is why
+`tools/mm/rswap_run_test.py` uses a bounded cgroup. The read path is what broke.
+
+Status legend as above: `open`, `fixed` (commit listed), `deferred`, `invalid`.
+
+### L1 — A transient `-EINTR` on connect kills the read, and nothing retries it
+
+`open`.
+
+`rswap_sock_connect()` passes `kernel_connect()`'s return value straight out as
+`ERR_PTR(ret)` (`mm/rswap_sock.c:43-50`), so a signal delivered during the
+connect wait yields `-EINTR` (`pr_err_ratelimited("kernel_connect to %s:%u
+failed: %d\n", …)` with `-4` in the live log). Nothing between there and the
+swap request retries it:
+
+- the send, receive and page helpers return on any `ret <= 0`
+  (`mm/rswap_sock.c:147-155`, `:188-196`, `:224-232`), so an interrupted
+  `sock_sendmsg()`/`sock_recvmsg()` is an error too;
+- the HTTP backend has no retry policy at all: `rswap_http_store()` and
+  `rswap_http_load()` return the first error (`mm/rswap_http.c`);
+- the core calls the backend exactly once per batch
+  (`rswap_flush_batch()`, `mm/rswap.c:1098`) and fails the whole request on the
+  first negative errno;
+- the Redis retry-once policy requires `!conn->sock` after the failure
+  (`mm/rswap_redis.c`), which covers a dropped pooled connection but not a
+  failure to establish one, and it is bounded to a single attempt.
+
+Live evidence: `read_errors` 7, `redis_retries` 3, then `Read-error on
+swap-device` and the task touching the page died.
+
+Fix: retry `-EINTR` (and the other restartable errno) inside the transport,
+give the read path a bounded retry for transient transport failures, and count
+it. `EINTR` must not be treated as "the store is broken".
+
+### L2 — A failed swapin is fatal to the task that touches the page
+
+`open`.
+
+On failure `swap_read_end()` (`mm/page_io.c:584-600`) neither marks the folio
+uptodate nor in error, so `do_swap_page()` takes the `!folio_test_uptodate()`
+branch and returns `VM_FAULT_SIGBUS`. That is the mechanism the live run hit:
+the process touching a KV page went down mid-run with `Read-error on
+swap-device` in the log.
+
+Nothing in the rswap path calls `folio_set_error()`, and the readahead failure
+path in `mm/swap_state.c` has to be audited for handing a non-uptodate folio
+back to the caller: if it does, "swapin failed" can present as a page of zeros
+rather than a fault, which is worse than dying.
+
+Fix: make the failure explicit and local — mark the folio in error so a
+repeated access fails the same way instead of returning garbage, keep the fault
+to the accessing task (SIGBUS), and log once, rate limited, with device type
+and swap offset so the failing key can be identified.
+
+### L3 — The backend timeouts cannot be changed at runtime
+
+`open`.
+
+`send_timeout_ms` and `recv_timeout_ms` are `0444` module parameters
+(`mm/rswap.c:116-122`), so root gets `EACCES` writing them and the only way to
+set a timeout is the kernel command line. Tuning them against a slow path — or
+giving a connect more room than 20 ms of send timeout, the situation behind L1 —
+needs a reboot. They are consulted when a connection is established, so a
+runtime write is safe for new connections.
+
+Fix: make exactly those two writable with range validation, leave `backend`,
+`host`, `port`, `redis_user`, `redis_password` and `redis_db` boot-only (they
+select the store for a device that may already hold data), and document which
+is which.
+
+### L4 — Write throughput is bounded by batch size and in-flight depth
+
+`deferred`, not a defect.
+
+22 MB/s means a 32k-token DeepSeek prefill (~10 GiB) needs about eight minutes
+to spill. `RSWAP_BATCH_MAX` (32) and `RSWAP_READ_MAX_INFLIGHT` (8)
+(`RSWAP_REDIS_POOL_MAX`) are the knobs; both are compile-time constants, and
+the pool semaphore is shared with writeout. Raising them is a measurement
+exercise, not a bug fix: it needs the same pageout test at two settings, and it
+costs transient memory per queued batch.
