@@ -38,6 +38,20 @@ class KVSwapTest(unittest.TestCase):
         conn.close()
         return status, data
 
+    def assert_rejected(self, method, key, body):
+        """The server refuses the request and stores nothing.
+
+        A body it cannot accept is answered with 400, and the connection is
+        closed without draining the body, so a large body can surface as a
+        connection error on the client instead of a status line.  Either
+        outcome is a refusal; what matters is that the object was not stored.
+        """
+        try:
+            status, _ = self.request(method, key, body)
+        except (ConnectionError, http.client.HTTPException):
+            return
+        self.assertEqual(status, 400)
+
     def round_trip(self, size):
         body = os.urandom(size)
         key = digest_key(body)
@@ -83,7 +97,7 @@ class KVSwapTest(unittest.TestCase):
             body = os.urandom(size)
             key = digest_key(f"size-{size}".encode())
             with self.subTest(size=size):
-                self.assertEqual(self.request("POST", key, body)[0], 400)
+                self.assert_rejected("POST", key, body)
                 self.assertEqual(self.request("GET", key), (404, b""))
 
     def test_fragmented_header(self):
