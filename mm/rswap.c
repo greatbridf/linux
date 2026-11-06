@@ -92,7 +92,8 @@ MODULE_PARM_DESC(backend, "KV backend to use: http or redis");
 
 static char rswap_kv_host[RSWAP_KV_HOST_LEN];
 module_param_string(host, rswap_kv_host, sizeof(rswap_kv_host), 0444);
-MODULE_PARM_DESC(host, "KV endpoint address; empty selects the backend default");
+MODULE_PARM_DESC(host,
+		 "KV endpoint address; empty selects the backend default");
 
 static unsigned short rswap_kv_port;
 module_param_named(port, rswap_kv_port, ushort, 0444);
@@ -271,10 +272,14 @@ static void rswap_stats_errors(struct rswap_stats *stats, int rw,
 }
 
 /*
- * A page that never reached the backend: no digest on writeout, none stored
- * on swapin.  Both are expected for pages user space never attached.
+ * Pages of a request that never reached the backend: no digest on writeout,
+ * none stored on swapin.  Both are expected for pages user space never
+ * attached.  @pages is the number of pages that stayed where they were; only
+ * the page that was found without a digest is counted as such, because the
+ * kind of the others is unknown.
  */
-static void rswap_stats_key_failure(struct rswap_stats *stats, int rw, int err)
+static void rswap_stats_key_failure(struct rswap_stats *stats, int rw, int err,
+				    unsigned int pages)
 {
 	if (!stats)
 		return;
@@ -282,7 +287,7 @@ static void rswap_stats_key_failure(struct rswap_stats *stats, int rw, int err)
 		atomic64_inc(&stats->no_digest);
 	else if (rw == READ && err == -ENOENT)
 		atomic64_inc(&stats->no_entry);
-	rswap_stats_errors(stats, rw, 1);
+	rswap_stats_errors(stats, rw, pages);
 }
 
 static void rswap_stats_io(struct rswap_io_stats *io, s64 ns)
@@ -915,7 +920,8 @@ static int rswap_page_key(struct swap_info_struct *si, struct page *page,
  * @nr:		number of pages in the batch
  * @rw:		WRITE or READ
  */
-static int rswap_submit_batch(struct rswap_kv_page *pages, unsigned int nr, int rw)
+static int rswap_submit_batch(struct rswap_kv_page *pages, unsigned int nr,
+			     int rw)
 {
 	int ret = 0;
 
@@ -1001,8 +1007,9 @@ static struct rswap_batch *rswap_batch_alloc(struct swap_info_struct *si)
  * dereferences the swap device after the caller's context is gone.  Returns
  * -ENODATA on writeout resp. -ENOENT on swapin when the page has no digest.
  */
-static int rswap_batch_add(struct rswap_batch *batch, struct swap_info_struct *si,
-			   struct page *page, int rw)
+static int rswap_batch_add(struct rswap_batch *batch,
+			   struct swap_info_struct *si, struct page *page,
+			   int rw)
 {
 	struct folio *folio = page_folio(page);
 	swp_entry_t entry = folio_page_swap_entry(folio, page);
@@ -1052,6 +1059,8 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 	struct rswap_batch *batch;
 	struct folio *folio;
 	struct page *page;
+	unsigned int nr_moved = 0;
+	unsigned int nr_left;
 	int ret = 0;
 	int i;
 	unsigned int noio_flags;
@@ -1080,18 +1089,28 @@ static void rswap_submit(struct swap_io_ctx *ctx, int rw)
 				goto key_error;
 			if (batch->nr < RSWAP_BATCH_MAX)
 				continue;
+			nr_moved += batch->nr;
 			ret = rswap_batch_flush(batch, rw);
 			if (ret)
 				goto out;
 		}
 	}
-	if (batch->nr)
+	if (batch->nr) {
+		nr_moved += batch->nr;
 		ret = rswap_batch_flush(batch, rw);
+	}
 	goto out;
 
 key_error:
-	rswap_stats_key_failure(&rswap_total, rw, ret);
-	rswap_stats_key_failure(ctx->sis->rswap_stats, rw, ret);
+	/*
+	 * A key error fails the whole request, so every page that did not move
+	 * is a failed page, exactly as in the batch-failure path: the pages of
+	 * the batch that was not flushed, the failing page and the pages the
+	 * loop had not reached yet.
+	 */
+	nr_left = (sio->len >> PAGE_SHIFT) - nr_moved - batch->nr;
+	rswap_stats_key_failure(&rswap_total, rw, ret, nr_left);
+	rswap_stats_key_failure(ctx->sis->rswap_stats, rw, ret, nr_left);
 	pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
 			   rw == WRITE ? "write" : "read",
 			   ctx->sis->type,
@@ -1117,7 +1136,10 @@ out:
  */
 #define RSWAP_READ_MAX_INFLIGHT	8
 
-/* Batches between dispatch and completion, including any queued ones. */
+/*
+ * Batches holding one of the RSWAP_READ_MAX_INFLIGHT slots: queued or running
+ * in a worker, or moved in the submitting task while a slot was free.
+ */
 static atomic_t rswap_read_inflight;
 /* Largest value the above reached; reset when a device is created. */
 static atomic_t rswap_read_peak_inflight;
@@ -1159,19 +1181,15 @@ static bool rswap_read_enter(void)
 	return true;
 }
 
-/* Account a batch moved in the submitting task: no slot was taken for it. */
-static void rswap_read_enter_inline(void)
-{
-	rswap_read_peak_update(atomic_inc_return(&rswap_read_inflight));
-}
-
 /*
- * Release the slot only after the request completion ran, so that a reader
- * which observes read_inflight == 0 also observes the finished request.
+ * Release @nr read slots.  A batch releases its slot only after it dropped its
+ * request reference, i.e. after the completion it may have triggered ran: a
+ * worker in rswap_read_batch_work(), a batch moved in the submitting task in
+ * rswap_read_async() after its final drop.
  */
-static void rswap_read_leave(void)
+static void rswap_read_leave(unsigned int nr)
 {
-	atomic_dec(&rswap_read_inflight);
+	atomic_sub(nr, &rswap_read_inflight);
 }
 
 /*
@@ -1229,7 +1247,7 @@ static void rswap_read_batch_work(struct work_struct *work)
 	rswap_read_req_error(req, ret);
 	kfree(batch);
 	rswap_read_req_put(req);
-	rswap_read_leave();
+	rswap_read_leave(1);
 }
 
 /*
@@ -1237,28 +1255,39 @@ static void rswap_read_batch_work(struct work_struct *work)
  * queue is saturated, the workqueue is unavailable or it refuses the item.
  * The inline path is exactly the previous synchronous behaviour, so swapin
  * always makes forward progress under memory pressure.
+ *
+ * Returns true when the batch was moved here and holds a read slot, which the
+ * submitting task releases after its final reference drop.
  */
-static void rswap_read_dispatch(struct rswap_batch *batch)
+static bool rswap_read_dispatch(struct rswap_batch *batch)
 {
 	struct rswap_read_req *req = batch->req;
+	bool held;
 	int ret;
 
-	if (rswap_read_wq && rswap_read_enter()) {
+	held = rswap_read_enter();
+	if (held && rswap_read_wq) {
 		refcount_inc(&req->refs);
 		INIT_WORK(&batch->work, rswap_read_batch_work);
 		if (queue_work(rswap_read_wq, &batch->work))
-			return;
+			return false;
 		refcount_dec(&req->refs);
-		rswap_read_leave();
+		rswap_read_leave(1);
+		held = false;
 	}
 
+	/*
+	 * Move the batch here instead.  Either the queue was saturated, so no
+	 * slot was taken and read_inflight cannot exceed the bound, or there is
+	 * no workqueue and the slot taken above stays held until the submitter
+	 * dropped its final reference.
+	 */
 	atomic64_inc(&rswap_read_fallbacks);
-	rswap_read_enter_inline();
 	ret = rswap_batch_flush(batch, READ);
-	rswap_read_leave();
-
 	rswap_read_req_error(req, ret);
 	kfree(batch);
+
+	return held;
 }
 
 static int rswap_read_wq_init(void)
@@ -1301,6 +1330,9 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 	struct rswap_batch *batch;
 	struct folio *folio;
 	struct page *page;
+	unsigned int nr_queued = 0;
+	unsigned int nr_inline = 0;
+	unsigned int nr_left;
 	s64 started = ktime_get_ns();
 	unsigned int noio_flags;
 	int ret = 0;
@@ -1343,7 +1375,9 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 				continue;
 
 			batch->req = req;
-			rswap_read_dispatch(batch);
+			nr_queued += batch->nr;
+			if (rswap_read_dispatch(batch))
+				nr_inline++;
 			batch = rswap_batch_alloc(ctx->sis);
 			if (!batch) {
 				ret = -ENOMEM;
@@ -1353,14 +1387,23 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 	}
 	if (batch->nr) {
 		batch->req = req;
-		rswap_read_dispatch(batch);
+		nr_queued += batch->nr;
+		if (rswap_read_dispatch(batch))
+			nr_inline++;
 		batch = NULL;
 	}
 	goto out;
 
 key_error:
-	rswap_stats_key_failure(&rswap_total, READ, ret);
-	rswap_stats_key_failure(batch->si->rswap_stats, READ, ret);
+	/*
+	 * A key error fails the whole request.  The batches already handed to
+	 * the workers account their own pages when they complete, so fail
+	 * everything else: the pages of the batch that was not dispatched, the
+	 * failing page and the pages the loop had not reached yet.
+	 */
+	nr_left = (sio->len >> PAGE_SHIFT) - nr_queued - batch->nr;
+	rswap_stats_key_failure(&rswap_total, READ, ret, nr_left);
+	rswap_stats_key_failure(batch->si->rswap_stats, READ, ret, nr_left);
 	pr_err_ratelimited("read type %u offset %lu failed: %d\n",
 			   ctx->sis->type,
 			   swp_offset(folio_page_swap_entry(folio, page)),
@@ -1374,6 +1417,8 @@ out:
 	atomic64_add(ktime_get_ns() - started, &rswap_read_submit_ns);
 	/* Drop the submitting task's reference; the last batch completes. */
 	rswap_read_req_put(req);
+	/* The request ran; release the slots of the batches moved here. */
+	rswap_read_leave(nr_inline);
 }
 
 static void rswap_submit_write(struct swap_io_ctx *ctx)
