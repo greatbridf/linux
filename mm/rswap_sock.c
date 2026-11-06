@@ -3,15 +3,23 @@
  * mm/rswap_sock.c - TCP transport shared by the rswap KV backends
  *
  * Every rswap backend reaches its key-value store over a plain TCP stream.
- * These helpers create the connection, send a buffer completely, and receive
- * once.  They are deliberately stateless: a backend opens a connection per
- * page operation, so the swap I/O path needs no locks and no connection
- * state of its own.
+ * These helpers create the connection, send a buffer completely, receive once
+ * and move one page image between a folio page and the stream.  They are
+ * deliberately stateless and only own the socket they are given, so the
+ * connection strategy stays with the backend: HTTP/1.0 carries one object per
+ * request and opens a connection for it, Redis pipelines a whole batch into
+ * one round trip and keeps its connections pooled.
+ *
+ * The timeouts are the ones rswap_sock_connect() put on the socket, so every
+ * send and receive below is bounded by the backend's send and receive
+ * timeout.
  */
 
 #define pr_fmt(fmt) "rswap: " fmt
 
+#include <linux/bvec.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/socket.h>
 #include <linux/in.h>
 #include <linux/inet.h>
@@ -121,4 +129,57 @@ int rswap_sock_recv(struct socket *sock, void *buf, size_t len)
 	if (!ret)
 		return -ECONNRESET;
 	return ret;
+}
+
+/*
+ * Send the @len bytes described by @bvecs, looping over short sends.
+ *
+ * iterate_bvec() maps one segment at a time for the duration of a copy, so a
+ * page image is never mapped across the blocking call.
+ */
+int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
+			  unsigned int nr, size_t len)
+{
+	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
+	int ret;
+
+	if (!len)
+		return 0;
+
+	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, bvecs, nr, len);
+	while (iov_iter_count(&msg.msg_iter)) {
+		ret = sock_sendmsg(sock, &msg);
+		if (ret <= 0)
+			return ret ? ret : -EIO;
+	}
+	return 0;
+}
+
+/* Send exactly one page image of @len bytes from @page. */
+int rswap_sock_send_page(struct socket *sock, struct page *page, size_t len)
+{
+	struct bio_vec bv;
+
+	bvec_set_page(&bv, page, len, 0);
+	return rswap_sock_send_bvecs(sock, &bv, 1, len);
+}
+
+/* Receive exactly one page image of @len bytes into @page. */
+int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t len)
+{
+	struct msghdr msg = { };
+	struct bio_vec bv;
+	int ret;
+
+	if (!len)
+		return 0;
+
+	bvec_set_page(&bv, page, len, 0);
+	iov_iter_bvec(&msg.msg_iter, ITER_DEST, &bv, 1, len);
+	while (iov_iter_count(&msg.msg_iter)) {
+		ret = sock_recvmsg(sock, &msg, 0);
+		if (ret <= 0)
+			return ret ? ret : -ECONNRESET;
+	}
+	return 0;
 }
