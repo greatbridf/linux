@@ -37,14 +37,17 @@
  * See mm/rswap_backend.h for the backend interface.
  */
 
-#ifdef CONFIG_RSWAP
+#ifndef _MM_RSWAP_H
+#define _MM_RSWAP_H
 
 #include <linux/types.h>
-
-struct vm_area_struct;
 #include <linux/swap.h>
 
 #include "swap.h"
+
+struct vm_area_struct;
+
+#ifdef CONFIG_RSWAP
 
 #define RSWAP_HASH_LEN 48
 
@@ -137,29 +140,58 @@ static inline bool rswap_vma_needs_hash(struct vm_area_struct *vma)
 
 #else /* !CONFIG_RSWAP */
 
-static inline int  rswap_enable(struct swap_info_struct *si) { return -EOPNOTSUPP; }
-static inline void rswap_disable(struct swap_info_struct *si) { }
-static inline void rswap_swapoff(struct swap_info_struct *si) { }
+static inline int rswap_enable(struct swap_info_struct *si)
+{
+	return -EOPNOTSUPP;
+}
+static inline void rswap_disable(struct swap_info_struct *si)
+{
+}
+static inline void rswap_swapoff(struct swap_info_struct *si)
+{
+}
 static inline void rswap_hash_invalidate(struct swap_info_struct *si,
 					 unsigned long offset,
-					 unsigned int nr_entries) { }
-static inline void rswap_debugfs_add(struct swap_info_struct *si) { }
-static inline void rswap_debugfs_del(struct swap_info_struct *si) { }
+					 unsigned int nr_entries)
+{
+}
+static inline void rswap_debugfs_add(struct swap_info_struct *si)
+{
+}
+static inline void rswap_debugfs_del(struct swap_info_struct *si)
+{
+}
 
-static inline void rswap_prepare_hashes(struct folio *folio, gfp_t gfp) { }
+static inline void rswap_prepare_hashes(struct folio *folio, gfp_t gfp)
+{
+}
 static inline int rswap_attach_prog(unsigned long vaddr, int prog_fd)
 {
 	return -EOPNOTSUPP;
 }
-static inline void rswap_hash_table_free(struct swap_cluster_info *ci) { }
+static inline void rswap_hash_table_free(struct swap_cluster_info *ci)
+{
+}
 static inline void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
-		struct vm_area_struct *vma) { }
+				     struct vm_area_struct *vma)
+{
+}
 static inline void rswap_attach_hash_shmem(struct folio *folio,
-		unsigned long addr, struct vm_area_struct *vma) { }
-static inline void rswap_shmem_move_hashes(struct inode *inode, struct folio *folio) { }
+					   unsigned long addr,
+					   struct vm_area_struct *vma)
+{
+}
+static inline void rswap_shmem_move_hashes(struct inode *inode,
+					   struct folio *folio)
+{
+}
 static inline void rswap_shmem_drop_hashes(struct inode *inode, pgoff_t start,
-		pgoff_t end) { }
-static inline void rswap_shmem_free_hashes(struct inode *inode) { }
+					   pgoff_t end)
+{
+}
+static inline void rswap_shmem_free_hashes(struct inode *inode)
+{
+}
 
 static inline bool rswap_vma_needs_hash(struct vm_area_struct *vma)
 {
@@ -167,3 +199,5 @@ static inline bool rswap_vma_needs_hash(struct vm_area_struct *vma)
 }
 
 #endif /* CONFIG_RSWAP */
+
+#endif /* _MM_RSWAP_H */

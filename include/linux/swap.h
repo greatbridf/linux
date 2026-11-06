@@ -258,7 +258,6 @@ struct swap_info_struct {
 	atomic_long_t		xswap_shrinks;	/* shrink operations so far */
 #endif
 #ifdef CONFIG_RSWAP
-	struct dentry		*rswap_dentry;	/* debugfs directory */
 	u32			*rswap_kv_port;	/* KV server port for debugfs */
 	struct rswap_stats	*rswap_stats;	/* per-device I/O counters */
 #endif /* CONFIG_RSWAP */
