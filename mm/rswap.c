@@ -435,18 +435,25 @@ static struct rswap_hash *rswap_slot_lookup(struct swap_info_struct *si,
 		return NULL;
 
 	ci = __swap_offset_to_cluster(si, offset);
-	table = READ_ONCE(ci->hash_table);
+	/*
+	 * Both pointers are published by rswap_slot_get() with
+	 * cmpxchg_release(), so this side reads them with acquire: a reader that
+	 * observes a slot must also observe the zeroed slot object and the table
+	 * it lives in.
+	 */
+	table = smp_load_acquire(&ci->hash_table);
 	if (!table)
 		return NULL;
 
-	/* Pair with rswap_slot_get(), which publishes the slot. */
+	/* Pair with the slot publication in rswap_slot_get(). */
 	return smp_load_acquire(&table->hashes[offset % SWAPFILE_CLUSTER]);
 }
 
 /*
  * Return the slot of @offset, allocating the table and the slot on demand.
- * Best effort: the callers run in reclaim and must not sleep, so failure only
- * means that this page has no digest yet.
+ * Allocation failure is not fatal: it only means that this page has no digest
+ * slot yet, so @gfp has to fit the caller - the folio allocation path may
+ * sleep (GFP_NOIO), the reclaim paths may not (GFP_NOWAIT).
  */
 static struct rswap_hash *rswap_slot_get(struct swap_info_struct *si,
 					 unsigned long offset, gfp_t gfp)
@@ -462,19 +469,26 @@ static struct rswap_hash *rswap_slot_get(struct swap_info_struct *si,
 	ci = __swap_offset_to_cluster(si, offset);
 	ci_off = offset % SWAPFILE_CLUSTER;
 
-	table = READ_ONCE(ci->hash_table);
+	/* Same pairing as in rswap_slot_lookup(). */
+	table = smp_load_acquire(&ci->hash_table);
 	if (!table) {
 		new_table = kzalloc_obj(*new_table, gfp);
 		if (!new_table)
 			return NULL;
-		table = cmpxchg(&ci->hash_table, NULL, new_table);
+		/*
+		 * cmpxchg() is a relaxed read-modify-write: publishing with
+		 * cmpxchg_release() is what orders the zeroed table before the
+		 * pointer that makes it reachable, and what the acquire loads
+		 * above pair with.
+		 */
+		table = cmpxchg_release(&ci->hash_table, NULL, new_table);
 		if (table)
 			kfree(new_table);
 		else
 			table = new_table;
 	}
 
-	/* Slots are published by cmpxchg, so they must be loaded with acquire. */
+	/* Slots are published by cmpxchg_release() and read acquire here. */
 	slot = smp_load_acquire(&table->hashes[ci_off]);
 	if (slot)
 		return slot;
@@ -483,7 +497,7 @@ static struct rswap_hash *rswap_slot_get(struct swap_info_struct *si,
 	if (!new_slot)
 		return NULL;
 
-	slot = cmpxchg(&table->hashes[ci_off], NULL, new_slot);
+	slot = cmpxchg_release(&table->hashes[ci_off], NULL, new_slot);
 	if (slot) {
 		kfree(new_slot);
 		return slot;
@@ -566,8 +580,13 @@ static int rswap_hash_lookup(struct vm_area_struct *vma, unsigned long addr,
  * Reserve the slots of a folio that just entered the swap cache.  A reserved
  * slot is not valid: it reports "no digest" until rswap_attach_hash() or the
  * legacy page_ext fallback stores one.
+ *
+ * @gfp is the caller's context: folio_alloc_swap() runs while it may still
+ * sleep and passes GFP_NOIO.  A failed reservation is not fatal - writeout
+ * then takes its key from the page_ext fallback - but it does change where the
+ * key comes from, so it is logged instead of passing silently.
  */
-void rswap_prepare_hashes(struct folio *folio)
+void rswap_prepare_hashes(struct folio *folio, gfp_t gfp)
 {
 	struct swap_info_struct *si;
 	unsigned long i;
@@ -581,9 +600,14 @@ void rswap_prepare_hashes(struct folio *folio)
 
 	for (i = 0; i < folio_nr_pages(folio); i++) {
 		swp_entry_t entry = folio_swap_entry(folio, i);
+		unsigned long offset = swp_offset(entry);
 
-		if (!rswap_slot_get(si, swp_offset(entry), GFP_NOWAIT))
-			return;
+		if (rswap_slot_get(si, offset, gfp))
+			continue;
+
+		pr_warn_ratelimited("type %d offset %lu: no digest slot\n",
+				    si->type, offset);
+		return;
 	}
 }
 
@@ -937,8 +961,10 @@ struct rswap_read_req;
 /*
  * One batch of up to RSWAP_BATCH_MAX base page images: the keys they are
  * stored under, the folio pages they belong to and, for swapin, the work item
- * that moves them.  Too big for the stack, so it is kvmalloc'ed for the
- * duration of the batch.
+ * that moves them.  The page images never pass through the batch: a backend
+ * moves them between the remote store and the folio pages @pages[].page names,
+ * so a batch only carries bookkeeping.  Too big for the stack, so it is
+ * allocated for the duration of the batch.
  *
  * A batch belongs to one asynchronous read request while it is queued or
  * running in a worker (@req is NULL on the synchronous write path).  The
@@ -953,19 +979,16 @@ struct rswap_batch {
 	struct work_struct	work;
 	char			keys[RSWAP_BATCH_MAX][RSWAP_KV_KEY_LEN];
 	struct rswap_kv_page	pages[RSWAP_BATCH_MAX];
-	char			data[] __aligned(PAGE_SIZE);
 };
 
 static struct rswap_batch *rswap_batch_alloc(struct swap_info_struct *si)
 {
 	struct rswap_batch *batch;
 
-	batch = kvmalloc(struct_size(batch, data, RSWAP_BATCH_MAX * PAGE_SIZE),
-			 GFP_NOIO);
+	batch = kzalloc_obj(*batch, GFP_NOIO);
 	if (unlikely(!batch))
 		return NULL;
 
-	batch->nr = 0;
 	batch->si = si;
 
 	return batch;
@@ -1075,7 +1098,7 @@ key_error:
 			   swp_offset(folio_page_swap_entry(folio, page)),
 			   ret);
 out:
-	kvfree(batch);
+	kfree(batch);
 	memalloc_noio_restore(noio_flags);
 	sio->iocb.ki_complete(&sio->iocb, ret < 0 ? ret : sio->len);
 }
@@ -1083,10 +1106,10 @@ out:
 /* ---------- asynchronous swapin ---------- */
 
 /*
- * How many read batches may be outstanding at once.  Each one holds its
- * bounce buffer (RSWAP_BATCH_MAX pages: 128 KiB with 4 KiB pages, 512 KiB
- * with 16 KiB pages) and pins the folios it fills, so this bound is what
- * keeps the transient read memory at 1-4 MiB.  Eight matches
+ * How many read batches may be outstanding at once.  A batch is bookkeeping
+ * only - RSWAP_BATCH_MAX keys and one struct rswap_kv_page per page, a few
+ * KiB - so what this bound really limits is the folios a queued batch pins
+ * until its remote reads finished.  Eight matches
  * RSWAP_REDIS_POOL_MAX: a ninth concurrent batch would only wait for a pooled
  * connection, and the measured WILLNEED throughput of the remote Redis test
  * server stopped improving beyond eight concurrent batches (22.5 MiB/s with
@@ -1204,7 +1227,7 @@ static void rswap_read_batch_work(struct work_struct *work)
 	memalloc_noio_restore(noio_flags);
 
 	rswap_read_req_error(req, ret);
-	kvfree(batch);
+	kfree(batch);
 	rswap_read_req_put(req);
 	rswap_read_leave();
 }
@@ -1235,7 +1258,7 @@ static void rswap_read_dispatch(struct rswap_batch *batch)
 	rswap_read_leave();
 
 	rswap_read_req_error(req, ret);
-	kvfree(batch);
+	kfree(batch);
 }
 
 static int rswap_read_wq_init(void)
@@ -1266,7 +1289,7 @@ static int rswap_read_wq_init(void)
  * of the request finished, i.e. through the normal asynchronous swapin
  * lifecycle.
  *
- * Batch buffers are kvmalloc'ed under GFP_NOIO one batch at a time, so the
+ * Batch bookkeeping is kzalloc'ed under GFP_NOIO one batch at a time, so the
  * submitter never needs memory for the whole request.  When even that fails,
  * or no batch slot is free, the batch is moved right here.
  */
@@ -1345,7 +1368,7 @@ key_error:
 out_error:
 	rswap_read_req_error(req, ret);
 out:
-	kvfree(batch);
+	kfree(batch);
 	memalloc_noio_restore(noio_flags);
 	atomic64_inc(&rswap_read_submits);
 	atomic64_add(ktime_get_ns() - started, &rswap_read_submit_ns);

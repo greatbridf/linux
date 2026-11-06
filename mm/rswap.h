@@ -101,7 +101,7 @@ void rswap_debugfs_del(struct swap_info_struct *si);
 /* ---------- Hash slots (called from swapfile.c) ---------- */
 
 /* Allocate the slots of a folio that just entered the swap cache. */
-void rswap_prepare_hashes(struct folio *folio);
+void rswap_prepare_hashes(struct folio *folio, gfp_t gfp);
 /* Free the table of a cluster that is being released. */
 void rswap_hash_table_free(struct swap_cluster_info *ci);
 
@@ -146,7 +146,7 @@ static inline void rswap_hash_invalidate(struct swap_info_struct *si,
 static inline void rswap_debugfs_add(struct swap_info_struct *si) { }
 static inline void rswap_debugfs_del(struct swap_info_struct *si) { }
 
-static inline void rswap_prepare_hashes(struct folio *folio) { }
+static inline void rswap_prepare_hashes(struct folio *folio, gfp_t gfp) { }
 static inline int rswap_attach_prog(unsigned long vaddr, int prog_fd)
 {
 	return -EOPNOTSUPP;

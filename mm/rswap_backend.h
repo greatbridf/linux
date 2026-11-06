@@ -27,10 +27,10 @@ struct socket;
 /*
  * Most pages the core hands to one ->store()/->load() call.  A swap request
  * carries up to SWAP_CLUSTER_MAX pages; batching them lets a backend pay one
- * round trip for several pages, and the core's bounce buffer stays bounded.
- * One page costs only a fraction of a round trip, so a full 32 page batch is
- * one request; the buffer it needs is 128 KiB with 4 KiB pages and 512 KiB
- * with 16 KiB pages, allocated per in-flight request.
+ * round trip for several pages.  One page costs only a fraction of a round
+ * trip, so a full 32 page batch is one request; the pages travel between the
+ * folio pages and the store directly, so the batch carries only the keys and
+ * one struct rswap_kv_page per page.
  */
 #define RSWAP_BATCH_MAX		32
 

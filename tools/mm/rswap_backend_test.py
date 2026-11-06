@@ -698,6 +698,7 @@ HASH_SHIMS = r"""
 #define smp_load_acquire(ptr) __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
 #define READ_ONCE(x) (x)
 #define cmpxchg(ptr, old, new) __sync_val_compare_and_swap((ptr), (old), (new))
+#define cmpxchg_release(ptr, old, new) cmpxchg((ptr), (old), (new))
 #define kzalloc_obj(obj, gfp) calloc(1, sizeof(obj))
 #define kfree(ptr) free(ptr)
 typedef struct { unsigned long val; } swp_entry_t;
