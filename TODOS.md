@@ -124,6 +124,28 @@ All six runs started with 32,768/32,768 pages nonresident, read exactly
 remote reads during verification. No measured read errors or Redis retries
 occurred. These are individual runs, not a proof of physical link capacity.
 
+## Write throughput is bounded by batch size and in-flight depth (L4)
+
+Deferred from the live findings (L4 in `REVIEW-FINDINGS.md`), not a defect.
+
+The live DeepSeek run moved 2909 pages (46.5 MiB) out at 22.8 ms per 32-page
+batch, i.e. ~22 MB/s (`written_pages` 16963 -> 19872, visible in `MONITOR` and
+in the backend counters). At that rate a 32k-token DeepSeek prefill (~10 GiB)
+needs about eight minutes to spill.
+
+- The knobs are `RSWAP_BATCH_MAX` (32), `RSWAP_READ_MAX_INFLIGHT` (8) and
+  `RSWAP_REDIS_POOL_MAX`, all compile-time constants. The connection pool
+  semaphore is shared by the read queue and writeout, so raising the read depth
+  alone does not give writeout more concurrent connections.
+- Raising them is a measurement exercise, not a bug fix: it needs the same
+  pageout test at two settings (`tools/mm/rswap_pageout_test.py`, base pages and
+  `--huge`), and every queued batch costs transient memory for its pinned
+  folios.
+- Trigger note from the same run: `memory.reclaim` is what reaches vmscan and
+  makes writeout happen. A plain `MADV_PAGEOUT` over the mapping writes nothing,
+  whether it is issued from the worker side or the service side, which is why
+  the live runners bound the verifier with a cgroup.
+
 ## What the November 2026 review series changed
 
 The series from `e19c7859301a` to `864af43d0c7a` fixed every BLOCKER and MAJOR

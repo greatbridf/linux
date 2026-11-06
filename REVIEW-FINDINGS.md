@@ -416,9 +416,13 @@ wrote nothing). The run moved real data: `written_pages` 16963 → 19872
 
 Status legend as above: `open`, `fixed` (commit listed), `deferred`, `invalid`.
 
+Status after this series: L1, L2 (including L2b) and L3 are fixed by
+`97e9ae0f0740`, `0ea1b0df34a8`, `007581174afe` and `b7f34046608e`; L4 is
+`deferred` and its numbers are recorded in `TODOS.md`.
+
 ### L1 — A transient `-EINTR` on connect kills the read, and nothing retries it
 
-`open`.
+`fixed` — `97e9ae0f0740` (transport) and `0ea1b0df34a8` (core).
 
 `rswap_sock_connect()` passes `kernel_connect()`'s return value straight out as
 `ERR_PTR(ret)` (`mm/rswap_sock.c:43-50`), so a signal delivered during the
@@ -445,11 +449,24 @@ Fix: retry `-EINTR` (and the other restartable errno) inside the transport,
 give the read path a bounded retry for transient transport failures, and count
 it. `EINTR` must not be treated as "the store is broken".
 
+What the series does: `rswap_sock_connect()`, `rswap_sock_send()`,
+`rswap_sock_send_bvecs()` and `rswap_sock_recv_page()` retry a syscall that a
+signal interrupted as long as the request deadline allows it, so `-EINTR` no
+longer escapes for a signal; and `rswap_flush_batch()` moves a read batch again
+up to `RSWAP_READ_MAX_RETRIES` (2) times when `rswap_read_retryable()` calls the
+error transient (`-EINTR`, `-ETIMEDOUT`, `-ECONNRESET`, `-ECONNREFUSED`,
+`-ECONNABORTED`, `-EPIPE`, `-ENETUNREACH`, `-EHOSTUNREACH`, `-ENETDOWN`,
+`-EAGAIN`), counting each retry in `read_retries`. Writeout stays single
+attempt, `-ENOENT`/`-EIO`/`-EMSGSIZE`/`-EACCES`/`-ENOMEM`/`-EINVAL`/`-EPROTO`
+are answers and are not repeated, and `tools/mm/rswap_backend_test.py` now
+compiles the real classifier and loop to check the list, the attempt bound and
+the counter.
+
 ### L2 — A failed swapin is fatal to the task that touches the page
 
 `fixed` — `97e9ae0f0740` and `0ea1b0df34a8` (bounded read retries) plus the
-L2b commit of this series, `mm: rswap: keep a failed swapin local to the
-accessing task`.
+L2b commit of this series, `007581174afe` (`mm: rswap: keep a failed swapin
+local to the accessing task`).
 
 On failure `swap_read_end()` (`mm/page_io.c:584-600`) neither marks the folio
 uptodate nor in error, so `do_swap_page()` takes the `!folio_test_uptodate()`
@@ -482,7 +499,7 @@ prefix, one rate-limited line per batch instead of one per page.
 
 ### L3 — The backend timeouts cannot be changed at runtime
 
-`open`.
+`fixed` — `b7f34046608e`.
 
 `send_timeout_ms` and `recv_timeout_ms` are `0444` module parameters
 (`mm/rswap.c:116-122`), so root gets `EACCES` writing them and the only way to
@@ -496,9 +513,18 @@ Fix: make exactly those two writable with range validation, leave `backend`,
 select the store for a device that may already hold data), and document which
 is which.
 
+The fix also removed the boot-time caching that would have made a writable
+parameter useless: both backends ask `rswap_kv_send_timeout()` /
+`rswap_kv_recv_timeout()` per request, so a write applies to requests started
+afterwards, an in-flight batch keeps its budget and a pooled Redis socket keeps
+the timeouts it was opened with. Both parameters are `0644` and reject a
+non-numeric value or anything above `RSWAP_TIMEOUT_MAX_MS` (60000) with
+`-EINVAL`; zero still means "the backend default". The remaining six stay
+`0444` and are documented as boot-only in `AGENTS.md`.
+
 ### L4 — Write throughput is bounded by batch size and in-flight depth
 
-`deferred`, not a defect.
+`deferred`, not a defect. Recorded in `TODOS.md` with the measured numbers.
 
 22 MB/s means a 32k-token DeepSeek prefill (~10 GiB) needs about eight minutes
 to spill. `RSWAP_BATCH_MAX` (32) and `RSWAP_READ_MAX_INFLIGHT` (8)

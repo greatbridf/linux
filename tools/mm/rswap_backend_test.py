@@ -144,7 +144,7 @@ static struct rswap_stats rswap_total, rswap_write_io, rswap_read_io;
 static struct rswap_stats device_stats;
 static struct {
     unsigned int pages_written, pages_read, errors_written, errors_read;
-    unsigned int no_digest, no_entry, batches;
+    unsigned int no_digest, no_entry, batches, retries;
     unsigned int dev_pages_written, dev_pages_read, dev_errors_read;
 } counted;
 struct swap_info_struct {
@@ -157,6 +157,12 @@ static struct swap_info_struct swap_info_stub = { .rswap_stats = &device_stats }
 static void rswap_stats_io(struct rswap_stats *io, int64_t ns)
 {
     counted.batches++;
+}
+#define cond_resched() do { } while (0)
+static void rswap_stats_retry(struct rswap_stats *stats)
+{
+    if (stats)
+        counted.retries++;
 }
 static void rswap_stats_pages(struct rswap_stats *stats, int rw,
                               unsigned int pages)
@@ -355,10 +361,14 @@ static int kstrtoul(const char *text, unsigned int base, unsigned long *out)
     *out = strtoul(text, &end, base);
     return errno || end == text || *end ? -EINVAL : 0;
 }
-static int rswap_sock_recv(struct socket *sock, char *buf, int len)
+static int rswap_sock_recv(struct socket *sock, void *buf, size_t len,
+                           unsigned long deadline)
 {
     size_t available = response_size - response_offset;
     size_t count = min_t(size_t, available, len);
+
+    if (rswap_sock_expired(deadline))
+        return -ETIMEDOUT;
     count = min_t(size_t, count, 37);
     if (!count)
         return response_error;
@@ -378,7 +388,7 @@ static int rswap_sock_recv_page(struct socket *sock, struct page *page,
         return -ETIMEDOUT;
     while (done < len) {
         ret = rswap_sock_recv(sock, (char *)page->data + off + done,
-                              len - done);
+                              len - done, deadline);
         if (ret <= 0)
             return ret ? ret : -EIO;
         done += ret;
@@ -713,6 +723,11 @@ int main(void)
                counted.dev_errors_read);
         return 1;
     }
+    /* A missing object is an answer about the store, not a transient error. */
+    if (counted.retries) {
+        printf("FAIL: %u retry(s) after a missing object\n", counted.retries);
+        return 1;
+    }
     /* Every request completed once and released its queue slot. */
     if (atomic_read(&rswap_read_inflight) ||
         atomic64_read(&rswap_read_fallbacks) ||
@@ -735,6 +750,209 @@ int main(void)
     }
     puts("PASS: actual submit paths batch pages and preserve addressing/errors");
     return 0;
+}
+"""
+
+RETRY_SHIMS = r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#define PAGE_SIZE 4096
+#define WRITE 1
+#define READ 0
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+#define ktime_get_ns() ((s64)0)
+#define cond_resched() do { } while (0)
+typedef int64_t s64;
+struct page { int unused; };
+struct rswap_kv_page {
+    const char *key;
+    struct page *page;
+};
+struct rswap_stats { int unused; };
+struct rswap_io_stats { int unused; };
+static struct rswap_stats rswap_total, device_stats;
+static struct rswap_io_stats rswap_write_io, rswap_read_io;
+/*
+ * The scripted backend: script[] lists the errno of each attempt in order and
+ * its last entry repeats, so { -EINTR, -EINTR } is a store that stays down and
+ * { -EINTR, 0 } is one that recovers on the second attempt.
+ */
+static int script[4];
+static unsigned int script_len = 1;
+static unsigned int attempts, timed_batches;
+static unsigned long total_retries, device_retries;
+static unsigned int pages_moved, pages_failed;
+static void reset_script(int last)
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_LEN(script); i++)
+        script[i] = last;
+    script_len = 1;
+    attempts = timed_batches = 0;
+    total_retries = device_retries = 0;
+    pages_moved = pages_failed = 0;
+}
+static int rswap_submit_batch(struct rswap_kv_page *pages, unsigned int nr,
+                              int rw)
+{
+    unsigned int i = attempts < script_len ? attempts : script_len - 1;
+
+    attempts++;
+    return script[i < ARRAY_LEN(script) ? i : ARRAY_LEN(script) - 1];
+}
+static void rswap_stats_io(struct rswap_io_stats *io, s64 ns)
+{
+    timed_batches++;
+}
+/* Pages and errors are accounted per page in the total and per device. */
+static void rswap_stats_pages(struct rswap_stats *stats, int rw,
+                              unsigned int pages)
+{
+    if (stats == &rswap_total)
+        pages_moved += pages;
+}
+static void rswap_stats_errors(struct rswap_stats *stats, int rw,
+                               unsigned int pages)
+{
+    if (stats == &rswap_total)
+        pages_failed += pages;
+}
+/* Both counter blocks are told about a retry, one increment each. */
+static void rswap_stats_retry(struct rswap_stats *stats)
+{
+    if (stats == &rswap_total)
+        total_retries++;
+    else if (stats == &device_stats)
+        device_retries++;
+}
+"""
+
+RETRY_MAIN = r"""
+static const int retryable[] = {
+    -EINTR, -ETIMEDOUT, -ECONNRESET, -ECONNREFUSED, -ECONNABORTED,
+    -EPIPE, -ENETUNREACH, -EHOSTUNREACH, -ENETDOWN, -EAGAIN,
+};
+static const int not_retryable[] = {
+    -ENOENT, -ENODATA, -EIO, -EMSGSIZE, -EACCES, -ENOMEM, -EINVAL, -EPROTO,
+};
+
+int main(void)
+{
+    struct rswap_kv_page pages[2] = { { .key = "aa" }, { .key = "bb" } };
+    unsigned int i, failures = 0;
+
+    /*
+     * The documented bound: a read batch gets two retries, i.e. at most three
+     * attempts.  Raising it is a documented behaviour change, not a tweak.
+     */
+    if (RSWAP_READ_MAX_RETRIES != 2) {
+        printf("FAIL: read retries bound is %d, AGENTS.md documents two\n",
+               RSWAP_READ_MAX_RETRIES);
+        failures++;
+    }
+
+    /* Every transient transport failure is retried, up to the bound. */
+    for (i = 0; i < ARRAY_LEN(retryable); i++) {
+        int err = retryable[i];
+
+        if (!rswap_read_retryable(err)) {
+            printf("FAIL: errno %d is not retried on the read path\n", err);
+            failures++;
+            continue;
+        }
+        /* A store that stays down is attempted three times, not forever. */
+        reset_script(err);
+        script_len = 2;
+        if (rswap_flush_batch(pages, &device_stats, 2, READ) != err ||
+            attempts != RSWAP_READ_MAX_RETRIES + 1 ||
+            total_retries != RSWAP_READ_MAX_RETRIES ||
+            device_retries != RSWAP_READ_MAX_RETRIES ||
+            timed_batches != RSWAP_READ_MAX_RETRIES + 1 ||
+            pages_moved || pages_failed != 2) {
+            printf("FAIL: errno %d: %u attempt(s), %lu/%lu retry(s), "
+                   "%u moved, %u failed\n", err, attempts, total_retries,
+                   device_retries, pages_moved, pages_failed);
+            failures++;
+        }
+        /* One retry is enough when the second attempt works. */
+        reset_script(err);
+        script[1] = 0;
+        script_len = 2;
+        if (rswap_flush_batch(pages, &device_stats, 2, READ) ||
+            attempts != 2 || total_retries != 1 || device_retries != 1 ||
+            pages_moved != 2 || pages_failed) {
+            printf("FAIL: errno %d healed on attempt two: %u attempt(s), "
+                   "%lu/%lu retry(s), %u moved, %u failed\n", err, attempts,
+                   total_retries, device_retries, pages_moved, pages_failed);
+            failures++;
+        }
+        /* ... and the last allowed retry still returns success. */
+        reset_script(err);
+        script[RSWAP_READ_MAX_RETRIES] = 0;
+        script_len = RSWAP_READ_MAX_RETRIES + 1;
+        if (rswap_flush_batch(pages, &device_stats, 2, READ) ||
+            attempts != RSWAP_READ_MAX_RETRIES + 1 ||
+            total_retries != RSWAP_READ_MAX_RETRIES ||
+            device_retries != RSWAP_READ_MAX_RETRIES ||
+            pages_moved != 2 || pages_failed) {
+            printf("FAIL: errno %d healed on attempt three: %u attempt(s), "
+                   "%lu/%lu retry(s), %u moved, %u failed\n", err, attempts,
+                   total_retries, device_retries, pages_moved, pages_failed);
+            failures++;
+        }
+    }
+
+    /* An answer about the request or the store is reported, never repeated. */
+    for (i = 0; i < ARRAY_LEN(not_retryable); i++) {
+        int err = not_retryable[i];
+
+        if (rswap_read_retryable(err)) {
+            printf("FAIL: errno %d repeated as if it were transient\n", err);
+            failures++;
+            continue;
+        }
+        reset_script(err);
+        if (rswap_flush_batch(pages, &device_stats, 2, READ) != err ||
+            attempts != 1 || total_retries || device_retries ||
+            pages_moved || pages_failed != 2) {
+            printf("FAIL: errno %d: %u attempt(s), %lu/%lu retry(s), "
+                   "%u moved, %u failed\n", err, attempts, total_retries,
+                   device_retries, pages_moved, pages_failed);
+            failures++;
+        }
+    }
+
+    /*
+     * Writeout stays single attempt even for a transient failure: reclaim
+     * keeps the folio resident and drives the page again itself.
+     */
+    reset_script(-EINTR);
+    if (rswap_flush_batch(pages, &device_stats, 2, WRITE) != -EINTR ||
+        attempts != 1 || total_retries || device_retries ||
+        pages_moved || pages_failed != 2) {
+        printf("FAIL: writeout made %u attempt(s) and %lu/%lu retry(s)\n",
+               attempts, total_retries, device_retries);
+        failures++;
+    }
+    reset_script(-EINTR);
+    script[1] = 0;
+    script_len = 2;
+    if (rswap_flush_batch(pages, &device_stats, 2, WRITE) != -EINTR ||
+        attempts != 1 || total_retries || device_retries) {
+        printf("FAIL: writeout retried a failure on %u attempt(s)\n",
+               attempts);
+        failures++;
+    }
+
+    if (!failures)
+        puts("PASS: actual read retry policy repeats transient transport "
+             "failures only, three attempts at most, writeout once");
+    return !!failures;
 }
 """
 
@@ -807,6 +1025,15 @@ int main(void)
         failures++;
     }
     assert(atomic64_read(&rswap_read_io.batches) == 0);
+
+    /* One retry of a read batch is one increment; no retry, no increment. */
+    rswap_stats_retry(&stats);
+    rswap_stats_retry(&stats);
+    rswap_stats_retry(NULL);
+    if (atomic64_read(&stats.read_retries) != 2) {
+        puts("FAIL: retries are not counted once per retry");
+        failures++;
+    }
 
     if (!failures)
         puts("PASS: actual counters account pages, failures and peak time");
@@ -1243,6 +1470,12 @@ def main():
                       "mm/rswap.c: rswap_page_key")
     hashes += extract(source, "void rswap_hash_invalidate(", "int rswap_enable(",
                       "mm/rswap.c: rswap_hash_invalidate")
+    retry = extract(source, "/*\n * How many times a read batch",
+                    "/*\n * Flush one batch:",
+                    "mm/rswap.c: read retry policy")
+    retry += extract(source, "static int rswap_flush_batch(",
+                     "struct rswap_read_req;",
+                     "mm/rswap.c: rswap_flush_batch")
     free = extract(swapfile, "static void swap_range_free(",
                    "static bool get_swap_device_info(",
                    "mm/swapfile.c: swap_range_free")
@@ -1252,6 +1485,7 @@ def main():
     snippets = {
         "response": SHIMS + response + PARSER_MAIN,
         "folio": SHIMS + submit + BACKEND_MAIN,
+        "retry": RETRY_SHIMS + retry + RETRY_MAIN,
         "hashes": HASH_SHIMS + hashes + HASH_MAIN,
         "free": FREE_SHIMS + free + FREE_MAIN,
         "stats": STATS_SHIMS + stats + STATS_MAIN,

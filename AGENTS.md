@@ -150,6 +150,57 @@ worker, so they are real remote batch latency. `read_inflight`,
 performance test separates `SUBMITTED` from `LOADED` for the same reason:
 only `LOADED` means the remote reads finished.
 
+### Read retry policy
+
+A read batch is retried in `rswap_flush_batch()`; a write batch is not.
+
+- Retried errno, i.e. failures a later attempt can plausibly survive:
+  `-EINTR`, `-ETIMEDOUT`, `-ECONNRESET`, `-ECONNREFUSED`, `-ECONNABORTED`,
+  `-EPIPE`, `-ENETUNREACH`, `-EHOSTUNREACH`, `-ENETDOWN`, `-EAGAIN`.
+  `rswap_read_retryable()` is the only place that decides this.
+- Not retried, because they answer for the request or the store rather than for
+  this attempt: `-ENOENT`, `-ENODATA`, `-EIO`, `-EMSGSIZE`, `-EACCES`,
+  `-ENOMEM`, `-EINVAL`, `-EPROTO`. Repeating them would only delay the fault
+  that reports the real cause.
+- `RSWAP_READ_MAX_RETRIES` (2) bounds a batch to three attempts, so a dead
+  store costs three round trips of the same budget rather than a stall, and a
+  fault that waits for the batch waits for all of them. Each retry costs one
+  `cond_resched()` and one increment of `read_retries` in both the total and the
+  device counter block; a first-attempt failure that is not retried does not
+  increment it.
+- A batch is idempotent, because a page store answers every read with the same
+  object, so the whole batch is moved again and not just the pages an earlier
+  attempt had not reached. Attempts are counted and timed as backend calls;
+  pages and errors are accounted once, from the final outcome.
+- Writeout is deliberately single attempt: reclaim keeps the folio resident and
+  writes the page again itself, so a retry there would only lengthen the stall
+  in the reclaim path.
+
+The transport already retries a syscall interrupted by a signal (`-EINTR`)
+inside the request budget, so this layer only sees failures that survived
+that. `redis_retries` counts the backend's own retry on a fresh connection,
+which is a separate, inner policy.
+
+### Failed swapin
+
+A swapin that fails after the retries is not fatal to the system and never
+returns a zero page:
+
+- `swap_read_end()` neither marks the folio uptodate nor keeps it locked, and
+  `do_swap_page()` then fails its own `!folio_test_uptodate()` check with
+  `VM_FAULT_SIGBUS` without installing a PTE. The accessing task gets `SIGBUS`;
+  nothing else does.
+- A repeated access finds the same folio in the swap cache and is not read
+  again, so it fails the same way at no remote cost.
+- Readahead only queues neighbours and drops its reference, so it never hands
+  contents to a fault. Shmem fails with `-EIO` and poisons the entry; swapoff
+  installs a poisoned entry.
+- There is no folio error bit to set: `PG_error` was removed upstream, so the
+  state `swap_read_end()` leaves *is* the failure marker.
+- The failure is logged once per batch, rate limited, naming the swap type, the
+  first offset of the batch, the page count and the key prefix, so the object
+  can be found in the store.
+
 ### Endpoint and build scope
 
 - The endpoint is a boot parameter; the defaults are `127.0.0.1:6789` (HTTP)
@@ -441,7 +492,7 @@ swap fault
 - `tools/mm/rswap_swapin_test.c` / `.py` / `.rst`: separate cold swapin
   benchmark comparing WILLNEED with page faults and multiple reader threads.
 - `tools/mm/rswap_backend_test.py`: source-level regressions for the digest
-  slot, the key path, batching, counters and the response parser.
+  slot, the key path, batching, retry policy, counters and the response parser.
 - `tools/mm/rswap_redis_test.py`: RESP client test against a scripted server,
   plus `--live` against a real Redis server.
 - `tools/mm/kvswap_test.py`: HTTP protocol regression tests.
@@ -524,9 +575,12 @@ read_submit_avg_ns     210000
 created, `read_fallbacks` batches that had to be moved in the submitting task
 (no free queue slot or no workqueue), `read_submits` read requests queued and
 `read_submit_avg_ns` the average time a submission spent before returning to
-the caller. A request that finds no memory for its queue bookkeeping at all
-runs the previous synchronous path inside `rswap_submit()` instead and shows
-up only in `read_pages`/`read_batches`. `read_batches` and `read_avg_ns` still count
+the caller. `read_retries` counts read batches moved again after a transient
+transport failure (see "Read retry policy"); it is printed with the page
+counters, between `read_no_entry` and `read_avg_ns`. A request that finds no
+memory for its queue bookkeeping at all runs the previous synchronous path
+inside `rswap_submit()` instead and shows up only in
+`read_pages`/`read_batches`. `read_batches` and `read_avg_ns` still count
 and time the backend calls themselves, now from the worker.
 
 Backends may add their own lines at the end of `stats`; the Redis backend
@@ -851,6 +905,18 @@ are not backend transport failures or evidence of a fallback path.
   throughput. A backend switch needs a reboot, and the backend for a device is
   never recorded, so a device written with one backend cannot be read back
   with another.
+- Read throughput is bounded by the batch size and the in-flight depth, both
+  compile-time constants: a live run reached ~22 MB/s, i.e. roughly eight
+  minutes for a 32k-token DeepSeek prefill (~10 GiB) to spill, at 22.8 ms per
+  32-page batch. The Redis connection pool semaphore is shared with writeout,
+  so a saturated read queue delays reclaim-context writeout by one remote
+  batch. Raising either number is a measurement exercise, not a bug fix; it
+  costs transient memory per queued batch.
+- A transient failure of a read batch is retried twice per batch and then
+  reported, so a store that stays down costs three round trips (three request
+  budgets) per batch before the fault. Reclaim retries the page instead:
+  writeout is never retried by the core, because `-ENODATA`/`-EIO` there just
+  leaves the folio resident for the next reclaim pass.
 - A batch holds only bookkeeping: `RSWAP_BATCH_MAX` keys of `RSWAP_KV_KEY_LEN`
   bytes plus one `struct rswap_kv_page` per page, so a few KiB per batch and
   one pinned folio per page. Neither backend copies a page image: the bytes
