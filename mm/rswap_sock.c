@@ -160,8 +160,14 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 		return ERR_PTR(ret);
 	}
 
-	/* The connection is up: from here on only the send timeout applies. */
-	sock_set_sndtimeo(sock->sk, send_timeo);
+	/*
+	 * The connection is up: from here on only the send timeout applies.
+	 * sk_sndtimeo is in jiffies, like sk_rcvtimeo above, so write it
+	 * directly.  sock_set_sndtimeo() (net/core/sock.c) takes its argument
+	 * in seconds and multiplies it by HZ, which would stretch every send
+	 * timeout here by a factor of HZ.
+	 */
+	WRITE_ONCE(sock->sk->sk_sndtimeo, send_timeo);
 
 	return sock;
 }

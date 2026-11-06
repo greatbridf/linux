@@ -27,7 +27,14 @@
 #define RSWAP_HTTP_DEFAULT_HOST		"127.0.0.1"
 #define RSWAP_HTTP_DEFAULT_PORT		6789
 #define RSWAP_HTTP_CONNECT_TIMEOUT_MS	1000
-#define RSWAP_HTTP_SEND_TIMEOUT_MS	20
+/*
+ * How long one send may block before it fails with -EAGAIN.  1 s, because the
+ * first 128 KiB batch on a cold remote path costs about 45 ms, so a healthy
+ * endpoint must not be failed by a single slow send; the real bound on a
+ * request is rswap_http_deadline(), which budgets connect, send and both
+ * receives.
+ */
+#define RSWAP_HTTP_SEND_TIMEOUT_MS	1000
 #define RSWAP_HTTP_RECV_TIMEOUT_MS	1000
 #define RSWAP_HTTP_MAX_HEADER		2048
 
