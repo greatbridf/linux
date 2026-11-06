@@ -13,7 +13,7 @@ pointer table; keys are 96 hex characters (`mm/rswap.c:77`), not the documented
 the code.
 
 Status legend: `open`, `fixed` (commit listed), `deferred` (accepted, not in
-this pass).
+this pass), `invalid` (raised by the review, disproved against the tree).
 
 ## BLOCKER
 
@@ -158,12 +158,25 @@ per syscall: HTTP up to 2047 calls at `recv_timeout_ms` (default 1000 ms,
 slow peer pins a read worker, its locked folios and an inflight slot for
 minutes, and reclaim-context writeout queues behind it.
 
-### M4 — Upstream `SWP_SYNCHRONOUS_IO` readahead suppression is gone
+### M4 — Upstream `SWP_SYNCHRONOUS_IO` readahead suppression is gone (invalid)
 
-`open`. `mm/swap_state.c:897-903,999-1005` now skip readahead only when
-`(si->flags & SWP_XSWAP) && !(si->flags & SWP_RSWAP)`. `SWP_SYNCHRONOUS_IO` no
-longer appears in the file, so `swapoff` of zram/brd/pmem devices readaheads
-where upstream did not.
+`invalid`. Not a defect. The report was that upstream suppressed readahead for
+synchronous devices in `mm/swap_state.c` and that the rswap change removed that
+test. No upstream tree ever had such a test: `SWP_SYNCHRONOUS_IO` occurs zero
+times in `mm/swap_state.c` in v6.0, v6.6, v6.12, v6.15 and v7.0, and
+`git log --all -S SWP_SYNCHRONOUS_IO -- mm/swap_state.c` is empty. The line the
+rswap change refines is the xswap skip added by `d357fd9bf6a6` ("mm: xswap
+support for zswap"). Upstream suppresses readahead for a synchronous device in
+the callers instead, and both are intact here: `do_swap_page()` bypasses
+`swapin_readahead()` under `SWP_SYNCHRONOUS_IO` (`mm/memory.c:5034-5040`) and
+shmem takes `shmem_swap_alloc_folio()` instead of `shmem_swapin_cluster()`
+(`mm/shmem.c:2516`). rswap and xswap devices have no `si->bdev`, so they never
+set `SWP_SYNCHRONOUS_IO` (`mm/swapfile.c:5011-5012`).
+
+Conclusion: the xswap-only skip in `mm/swap_state.c:897-903,999-1005` keeps
+`try_to_unuse()` readaheading synchronous devices exactly as upstream does, and
+the only rswap-attributable behaviour change there is enabling readahead for
+`SWP_RSWAP` entries, which is intended.
 
 ### M5 — "At least one backend" is not enforced
 
@@ -328,6 +341,9 @@ too.
   runs after `__folio_migrate_mapping()` and before the source folio is freed.
 - `CONFIG_RSWAP=n` stubs exist for every hook, and requests never mix devices
   because `swap_can_merge()` refuses a differing `si`.
+- Upstream's synchronous-device readahead suppression is untouched (M4):
+  `do_swap_page()` and shmem still bypass readahead for `SWP_SYNCHRONOUS_IO`,
+  which `mm/swap_state.c` never tested.
 - RESP and HTTP parsing are strict (`$-1` → `-ENOENT`, non-page-size →
   `-EMSGSIZE`, `NOAUTH`/`WRONGPASS` → `-EACCES`, `Content-Length` required and
   compared), pipelining and partial I/O are handled, and retry-once is
