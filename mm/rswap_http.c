@@ -15,6 +15,7 @@
 #define pr_fmt(fmt) "rswap: " fmt
 
 #include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/kstrtox.h>
@@ -60,9 +61,9 @@ static int rswap_http_get(struct socket *sock, const char *key)
 	return rswap_sock_send(sock, req, ret);
 }
 
-/* Build and send an HTTP POST request carrying @len bytes of page data. */
+/* Build and send an HTTP POST request carrying the page image @page. */
 static int rswap_http_post(struct socket *sock, const char *key,
-			   const void *data, size_t len)
+			   struct page *page, size_t len)
 {
 	char hdr[512];
 	int hlen;
@@ -82,19 +83,19 @@ static int rswap_http_post(struct socket *sock, const char *key,
 	ret = rswap_sock_send(sock, hdr, hlen);
 	if (ret)
 		return ret;
-	return rswap_sock_send(sock, data, len);
+	return rswap_sock_send_page(sock, page, len);
 }
 
 /* ---------- Response parsing ---------- */
 
 /*
- * Parse the HTTP response.  Extracts the status code and,
- * for GET requests, copies the body into @data.
+ * Parse the HTTP response.  Extracts the status code and, for GET requests,
+ * reads the body straight into the page image @page.
  *
  * Returns 0 on success (HTTP 200), -errno on failure.
  */
-static int rswap_http_parse_response(struct socket *sock,
-				     char *data, size_t datalen, bool is_read)
+static int rswap_http_parse_response(struct socket *sock, struct page *page,
+				     size_t len, bool is_read)
 {
 	/*
 	 * Heap-allocate the header buffer to keep stack usage under the
@@ -105,7 +106,6 @@ static int rswap_http_parse_response(struct socket *sock,
 	int status = 0;
 	char *line;
 	size_t content_length = 0;
-	size_t received = 0;
 	bool have_length = false;
 	int ret;
 
@@ -165,19 +165,14 @@ static int rswap_http_parse_response(struct socket *sock,
 		}
 		line = next;
 	}
-	if (!have_length || content_length != (is_read ? datalen : 0)) {
+	if (!have_length || content_length != (is_read ? len : 0)) {
 		ret = -EPROTO;
 		goto out;
 	}
-	while (received < content_length) {
-		ret = rswap_sock_recv(sock, data + received,
-				      min_t(size_t, content_length - received,
-					    65536));
-		if (ret <= 0) {
-			ret = ret ? ret : -EIO;
+	if (is_read) {
+		ret = rswap_sock_recv_page(sock, page, content_length);
+		if (ret)
 			goto out;
-		}
-		received += ret;
 	}
 
 	ret = 0;
@@ -198,6 +193,9 @@ static int rswap_http_store(struct rswap_kv_page *pages, unsigned int nr,
 	unsigned int i;
 	int ret;
 
+	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
+		return -EINVAL;
+
 	for (i = 0; i < nr; i++) {
 		struct socket *sock;
 
@@ -205,7 +203,7 @@ static int rswap_http_store(struct rswap_kv_page *pages, unsigned int nr,
 		if (IS_ERR(sock))
 			return PTR_ERR(sock);
 
-		ret = rswap_http_post(sock, pages[i].key, pages[i].data, len);
+		ret = rswap_http_post(sock, pages[i].key, pages[i].page, len);
 		if (!ret)
 			ret = rswap_http_parse_response(sock, NULL, len, false);
 		rswap_sock_close(sock);
@@ -221,6 +219,9 @@ static int rswap_http_load(struct rswap_kv_page *pages, unsigned int nr,
 	unsigned int i;
 	int ret;
 
+	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
+		return -EINVAL;
+
 	for (i = 0; i < nr; i++) {
 		struct socket *sock;
 
@@ -230,7 +231,7 @@ static int rswap_http_load(struct rswap_kv_page *pages, unsigned int nr,
 
 		ret = rswap_http_get(sock, pages[i].key);
 		if (!ret)
-			ret = rswap_http_parse_response(sock, pages[i].data, len,
+			ret = rswap_http_parse_response(sock, pages[i].page, len,
 							true);
 		rswap_sock_close(sock);
 		if (ret)

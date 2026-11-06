@@ -191,16 +191,11 @@ static int rswap_redis_add_header(struct rswap_redis_cmd *cmd, const char *key,
 static int rswap_redis_send_cmd(struct socket *sock,
 				struct rswap_redis_cmd *cmd)
 {
-	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
 	int ret;
 
-	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, cmd->bvecs, cmd->nr,
-		      cmd->len);
-	while (iov_iter_count(&msg.msg_iter)) {
-		ret = sock_sendmsg(sock, &msg);
-		if (ret <= 0)
-			return ret ? ret : -EIO;
-	}
+	ret = rswap_sock_send_bvecs(sock, cmd->bvecs, cmd->nr, cmd->len);
+	if (ret)
+		return ret;
 	cmd->nr = 0;
 	cmd->len = 0;
 	return 0;
@@ -261,8 +256,6 @@ static int rswap_redis_status(struct socket *sock, const char *expected)
 static int rswap_redis_read_bulk(struct socket *sock, struct page *page,
 				 size_t len)
 {
-	struct msghdr msg = { };
-	struct bio_vec bv;
 	char line[RSWAP_REDIS_MAX_LINE];
 	char trailer[2];
 	size_t received = 0;
@@ -287,13 +280,9 @@ static int rswap_redis_read_bulk(struct socket *sock, struct page *page,
 	if ((size_t)value_len != len)
 		return -EMSGSIZE;
 
-	bvec_set_page(&bv, page, len, 0);
-	iov_iter_bvec(&msg.msg_iter, ITER_DEST, &bv, 1, len);
-	while (iov_iter_count(&msg.msg_iter)) {
-		ret = sock_recvmsg(sock, &msg, 0);
-		if (ret <= 0)
-			return ret ? ret : -ECONNRESET;
-	}
+	ret = rswap_sock_recv_page(sock, page, len);
+	if (ret)
+		return ret;
 
 	/* Trailing CRLF of the bulk string. */
 	received = 0;

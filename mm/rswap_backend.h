@@ -21,6 +21,8 @@
 
 #include <linux/types.h>
 
+struct bio_vec;
+struct page;
 struct seq_file;
 struct socket;
 
@@ -74,9 +76,10 @@ struct rswap_kv_config {
  *
  * ->store() and ->load() move @nr page images of @len bytes each from and to
  * @pages[].  @nr is between 1 and RSWAP_BATCH_MAX; keys stay valid only for
- * the duration of the call.  A backend should spend as few round trips as its
- * protocol allows, i.e. pipeline all @nr keys over one connection; moving the
- * pages one at a time is still correct.
+ * the duration of the call.  A backend spends as few round trips as its
+ * protocol allows: Redis pipelines all @nr keys over one pooled connection,
+ * so a batch is one round trip, while HTTP/1.0 carries one object per request
+ * and so needs one per page.  Moving the pages one at a time is still correct.
  *
  * They run in swap I/O context under GFP_NOIO and must not touch the
  * filesystem.  They may sleep.  ->load() returns -ENOENT when a key is
@@ -100,9 +103,10 @@ struct rswap_backend {
 };
 
 /*
- * TCP transport shared by the backends (mm/rswap_sock.c).  A backend opens
- * one connection per ->store()/->load() call and closes it again, so these
- * helpers keep no state and need no locking.
+ * TCP transport shared by the backends (mm/rswap_sock.c).  The helpers keep
+ * no state and need no locking of their own; whoever owns @sock decides how
+ * long it lives.  HTTP/1.0 opens one connection per object, Redis keeps a pool
+ * and reuses a connection for many batches.
  */
 struct socket *rswap_sock_connect(const char *host, u16 port,
 				  unsigned int send_timeout_ms,
@@ -111,6 +115,10 @@ void rswap_sock_close(struct socket *sock);
 bool rswap_sock_alive(struct socket *sock);
 int rswap_sock_send(struct socket *sock, const void *data, size_t len);
 int rswap_sock_recv(struct socket *sock, void *buf, size_t len);
+int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
+			  unsigned int nr, size_t len);
+int rswap_sock_send_page(struct socket *sock, struct page *page, size_t len);
+int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t len);
 
 #ifdef CONFIG_RSWAP_KV_HTTP
 extern const struct rswap_backend rswap_http_backend;
