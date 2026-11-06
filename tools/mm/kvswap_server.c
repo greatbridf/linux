@@ -3,8 +3,8 @@
  * tools/mm/kvswap_server.c - Simple HTTP KV store for rswap
  *
  * A minimal HTTP/1.0 server that stores and retrieves key-value pairs
- * where keys are SHA-256 hex strings and values are arbitrary byte
- * sequences (typically swap page data).
+ * where keys are the hex form of the digest an rswap program supplied for a
+ * page and values are arbitrary byte sequences (typically swap page data).
  *
  * Usage:
  *   kvswap_server [-d <data_dir>] [-p <port>] [-l <listen_addr>]
@@ -15,10 +15,10 @@
  *   listen    = 127.0.0.1
  *
  * Endpoints:
- *   GET  /v1/folios/<sha256>/read   -> 200 with body, or 404
- *   POST /v1/folios/<sha256>/write  -> 200 on success
+ *   GET  /v1/folios/<key>/read   -> 200 with body, or 404
+ *   POST /v1/folios/<key>/write  -> 200 on success
  *
- * The server stores one file per key in <data_dir>/<sha256>.
+ * The server stores one file per key in <data_dir>/<key>.
  */
 
 #ifndef _GNU_SOURCE
@@ -51,7 +51,16 @@
 #define MAX_BACKLOG	128
 #define MAX_HEADER	8192
 #define MAX_PATH	PATH_MAX
-#define SHA256_HEXLEN	64
+/*
+ * Width of one key: the digest is RSWAP_HASH_LEN bytes (mm/rswap.h), the core
+ * emits it with bin2hex() as RSWAP_HASH_HEXLEN = 2 * RSWAP_HASH_LEN = 96 hex
+ * characters, and that string plus its NUL is RSWAP_KV_KEY_LEN bytes
+ * (mm/rswap_backend.h).  The digest is supplied by the userspace or BPF
+ * program, so its meaning is opaque here and not necessarily a SHA-256 sum;
+ * this server only checks the width and the hex digits.  The literal is
+ * spelled out because this tool builds without the kernel headers.
+ */
+#define KEY_HEXLEN	96
 #define MAX_BODY		(64UL * 1024 * 1024)
 
 /* Global config, set from cmdline. */
@@ -77,26 +86,26 @@ static void die(const char *fmt, ...)
 	exit(1);
 }
 
-/* Build the file path for a given SHA-256 hex key. */
-static int key_to_path(const char *sha256, char *out, size_t outsz)
+/* Build the file path for a given hex key. */
+static int key_to_path(const char *key, char *out, size_t outsz)
 {
 	size_t len;
 	const char *p;
 
-	/* Validate: exactly 64 hex chars. */
-	for (len = 0, p = sha256; *p; p++, len++) {
+	/* Validate: exactly KEY_HEXLEN hex chars. */
+	for (len = 0, p = key; *p; p++, len++) {
 		if (!isxdigit((unsigned char)*p))
 			return -1;
 	}
-	if (len != SHA256_HEXLEN)
+	if (len != KEY_HEXLEN)
 		return -1;
 
 	return snprintf(out, outsz, "%s/%.2s/%s",
-			cfg.data_dir, sha256, sha256) < (int)outsz ? 0 : -1;
+			cfg.data_dir, key, key) < (int)outsz ? 0 : -1;
 }
 
 /* Ensure the storage directory and its 2-char subdir exist. */
-static int ensure_dirs(const char *sha256)
+static int ensure_dirs(const char *key)
 {
 	char sub[MAX_PATH];
 	int ret;
@@ -107,7 +116,7 @@ static int ensure_dirs(const char *sha256)
 		return -errno;
 
 	/* Create 2-char prefix subdirectory. */
-	ret = snprintf(sub, sizeof(sub), "%s/%.2s", cfg.data_dir, sha256);
+	ret = snprintf(sub, sizeof(sub), "%s/%.2s", cfg.data_dir, key);
 	if (ret >= (int)sizeof(sub))
 		return -ENAMETOOLONG;
 
@@ -187,14 +196,15 @@ static void send_500(int fd)
 
 /*
  * Parse a line like:
- *   GET /v1/folios/<sha256>/read HTTP/1.0\r\n
- *   POST /v1/folios/<sha256>/write HTTP/1.0\r\n
+ *   GET /v1/folios/<key>/read HTTP/1.0\r\n
+ *   POST /v1/folios/<key>/write HTTP/1.0\r\n
  *
- * Extracts method, sha256, and operation ("read" or "write").
+ * where <key> is KEY_HEXLEN hex characters.  Extracts method, key, and
+ * operation ("read" or "write").
  */
 static int parse_request(const char *buf,
 			  char *method, size_t method_sz __attribute__((__unused__)),
-			  char *sha256, size_t sha256_sz __attribute__((__unused__)),
+			  char *key, size_t key_sz __attribute__((__unused__)),
 			  char *op, size_t op_sz)
 {
 	char path[512];
@@ -205,7 +215,7 @@ static int parse_request(const char *buf,
 	if (n != 3)
 		return -1;
 
-	/* Path: /v1/folios/<64 hex chars>/<read|write> */
+	/* Path: /v1/folios/<KEY_HEXLEN hex chars>/<read|write> */
 	if (strncmp(path, "/v1/folios/", 11) != 0)
 		return -1;
 
@@ -215,15 +225,15 @@ static int parse_request(const char *buf,
 		return -1;
 
 	size_t keylen = slash - p;
-	if (keylen != SHA256_HEXLEN)
+	if (keylen != KEY_HEXLEN)
 		return -1;
 
-	memcpy(sha256, p, SHA256_HEXLEN);
-	sha256[SHA256_HEXLEN] = '\0';
+	memcpy(key, p, KEY_HEXLEN);
+	key[KEY_HEXLEN] = '\0';
 
 	/* Validate hex. */
-	for (n = 0; n < SHA256_HEXLEN; n++) {
-		if (!isxdigit((unsigned char)sha256[n]))
+	for (n = 0; n < KEY_HEXLEN; n++) {
+		if (!isxdigit((unsigned char)key[n]))
 			return -1;
 	}
 
@@ -234,14 +244,14 @@ static int parse_request(const char *buf,
 
 /* ---------- Request handlers ---------- */
 
-static void handle_get(int fd, const char *sha256)
+static void handle_get(int fd, const char *key)
 {
 	char fpath[MAX_PATH];
 	struct stat st;
 	int f;
 	void *map;
 
-	if (key_to_path(sha256, fpath, sizeof(fpath)) < 0) {
+	if (key_to_path(key, fpath, sizeof(fpath)) < 0) {
 		send_400(fd);
 		return;
 	}
@@ -290,19 +300,19 @@ static void handle_get(int fd, const char *sha256)
 	free(map);
 }
 
-static void handle_post(int fd, const char *sha256,
+static void handle_post(int fd, const char *key,
 			const char *body, size_t bodylen)
 {
 	char fpath[MAX_PATH];
 	char temporary[MAX_PATH];
 	int f;
 
-	if (ensure_dirs(sha256) < 0) {
+	if (ensure_dirs(key) < 0) {
 		send_500(fd);
 		return;
 	}
 
-	if (key_to_path(sha256, fpath, sizeof(fpath)) < 0) {
+	if (key_to_path(key, fpath, sizeof(fpath)) < 0) {
 		send_400(fd);
 		return;
 	}
@@ -339,7 +349,7 @@ static void handle_post(int fd, const char *sha256,
 static void handle_connection(int fd)
 {
 	char buf[MAX_HEADER];
-	char method[32], sha256[SHA256_HEXLEN + 1], op[32];
+	char method[32], key[KEY_HEXLEN + 1], op[32];
 	ssize_t n;
 	const char *body = NULL;
 	size_t bodylen = 0;
@@ -376,14 +386,14 @@ static void handle_connection(int fd)
 
 	/* Parse the request line. */
 	if (parse_request(buf, method, sizeof(method),
-			  sha256, sizeof(sha256),
+			  key, sizeof(key),
 			  op, sizeof(op)) < 0) {
 		send_400(fd);
 		goto done;
 	}
 
 	if (strcmp(method, "GET") == 0 && strcmp(op, "read") == 0) {
-		handle_get(fd, sha256);
+		handle_get(fd, key);
 	} else if (strcmp(method, "POST") == 0 && strcmp(op, "write") == 0) {
 		char *line = strstr(buf, "\r\n");
 		size_t content_length = 0;
@@ -441,7 +451,7 @@ static void handle_connection(int fd)
 			}
 			bodylen += n;
 		}
-		handle_post(fd, sha256, payload, content_length);
+		handle_post(fd, key, payload, content_length);
 	} else {
 		send_400(fd);
 	}

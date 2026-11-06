@@ -2,9 +2,10 @@
 /*
  * mm/rswap_redis.c - rswap KV backend speaking RESP to a Redis server
  *
- * Keys are the same 64 character lowercase SHA-256 hex strings the other
- * backends use, so a Redis dump can be audited directly against the digests
- * user space attached.  Values are raw base page images.
+ * Keys are the same hex digest strings the other backends use, so a Redis dump
+ * can be audited directly against the digests the programs supplied: 96
+ * characters, RSWAP_KV_KEY_LEN bytes with the NUL.  Values are raw base page
+ * images.
  *
  * One batch of up to RSWAP_BATCH_MAX pages is one pipelined write:
  *
