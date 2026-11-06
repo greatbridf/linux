@@ -164,7 +164,7 @@ static int rswap_http_parse_response(struct socket *sock, struct page *page,
 			goto out;
 		}
 		ret = rswap_sock_recv(sock, buf + total,
-				      RSWAP_HTTP_MAX_HEADER - 1 - total);
+				      RSWAP_HTTP_MAX_HEADER - 1 - total, deadline);
 		if (ret <= 0) {
 			ret = ret ? ret : -EIO;
 			goto out;

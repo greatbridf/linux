@@ -16,6 +16,13 @@
  * still hold it for minutes, so the helpers that loop also take the absolute
  * deadline of the request they serve (rswap_sock_deadline()) and stop with
  * -ETIMEDOUT once it has passed.
+ *
+ * A syscall interrupted by a signal is not a transport failure: it did not
+ * transfer anything, and repeating it continues the same request.  The
+ * helpers therefore retry -EINTR and -ERESTARTSYS, and only those, while the
+ * request deadline allows.  A partial page image must never become a
+ * short-read error because a signal arrived, and a signal must not fail a
+ * swap request that the store is serving normally.
  */
 
 #define pr_fmt(fmt) "rswap: " fmt
@@ -52,6 +59,23 @@ bool rswap_sock_expired(unsigned long deadline)
 	return time_after(jiffies, deadline);
 }
 
+/* Jiffies left before @deadline, at least one so the wait is never forever. */
+static long rswap_sock_left(unsigned long deadline)
+{
+	return max_t(long, 1, (long)(deadline - jiffies));
+}
+
+/*
+ * Was @ret a syscall interrupted by a signal?  Such a call transferred no
+ * data and changed no parser state, so it can be repeated.  These are the only
+ * errors retried here: retrying a transport failure is a policy of the caller
+ * that knows whether the operation is idempotent, not of the helpers below.
+ */
+static bool rswap_sock_interrupted(int ret)
+{
+	return ret == -EINTR || ret == -ERESTARTSYS;
+}
+
 /*
  * Create a TCP socket connected to @host:@port.
  *
@@ -61,6 +85,15 @@ bool rswap_sock_expired(unsigned long deadline)
  * @send_timeout_ms, which only applies to the sends that follow it: an
  * endpoint whose round trip approaches a short send timeout must still be able
  * to connect.
+ *
+ * An interrupted connect is repeated on the same socket.  A signal leaves the
+ * socket in SS_CONNECTING with its SYN still on the wire, and a blocking
+ * connect call in that state waits for that same attempt to finish instead of
+ * starting a new one; a recreated socket would restart the handshake and pay
+ * for the round trips already spent.  The retries are bounded by one connect
+ * budget, not by an attempt count: the connect wait of each attempt is the
+ * time left before the deadline, so a peer that never answers still fails with
+ * -ETIMEDOUT and a signal storm cannot extend the connect past its budget.
  */
 struct socket *rswap_sock_connect(const char *host, u16 port,
 				  unsigned int connect_timeout_ms,
@@ -69,7 +102,7 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 {
 	struct socket *sock;
 	struct sockaddr_in sin;
-	long connect_timeo;
+	unsigned long deadline;
 	long send_timeo;
 	long recv_timeo;
 	int ret;
@@ -80,7 +113,7 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 	 * connect wait non-blocking, neither of which is wanted in the swap I/O
 	 * path.
 	 */
-	connect_timeo = max_t(long, 1, msecs_to_jiffies(connect_timeout_ms));
+	deadline = rswap_sock_deadline(connect_timeout_ms);
 	send_timeo = max_t(long, 1, msecs_to_jiffies(send_timeout_ms));
 	recv_timeo = max_t(long, 1, msecs_to_jiffies(recv_timeout_ms));
 
@@ -91,8 +124,6 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 		return ERR_PTR(ret);
 	}
 
-	/* sk_sndtimeo also bounds the connect wait. */
-	sock_set_sndtimeo(sock->sk, connect_timeo);
 	WRITE_ONCE(sock->sk->sk_rcvtimeo, recv_timeo);
 
 	memset(&sin, 0, sizeof(sin));
@@ -104,9 +135,25 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 		return ERR_PTR(-EINVAL);
 	}
 
-	ret = kernel_connect(sock, (struct sockaddr_unsized *)&sin, sizeof(sin),
-			     0);
+	for (;;) {
+		/*
+		 * sk_sndtimeo also bounds the connect wait, and it is in
+		 * jiffies.  sock_set_sndtimeo() would convert its argument from
+		 * seconds, which would stretch the wait by HZ and put an
+		 * unanswered connect far past this budget.
+		 */
+		WRITE_ONCE(sock->sk->sk_sndtimeo, rswap_sock_left(deadline));
+		ret = kernel_connect(sock, (struct sockaddr_unsized *)&sin,
+				     sizeof(sin), 0);
+		if (!rswap_sock_interrupted(ret))
+			break;
+		if (rswap_sock_expired(deadline)) {
+			ret = -ETIMEDOUT;
+			break;
+		}
+	}
 	if (ret < 0) {
+		/* The final failure only: a retried connect logs nothing. */
 		pr_err_ratelimited("kernel_connect to %s:%u failed: %d\n",
 				   host, port, ret);
 		sock_release(sock);
@@ -150,8 +197,13 @@ int rswap_sock_send(struct socket *sock, const void *data, size_t len,
 		if (rswap_sock_expired(deadline))
 			return -ETIMEDOUT;
 		ret = kernel_sendmsg(sock, &mhdr, &iov, 1, iov.iov_len);
-		if (ret <= 0)
-			return ret ? ret : -EIO;
+		if (ret < 0) {
+			if (rswap_sock_interrupted(ret))
+				continue;
+			return ret;
+		}
+		if (!ret)
+			return -EIO;
 		iov.iov_base = (char *)iov.iov_base + ret;
 		iov.iov_len -= ret;
 	}
@@ -159,16 +211,24 @@ int rswap_sock_send(struct socket *sock, const void *data, size_t len,
 }
 
 /* Receive between 1 and @len bytes.  Zero is reported as -ECONNRESET. */
-int rswap_sock_recv(struct socket *sock, void *buf, size_t len)
+int rswap_sock_recv(struct socket *sock, void *buf, size_t len,
+		    unsigned long deadline)
 {
 	struct msghdr mhdr = { .msg_flags = MSG_NOSIGNAL };
 	struct kvec iov = { .iov_base = buf, .iov_len = len };
 	int ret;
 
-	ret = kernel_recvmsg(sock, &mhdr, &iov, 1, len, 0);
-	if (!ret)
-		return -ECONNRESET;
-	return ret;
+	for (;;) {
+		if (rswap_sock_expired(deadline))
+			return -ETIMEDOUT;
+		ret = kernel_recvmsg(sock, &mhdr, &iov, 1, len, 0);
+		if (ret < 0) {
+			if (rswap_sock_interrupted(ret))
+				continue;
+			return ret;
+		}
+		return ret ? ret : -ECONNRESET;
+	}
 }
 
 /*
@@ -191,8 +251,13 @@ int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
 		if (rswap_sock_expired(deadline))
 			return -ETIMEDOUT;
 		ret = sock_sendmsg(sock, &msg);
-		if (ret <= 0)
-			return ret ? ret : -EIO;
+		if (ret < 0) {
+			if (rswap_sock_interrupted(ret))
+				continue;
+			return ret;
+		}
+		if (!ret)
+			return -EIO;
 	}
 	return 0;
 }
@@ -230,8 +295,13 @@ int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t off,
 		if (rswap_sock_expired(deadline))
 			return -ETIMEDOUT;
 		ret = sock_recvmsg(sock, &msg, 0);
-		if (ret <= 0)
-			return ret ? ret : -ECONNRESET;
+		if (ret < 0) {
+			if (rswap_sock_interrupted(ret))
+				continue;
+			return ret;
+		}
+		if (!ret)
+			return -ECONNRESET;
 	}
 	return 0;
 }
