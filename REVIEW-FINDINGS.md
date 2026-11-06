@@ -416,9 +416,9 @@ wrote nothing). The run moved real data: `written_pages` 16963 → 19872
 
 Status legend as above: `open`, `fixed` (commit listed), `deferred`, `invalid`.
 
-Status after this series: L1, L2 (including L2b) and L3 are fixed by
-`97e9ae0f0740`, `0ea1b0df34a8`, `007581174afe` and `b7f34046608e`; L4 is
-`deferred` and its numbers are recorded in `TODOS.md`.
+Status after this series: L1, L2 (including L2b), L3 and L5 are fixed by
+`97e9ae0f0740`, `0ea1b0df34a8`, `007581174afe`, `b7f34046608e` and
+`5ee482575404`; L4 is `deferred` and its numbers are recorded in `TODOS.md`.
 
 ### L1 — A transient `-EINTR` on connect kills the read, and nothing retries it
 
@@ -535,7 +535,7 @@ costs transient memory per queued batch.
 
 ### L5 — The send timeout has never been in effect: `sock_set_sndtimeo()` takes seconds
 
-`open`. Found while fixing L1.
+`fixed` — `5ee482575404`. Found while fixing L1.
 
 `rswap_sock_connect()` converts both timeouts with `msecs_to_jiffies()` and then
 uses two different interfaces for them (`mm/rswap_sock.c`):
