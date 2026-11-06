@@ -1161,7 +1161,14 @@ static int rswap_batch_add(struct rswap_batch *batch,
 	return 0;
 }
 
-/* Move a full or partial batch and empty it again. */
+/*
+ * Move a full or partial batch and empty it again.
+ *
+ * A read failure is reported once per batch, never once per page: the swap
+ * type and the first swap offset of the batch locate the entry, and the key
+ * prefix identifies the object in the store without spelling out all 96 hex
+ * characters of a key the log reader does not need.
+ */
 static int rswap_batch_flush(struct rswap_batch *batch, int rw)
 {
 	unsigned int nr = batch->nr;
@@ -1169,10 +1176,18 @@ static int rswap_batch_flush(struct rswap_batch *batch, int rw)
 
 	batch->nr = 0;
 	ret = rswap_flush_batch(batch->pages, batch->stats, nr, rw);
-	if (ret)
-		pr_err_ratelimited("%s type %u failed: %d\n",
-				   rw == WRITE ? "write" : "read",
+	if (ret && rw == READ) {
+		struct page *page = batch->pages[0].page;
+		struct folio *folio = page_folio(page);
+
+		pr_err_ratelimited("read type %u offset %lu failed: %d (nr %u, key %.16s)\n",
+				   batch->type,
+				   swp_offset(folio_page_swap_entry(folio, page)),
+				   ret, nr, batch->pages[0].key);
+	} else if (ret) {
+		pr_err_ratelimited("write type %u failed: %d\n",
 				   batch->type, ret);
+	}
 	return ret;
 }
 
