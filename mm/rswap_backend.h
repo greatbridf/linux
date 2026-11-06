@@ -4,12 +4,16 @@
  *
  * rswap itself only decides *what* to store and under which key; *how* the
  * page reaches the remote store is delegated to a KV backend.  A backend
- * stores one base page image under the userspace supplied SHA-256 digest of
- * that page.
+ * stores one base page image under the digest that a userspace or BPF program
+ * supplied for that page.
  *
- * The key is always the 64 character lowercase hex form of a digest that was
- * attached by user space and persisted in the per-device table.  Backends must
- * never invent or derive a key of their own.
+ * The key is the hex form of that digest, as the core rendered it with
+ * bin2hex(): RSWAP_HASH_HEXLEN (2 * RSWAP_HASH_LEN = 96) characters, which is
+ * RSWAP_KV_KEY_LEN bytes including the terminating NUL.  The digest itself is
+ * program supplied and opaque here; today's digest programs emit 32 bytes of
+ * SHA-256, and the legacy /proc/sys/vm/rswap/attach path zero-extends such a
+ * digest to the 48 byte slot width, but nothing in the key layout depends on
+ * that.  Backends must never invent or derive a key of their own.
  */
 
 #ifndef _MM_RSWAP_BACKEND_H
@@ -20,7 +24,7 @@
 struct seq_file;
 struct socket;
 
-/* Longest KV key rswap ever produces: SHA-256 as hex plus the NUL. */
+/* One KV key: the digest as hex plus the NUL, 2 * RSWAP_HASH_LEN + 1 bytes. */
 #define RSWAP_KV_KEY_LEN	97	/* 2 * RSWAP_HASH_LEN + NUL */
 /* Room for a host name, an IPv4 literal or a future address family. */
 #define RSWAP_KV_HOST_LEN	64
@@ -36,7 +40,7 @@ struct socket;
 
 /* One base page image together with the KV key it belongs to. */
 struct rswap_kv_page {
-	const char	*key;		/* 64 digit lowercase hex SHA-256 */
+	const char	*key;		/* hex digest, RSWAP_KV_KEY_LEN bytes */
 	struct page	*page;		/* exactly one base page image */
 };
 

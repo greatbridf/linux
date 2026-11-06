@@ -4,11 +4,12 @@
  *
  * One base page is one HTTP/1.0 request:
  *
- *   write:  POST /v1/folios/<sha256>/write   body = page data
- *   read:   GET  /v1/folios/<sha256>/read
+ *   write:  POST /v1/folios/<key>/write   body = page data
+ *   read:   GET  /v1/folios/<key>/read
  *
- * The server (tools/mm/kvswap_server.c) stores each page as a file named by
- * the SHA-256 hex key.
+ * <key> is the hex form of the digest supplied for the page: 96 characters,
+ * RSWAP_KV_KEY_LEN bytes with the NUL (see mm/rswap_backend.h).  The server
+ * (tools/mm/kvswap_server.c) stores each page as a file named by that key.
  */
 
 #define pr_fmt(fmt) "rswap: " fmt
