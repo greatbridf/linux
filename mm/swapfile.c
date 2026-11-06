@@ -2143,7 +2143,7 @@ again:
 		goto failed;
 
 	/* Give the new entries their digest slots while we may still sleep. */
-	rswap_prepare_hashes(folio);
+	rswap_prepare_hashes(folio, GFP_NOIO);
 
 	return 0;
 
