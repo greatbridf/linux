@@ -14,6 +14,7 @@
 
 #define pr_fmt(fmt) "rswap: " fmt
 
+#include <linux/highmem.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
@@ -25,6 +26,7 @@
 
 #define RSWAP_HTTP_DEFAULT_HOST		"127.0.0.1"
 #define RSWAP_HTTP_DEFAULT_PORT		6789
+#define RSWAP_HTTP_CONNECT_TIMEOUT_MS	1000
 #define RSWAP_HTTP_SEND_TIMEOUT_MS	20
 #define RSWAP_HTTP_RECV_TIMEOUT_MS	1000
 #define RSWAP_HTTP_MAX_HEADER		2048
@@ -36,15 +38,29 @@ static struct {
 	unsigned int	recv_timeout_ms;
 } rswap_http;
 
+/*
+ * Budget for one HTTP request: one connect, one send and two receives, one for
+ * the response headers and one for the body.  A peer cannot stretch a request
+ * much past this, it can only add the single operation that is in flight.
+ */
+static unsigned long rswap_http_deadline(void)
+{
+	return rswap_sock_deadline(RSWAP_HTTP_CONNECT_TIMEOUT_MS +
+				   rswap_http.send_timeout_ms +
+				   2 * rswap_http.recv_timeout_ms);
+}
+
 static struct socket *rswap_http_open(void)
 {
 	return rswap_sock_connect(rswap_http.host, rswap_http.port,
+				  RSWAP_HTTP_CONNECT_TIMEOUT_MS,
 				  rswap_http.send_timeout_ms,
 				  rswap_http.recv_timeout_ms);
 }
 
 /* Build and send an HTTP GET request. */
-static int rswap_http_get(struct socket *sock, const char *key)
+static int rswap_http_get(struct socket *sock, const char *key,
+			  unsigned long deadline)
 {
 	char req[256];
 	int ret;
@@ -58,12 +74,13 @@ static int rswap_http_get(struct socket *sock, const char *key)
 	if (ret >= (int)sizeof(req))
 		return -ENOSPC;
 
-	return rswap_sock_send(sock, req, ret);
+	return rswap_sock_send(sock, req, ret, deadline);
 }
 
 /* Build and send an HTTP POST request carrying the page image @page. */
 static int rswap_http_post(struct socket *sock, const char *key,
-			   struct page *page, size_t len)
+			   struct page *page, size_t len,
+			   unsigned long deadline)
 {
 	char hdr[512];
 	int hlen;
@@ -80,13 +97,33 @@ static int rswap_http_post(struct socket *sock, const char *key,
 	if (hlen >= (int)sizeof(hdr))
 		return -ENOSPC;
 
-	ret = rswap_sock_send(sock, hdr, hlen);
+	ret = rswap_sock_send(sock, hdr, hlen, deadline);
 	if (ret)
 		return ret;
-	return rswap_sock_send_page(sock, page, len);
+	return rswap_sock_send_page(sock, page, len, deadline);
 }
 
 /* ---------- Response parsing ---------- */
+
+/*
+ * Offset just past the "\r\n\r\n" that ends the header block, or 0 while it
+ * has not arrived yet.  @scanned carries the part already searched, so a
+ * terminator that is split across two receives is still found.
+ */
+static size_t rswap_http_header_end(const char *buf, size_t total,
+				    size_t *scanned)
+{
+	size_t i = *scanned > 3 ? *scanned - 3 : 0;
+
+	for (; i + 4 <= total; i++) {
+		if (!memcmp(buf + i, "\r\n\r\n", 4)) {
+			*scanned = i + 4;
+			return i + 4;
+		}
+	}
+	*scanned = total;
+	return 0;
+}
 
 /*
  * Parse the HTTP response.  Extracts the status code and, for GET requests,
@@ -95,39 +132,50 @@ static int rswap_http_post(struct socket *sock, const char *key,
  * Returns 0 on success (HTTP 200), -errno on failure.
  */
 static int rswap_http_parse_response(struct socket *sock, struct page *page,
-				     size_t len, bool is_read)
+				     size_t len, bool is_read,
+				     unsigned long deadline)
 {
 	/*
 	 * Heap-allocate the header buffer to keep stack usage under the
 	 * 2048-byte warning threshold.  Our responses are tiny.
 	 */
 	char *buf = kmalloc(RSWAP_HTTP_MAX_HEADER, GFP_NOIO);
-	int total = 0;
-	int status = 0;
-	char *line;
+	size_t scanned = 0;
+	size_t total = 0;
+	size_t hdr_end = 0;
+	size_t have;
 	size_t content_length = 0;
 	bool have_length = false;
+	char *line, *end;
+	int status = 0;
 	int ret;
 
 	if (!buf)
 		return -ENOMEM;
 
-	/* Read headers (up to 2KB). */
+	/*
+	 * Read the header block in as few calls as the peer allows: one receive
+	 * returns whatever has arrived, so a normal response needs one.  The
+	 * last byte of the buffer stays reserved for the NUL.
+	 */
 	while (total < RSWAP_HTTP_MAX_HEADER - 1) {
-		ret = rswap_sock_recv(sock, buf + total, 1);
+		if (rswap_sock_expired(deadline)) {
+			ret = -ETIMEDOUT;
+			goto out;
+		}
+		ret = rswap_sock_recv(sock, buf + total,
+				      RSWAP_HTTP_MAX_HEADER - 1 - total);
 		if (ret <= 0) {
 			ret = ret ? ret : -EIO;
 			goto out;
 		}
 		total += ret;
 		buf[total] = '\0';
-
-		/* End of headers: \r\n\r\n */
-		if (total >= 4 &&
-		    memcmp(buf + total - 4, "\r\n\r\n", 4) == 0)
+		hdr_end = rswap_http_header_end(buf, total, &scanned);
+		if (hdr_end)
 			break;
 	}
-	if (total >= RSWAP_HTTP_MAX_HEADER - 1) {
+	if (!hdr_end) {
 		ret = -ENOSPC;
 		goto out;
 	}
@@ -142,13 +190,20 @@ static int rswap_http_parse_response(struct socket *sock, struct page *page,
 		goto out;
 	}
 
-	line = strstr(buf, "\r\n");
-	while (line) {
-		char *next;
+	/*
+	 * The header lines end with the empty line of the terminator; drop that
+	 * empty line and NUL-terminate the block for the scan below.
+	 */
+	end = buf + hdr_end - 2;
+	*end = '\0';
+	line = buf;
+	while (line < end) {
+		char *next = line;
 
-		line += 2;
-		next = strstr(line, "\r\n");
-		if (!next || next == line)
+		while (next + 2 <= end &&
+		       (next[0] != '\r' || next[1] != '\n'))
+			next++;
+		if (next + 2 > end)
 			break;
 		*next = '\0';
 		if (!strncasecmp(line, "Content-Length:", 15)) {
@@ -163,25 +218,53 @@ static int rswap_http_parse_response(struct socket *sock, struct page *page,
 			ret = -EPROTO;
 			goto out;
 		}
-		line = next;
+		line = next + 2;
 	}
 	if (!have_length || content_length != (is_read ? len : 0)) {
 		ret = -EPROTO;
 		goto out;
 	}
-	if (is_read) {
-		ret = rswap_sock_recv_page(sock, page, content_length);
-		if (ret)
-			goto out;
+	if (!is_read) {
+		ret = 0;
+		goto out;
 	}
 
-	ret = 0;
+	/*
+	 * A receive returns whatever has arrived, so the first bytes of the body
+	 * may already be in the header buffer.  They belong at the start of the
+	 * page, and only the rest is still on the socket.  The header buffer is
+	 * far smaller than a page, so it can never hold the whole body.
+	 */
+	have = total - hdr_end;
+	if (have) {
+		void *addr = kmap_local_page(page);
+
+		memcpy(addr, buf + hdr_end, have);
+		kunmap_local(addr);
+	}
+	ret = rswap_sock_recv_page(sock, page, have, content_length - have,
+				   deadline);
 out:
 	kfree(buf);
 	return ret;
 }
 
 /* ---------- Backend operations ---------- */
+
+/* Reject a batch whose keys are not the full digest strings the core made. */
+static int rswap_http_validate(struct rswap_kv_page *pages, unsigned int nr,
+			       size_t len)
+{
+	unsigned int i;
+
+	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
+		return -EINVAL;
+	for (i = 0; i < nr; i++) {
+		if (strlen(pages[i].key) + 1 != RSWAP_KV_KEY_LEN)
+			return -EINVAL;
+	}
+	return 0;
+}
 
 /*
  * HTTP/1.0 carries exactly one object per request, so a batch is a plain
@@ -193,19 +276,23 @@ static int rswap_http_store(struct rswap_kv_page *pages, unsigned int nr,
 	unsigned int i;
 	int ret;
 
-	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
-		return -EINVAL;
+	ret = rswap_http_validate(pages, nr, len);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < nr; i++) {
 		struct socket *sock;
+		unsigned long deadline = rswap_http_deadline();
 
 		sock = rswap_http_open();
 		if (IS_ERR(sock))
 			return PTR_ERR(sock);
 
-		ret = rswap_http_post(sock, pages[i].key, pages[i].page, len);
+		ret = rswap_http_post(sock, pages[i].key, pages[i].page, len,
+				      deadline);
 		if (!ret)
-			ret = rswap_http_parse_response(sock, NULL, len, false);
+			ret = rswap_http_parse_response(sock, NULL, len, false,
+							deadline);
 		rswap_sock_close(sock);
 		if (ret)
 			return ret;
@@ -219,20 +306,22 @@ static int rswap_http_load(struct rswap_kv_page *pages, unsigned int nr,
 	unsigned int i;
 	int ret;
 
-	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
-		return -EINVAL;
+	ret = rswap_http_validate(pages, nr, len);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < nr; i++) {
 		struct socket *sock;
+		unsigned long deadline = rswap_http_deadline();
 
 		sock = rswap_http_open();
 		if (IS_ERR(sock))
 			return PTR_ERR(sock);
 
-		ret = rswap_http_get(sock, pages[i].key);
+		ret = rswap_http_get(sock, pages[i].key, deadline);
 		if (!ret)
 			ret = rswap_http_parse_response(sock, pages[i].page, len,
-							true);
+							true, deadline);
 		rswap_sock_close(sock);
 		if (ret)
 			return ret;

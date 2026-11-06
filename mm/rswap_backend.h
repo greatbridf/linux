@@ -107,18 +107,30 @@ struct rswap_backend {
  * no state and need no locking of their own; whoever owns @sock decides how
  * long it lives.  HTTP/1.0 opens one connection per object, Redis keeps a pool
  * and reuses a connection for many batches.
+ *
+ * The socket timeouts only bound one operation each, so the helpers that may
+ * loop take the absolute deadline of the request they serve, as returned by
+ * rswap_sock_deadline(), and fail with -ETIMEDOUT once it has passed.  That is
+ * what keeps the wall time of one request bounded however slowly the peer
+ * answers.
  */
 struct socket *rswap_sock_connect(const char *host, u16 port,
+				  unsigned int connect_timeout_ms,
 				  unsigned int send_timeout_ms,
 				  unsigned int recv_timeout_ms);
 void rswap_sock_close(struct socket *sock);
 bool rswap_sock_alive(struct socket *sock);
-int rswap_sock_send(struct socket *sock, const void *data, size_t len);
+unsigned long rswap_sock_deadline(unsigned int timeout_ms);
+bool rswap_sock_expired(unsigned long deadline);
+int rswap_sock_send(struct socket *sock, const void *data, size_t len,
+		    unsigned long deadline);
 int rswap_sock_recv(struct socket *sock, void *buf, size_t len);
 int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
-			  unsigned int nr, size_t len);
-int rswap_sock_send_page(struct socket *sock, struct page *page, size_t len);
-int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t len);
+			  unsigned int nr, size_t len, unsigned long deadline);
+int rswap_sock_send_page(struct socket *sock, struct page *page, size_t len,
+			 unsigned long deadline);
+int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t off,
+			 size_t len, unsigned long deadline);
 
 #ifdef CONFIG_RSWAP_KV_HTTP
 extern const struct rswap_backend rswap_http_backend;

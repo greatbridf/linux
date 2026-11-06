@@ -27,6 +27,7 @@
 #define pr_fmt(fmt) "rswap: " fmt
 
 #include <linux/bvec.h>
+#include <linux/highmem.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/mempool.h>
@@ -43,10 +44,13 @@
 
 #define RSWAP_REDIS_DEFAULT_HOST	"127.0.0.1"
 #define RSWAP_REDIS_DEFAULT_PORT	6379
+#define RSWAP_REDIS_CONNECT_TIMEOUT_MS	10000
 #define RSWAP_REDIS_SEND_TIMEOUT_MS	10000
 #define RSWAP_REDIS_RECV_TIMEOUT_MS	10000
 /* Status, error and bulk length lines are all tiny. */
 #define RSWAP_REDIS_MAX_LINE		256
+/* Room for one "$<key length>\r\n" including its NUL. */
+#define RSWAP_REDIS_KEY_BULK_LEN	16
 /* Cached connections; more concurrent batches than this fall back to new. */
 #define RSWAP_REDIS_POOL_MAX		8
 /* Flush a full vector array without waiting for the pipelined replies. */
@@ -62,6 +66,19 @@ static struct {
 	unsigned int	recv_timeout_ms;
 } rswap_redis;
 
+/*
+ * Budget for one batch: one connect, one send and two receive timeouts.  A
+ * batch is one pipelined round trip, so the reply stream with its lines and
+ * bulk trailers fits in that.  The socket timeouts still bound how long the
+ * peer may stay silent between two operations.
+ */
+static unsigned long rswap_redis_deadline(void)
+{
+	return rswap_sock_deadline(RSWAP_REDIS_CONNECT_TIMEOUT_MS +
+				   rswap_redis.send_timeout_ms +
+				   2 * rswap_redis.recv_timeout_ms);
+}
+
 /* ---------- RESP wire format ---------- */
 
 enum {
@@ -73,7 +90,6 @@ enum {
 	RSWAP_CMD_ARG_2,
 	RSWAP_CMD_ARG_3,
 
-	RSWAP_CMD_BULK_KEY,
 	RSWAP_CMD_BULK_PAGE_SIZE,
 	RSWAP_CMD_CRLF,
 	RSWAP_CMD_USER,
@@ -89,24 +105,30 @@ static struct mempool *rswap_redis_cmd_pool;
 /* All vectors reference the original fragments, keys and page payloads. */
 struct rswap_redis_cmd {
 	struct socket	*sock;
+	unsigned long	deadline;
 	size_t		len;
 	unsigned int	nr;
+	unsigned int	nr_bulk;	/* used slots in @bulk */
 
+	/* "$<key length>\r\n", one slot per key of the batch being built. */
+	char		bulk[RSWAP_BATCH_MAX][RSWAP_REDIS_KEY_BULK_LEN];
 	struct bio_vec	bvecs[RSWAP_CMD_BVECS];
 };
 
-static int rswap_redis_send_cmd(struct socket *sock,
-				struct rswap_redis_cmd *cmd);
+static int rswap_redis_send_cmd(struct rswap_redis_cmd *cmd);
 
-static struct rswap_redis_cmd *rswap_redis_cmd_alloc(struct socket *sock)
+static struct rswap_redis_cmd *rswap_redis_cmd_alloc(struct socket *sock,
+						     unsigned long deadline)
 {
 	struct rswap_redis_cmd *cmd;
 
 	cmd = mempool_alloc(rswap_redis_cmd_pool, GFP_NOIO);
 	if (cmd) {
 		cmd->sock = sock;
+		cmd->deadline = deadline;
 		cmd->len = 0;
 		cmd->nr = 0;
+		cmd->nr_bulk = 0;
 	}
 	return cmd;
 }
@@ -117,7 +139,7 @@ static int rswap_redis_add_bvec(struct rswap_redis_cmd *cmd,
 	int ret;
 
 	if (cmd->nr == ARRAY_SIZE(cmd->bvecs)) {
-		ret = rswap_redis_send_cmd(cmd->sock, cmd);
+		ret = rswap_redis_send_cmd(cmd);
 		if (ret)
 			return ret;
 	}
@@ -137,30 +159,56 @@ static int rswap_redis_add_array(struct rswap_redis_cmd *cmd, unsigned int argc)
 	if (argc != 2 && argc != 3)
 		return -EINVAL;
 	return rswap_redis_add_part(cmd, argc == 2 ? RSWAP_CMD_ARG_2 :
-				  RSWAP_CMD_ARG_3);
+				    RSWAP_CMD_ARG_3);
 }
 
-static int rswap_redis_add_key(struct rswap_redis_cmd *cmd, const char *key)
+/* Append @len bytes of kernel memory at @data. */
+static int rswap_redis_add_buf(struct rswap_redis_cmd *cmd, const void *data,
+			       size_t len)
 {
-	size_t remaining = RSWAP_KV_KEY_LEN - 1;
 	struct bio_vec bv;
 	struct page *page;
-	size_t len;
+	size_t chunk;
 	int ret;
 
-	/* Core batch keys can live in a vmalloc allocation and cross a page. */
-	while (remaining) {
-		len = min_t(size_t, remaining, PAGE_SIZE - offset_in_page(key));
-		page = is_vmalloc_addr(key) ? vmalloc_to_page(key) :
-			virt_to_page(key);
-		bvec_set_page(&bv, page, len, offset_in_page(key));
+	/* The buffer can live in vmalloc memory and can cross a page. */
+	while (len) {
+		chunk = min_t(size_t, len, PAGE_SIZE - offset_in_page(data));
+		page = is_vmalloc_addr(data) ? vmalloc_to_page(data) :
+			virt_to_page(data);
+		bvec_set_page(&bv, page, chunk, offset_in_page(data));
 		ret = rswap_redis_add_bvec(cmd, &bv);
 		if (ret)
 			return ret;
-		key += len;
-		remaining -= len;
+		data += chunk;
+		len -= chunk;
 	}
 	return 0;
+}
+
+/*
+ * Append the bulk length header of @key and then the key itself.
+ *
+ * Both are taken from @key, so the bytes on the wire are exactly the key
+ * string; ->store() and ->load() have already rejected a key that is not a
+ * full digest, so every key of a batch has the same width.
+ */
+static int rswap_redis_add_key(struct rswap_redis_cmd *cmd, const char *key)
+{
+	size_t len = strlen(key);
+	char *bulk;
+	int bulk_len;
+	int ret;
+
+	if (cmd->nr_bulk == ARRAY_SIZE(cmd->bulk))
+		return -EINVAL;
+
+	bulk = cmd->bulk[cmd->nr_bulk++];
+	bulk_len = scnprintf(bulk, sizeof(cmd->bulk[0]), "$%zu\r\n", len);
+	ret = rswap_redis_add_buf(cmd, bulk, bulk_len);
+	if (ret)
+		return ret;
+	return rswap_redis_add_buf(cmd, key, len);
 }
 
 /* Append the prefilled wire fragments and the original key pages. */
@@ -171,38 +219,97 @@ static int rswap_redis_add_header(struct rswap_redis_cmd *cmd, const char *key,
 	unsigned int verb = store ? RSWAP_CMD_SET : RSWAP_CMD_GET;
 	int ret;
 
-	ret = rswap_redis_add_bvec(cmd, &rswap_common_part_bios[array]);
+	ret = rswap_redis_add_part(cmd, array);
 	if (!ret)
-		ret = rswap_redis_add_bvec(cmd, &rswap_common_part_bios[verb]);
-	if (!ret)
-		ret = rswap_redis_add_bvec(cmd,
-				 &rswap_common_part_bios[RSWAP_CMD_BULK_KEY]);
+		ret = rswap_redis_add_part(cmd, verb);
 	if (!ret)
 		ret = rswap_redis_add_key(cmd, key);
 	if (!ret)
-		ret = rswap_redis_add_bvec(cmd,
-				 &rswap_common_part_bios[RSWAP_CMD_CRLF]);
+		ret = rswap_redis_add_part(cmd, RSWAP_CMD_CRLF);
 	if (!ret && store)
-		ret = rswap_redis_add_bvec(cmd,
-				 &rswap_common_part_bios[RSWAP_CMD_BULK_PAGE_SIZE]);
+		ret = rswap_redis_add_part(cmd, RSWAP_CMD_BULK_PAGE_SIZE);
 	return ret;
 }
 
-static int rswap_redis_send_cmd(struct socket *sock,
-				struct rswap_redis_cmd *cmd)
+static int rswap_redis_send_cmd(struct rswap_redis_cmd *cmd)
 {
 	int ret;
 
-	ret = rswap_sock_send_bvecs(sock, cmd->bvecs, cmd->nr, cmd->len);
+	ret = rswap_sock_send_bvecs(cmd->sock, cmd->bvecs, cmd->nr, cmd->len,
+				    cmd->deadline);
 	if (ret)
 		return ret;
 	cmd->nr = 0;
 	cmd->len = 0;
+	cmd->nr_bulk = 0;
+	return 0;
+}
+
+/*
+ * Buffered reply reader.  The socket is read in chunks instead of one byte per
+ * call, so a reply costs one receive; bytes that arrive beyond the reply being
+ * parsed stay in @buf for the next one.  The batch is one pipelined exchange,
+ * so @deadline bounds the whole of it.
+ */
+struct rswap_redis_reader {
+	struct socket	*sock;
+	unsigned long	deadline;
+	size_t		filled;	/* bytes read into @buf */
+	size_t		used;	/* consumed prefix of @buf */
+	char		buf[RSWAP_REDIS_MAX_LINE];
+};
+
+static void rswap_redis_reader_init(struct rswap_redis_reader *reader,
+				    struct socket *sock, unsigned long deadline)
+{
+	reader->sock = sock;
+	reader->deadline = deadline;
+	reader->filled = 0;
+	reader->used = 0;
+}
+
+/* Are there reply bytes in the buffer that no parser has consumed yet? */
+static bool rswap_redis_reader_pending(const struct rswap_redis_reader *reader)
+{
+	return reader->used != reader->filled;
+}
+
+/* Make at least one unread byte available in @reader. */
+static int rswap_redis_reader_fill(struct rswap_redis_reader *reader)
+{
+	int ret;
+
+	if (rswap_redis_reader_pending(reader))
+		return 0;
+	if (rswap_sock_expired(reader->deadline))
+		return -ETIMEDOUT;
+	ret = rswap_sock_recv(reader->sock, reader->buf, sizeof(reader->buf));
+	if (ret <= 0)
+		return ret ? ret : -ECONNRESET;
+	reader->filled = ret;
+	reader->used = 0;
+	return 0;
+}
+
+/* Copy @len buffered bytes into @buf, reading from the socket when needed. */
+static int rswap_redis_reader_read(struct rswap_redis_reader *reader, char *buf,
+				   size_t len)
+{
+	size_t i;
+	int ret;
+
+	for (i = 0; i < len; i++) {
+		ret = rswap_redis_reader_fill(reader);
+		if (ret)
+			return ret;
+		buf[i] = reader->buf[reader->used++];
+	}
 	return 0;
 }
 
 /* Read one CRLF terminated line, without the terminator. */
-static int rswap_redis_read_line(struct socket *sock, char *line, size_t size)
+static int rswap_redis_read_line(struct rswap_redis_reader *reader, char *line,
+				 size_t size)
 {
 	size_t len = 0;
 	int ret;
@@ -210,9 +317,10 @@ static int rswap_redis_read_line(struct socket *sock, char *line, size_t size)
 	for (;;) {
 		if (len + 2 > size)
 			return -ENOSPC;
-		ret = rswap_sock_recv(sock, line + len, 1);
-		if (ret <= 0)
-			return ret ? ret : -ECONNRESET;
+		ret = rswap_redis_reader_fill(reader);
+		if (ret)
+			return ret;
+		line[len] = reader->buf[reader->used++];
 		if (line[len] == '\n') {
 			if (!len || line[len - 1] != '\r')
 				return -EPROTO;
@@ -235,12 +343,13 @@ static int rswap_redis_errno(const char *line)
 }
 
 /* Read a simple status reply and require @expected ("OK", ...). */
-static int rswap_redis_status(struct socket *sock, const char *expected)
+static int rswap_redis_status(struct rswap_redis_reader *reader,
+			      const char *expected)
 {
 	char line[RSWAP_REDIS_MAX_LINE];
 	int ret;
 
-	ret = rswap_redis_read_line(sock, line, sizeof(line));
+	ret = rswap_redis_read_line(reader, line, sizeof(line));
 	if (ret)
 		return ret;
 	if (line[0] == '-')
@@ -253,16 +362,16 @@ static int rswap_redis_status(struct socket *sock, const char *expected)
 }
 
 /* Read a bulk reply into @page, which must be exactly @len bytes long. */
-static int rswap_redis_read_bulk(struct socket *sock, struct page *page,
-				 size_t len)
+static int rswap_redis_read_bulk(struct rswap_redis_reader *reader,
+				 struct page *page, size_t len)
 {
 	char line[RSWAP_REDIS_MAX_LINE];
 	char trailer[2];
-	size_t received = 0;
+	size_t off = 0;
 	long value_len;
 	int ret;
 
-	ret = rswap_redis_read_line(sock, line, sizeof(line));
+	ret = rswap_redis_read_line(reader, line, sizeof(line));
 	if (ret)
 		return ret;
 	if (line[0] == '-')
@@ -280,19 +389,26 @@ static int rswap_redis_read_bulk(struct socket *sock, struct page *page,
 	if ((size_t)value_len != len)
 		return -EMSGSIZE;
 
-	ret = rswap_sock_recv_page(sock, page, len);
+	/* Payload bytes that arrived with the length line come first. */
+	if (rswap_redis_reader_pending(reader)) {
+		void *addr;
+
+		off = min_t(size_t, reader->filled - reader->used, len);
+		addr = kmap_local_page(page);
+		memcpy(addr, reader->buf + reader->used, off);
+		kunmap_local(addr);
+		reader->used += off;
+	}
+
+	ret = rswap_sock_recv_page(reader->sock, page, off, len - off,
+				   reader->deadline);
 	if (ret)
 		return ret;
 
 	/* Trailing CRLF of the bulk string. */
-	received = 0;
-	while (received < sizeof(trailer)) {
-		ret = rswap_sock_recv(sock, trailer + received,
-				      sizeof(trailer) - received);
-		if (ret <= 0)
-			return ret ? ret : -ECONNRESET;
-		received += ret;
-	}
+	ret = rswap_redis_reader_read(reader, trailer, sizeof(trailer));
+	if (ret)
+		return ret;
 	if (trailer[0] != '\r' || trailer[1] != '\n')
 		return -EPROTO;
 	return 0;
@@ -351,10 +467,26 @@ static atomic64_t rswap_redis_reuses;
 static atomic64_t rswap_redis_dropped;
 static atomic64_t rswap_redis_retries;
 
-/* Errors that mean the connection is unusable, not that the key is absent. */
+/*
+ * Errors that mean the connection itself failed.  Only those are retried,
+ * because only then can a fresh connection behave differently: the batch is
+ * idempotent.  An answer from a live server (a missing key, an object of the
+ * wrong length, a RESP error such as a wrong password) or a local allocation
+ * or argument failure must not burn the single retry.
+ */
 static bool rswap_redis_transport_error(int err)
 {
-	return err && err != -ENOENT && err != -EMSGSIZE;
+	switch (err) {
+	case 0:
+	case -ENOENT:
+	case -EMSGSIZE:
+	case -EACCES:
+	case -ENOMEM:
+	case -EINVAL:
+		return false;
+	default:
+		return true;
+	}
 }
 
 static void rswap_redis_drop(struct rswap_redis_conn *conn)
@@ -367,8 +499,10 @@ static void rswap_redis_drop(struct rswap_redis_conn *conn)
 }
 
 /* Open a connection if @conn has none, and authenticate it. */
-static int rswap_redis_ensure(struct rswap_redis_conn *conn)
+static int rswap_redis_ensure(struct rswap_redis_conn *conn,
+			      unsigned long deadline)
 {
+	struct rswap_redis_reader reader;
 	struct rswap_redis_cmd *cmd;
 	unsigned int replies;
 	unsigned int i;
@@ -382,7 +516,12 @@ static int rswap_redis_ensure(struct rswap_redis_conn *conn)
 		rswap_redis_drop(conn);
 	}
 
+	/* A retry that already spent the budget must not start a fresh one. */
+	if (rswap_sock_expired(deadline))
+		return -ETIMEDOUT;
+
 	conn->sock = rswap_sock_connect(rswap_redis.host, rswap_redis.port,
+					RSWAP_REDIS_CONNECT_TIMEOUT_MS,
 					rswap_redis.send_timeout_ms,
 					rswap_redis.recv_timeout_ms);
 	if (IS_ERR(conn->sock)) {
@@ -392,16 +531,19 @@ static int rswap_redis_ensure(struct rswap_redis_conn *conn)
 	}
 	atomic64_inc(&rswap_redis_connects);
 
-	cmd = rswap_redis_cmd_alloc(conn->sock);
+	cmd = rswap_redis_cmd_alloc(conn->sock, deadline);
 	if (!cmd) {
 		rswap_redis_drop(conn);
 		return -ENOMEM;
 	}
+	rswap_redis_reader_init(&reader, conn->sock, deadline);
 	ret = rswap_redis_queue_preamble(cmd, &replies);
 	if (!ret && replies) {
-		ret = rswap_redis_send_cmd(conn->sock, cmd);
+		ret = rswap_redis_send_cmd(cmd);
 		for (i = 0; !ret && i < replies; i++)
-			ret = rswap_redis_status(conn->sock, "OK");
+			ret = rswap_redis_status(&reader, "OK");
+		if (!ret && rswap_redis_reader_pending(&reader))
+			ret = -EPROTO;
 	}
 	mempool_free(cmd, rswap_redis_cmd_pool);
 	if (ret)
@@ -444,14 +586,15 @@ static void rswap_redis_conn_put(struct rswap_redis_conn *conn)
 
 static int rswap_redis_do_store(struct rswap_redis_conn *conn,
 				struct rswap_kv_page *pages, unsigned int nr,
-				size_t len)
+				size_t len, unsigned long deadline)
 {
+	struct rswap_redis_reader reader;
 	struct rswap_redis_cmd *cmd;
 	struct bio_vec bv;
 	unsigned int i;
 	int ret = 0;
 
-	cmd = rswap_redis_cmd_alloc(conn->sock);
+	cmd = rswap_redis_cmd_alloc(conn->sock, deadline);
 	if (!cmd)
 		return -ENOMEM;
 
@@ -465,66 +608,101 @@ static int rswap_redis_do_store(struct rswap_redis_conn *conn,
 		if (!ret)
 			ret = rswap_redis_add_part(cmd, RSWAP_CMD_CRLF);
 	}
-	if (ret)
-		goto out_free;
+	if (!ret)
+		ret = rswap_redis_send_cmd(cmd);
 
-	ret = rswap_redis_send_cmd(conn->sock, cmd);
+	rswap_redis_reader_init(&reader, conn->sock, deadline);
 	for (i = 0; !ret && i < nr; i++)
-		ret = rswap_redis_status(conn->sock, "OK");
+		ret = rswap_redis_status(&reader, "OK");
+	if (!ret && rswap_redis_reader_pending(&reader))
+		ret = -EPROTO;
 
-out_free:
 	mempool_free(cmd, rswap_redis_cmd_pool);
-	if (rswap_redis_transport_error(ret))
+	/* Unread replies must never reach the next pooled request. */
+	if (ret)
 		rswap_redis_drop(conn);
 	return ret;
 }
 
 static int rswap_redis_do_load(struct rswap_redis_conn *conn,
 			       struct rswap_kv_page *pages, unsigned int nr,
-			       size_t len)
+			       size_t len, unsigned long deadline)
 {
+	struct rswap_redis_reader reader;
 	struct rswap_redis_cmd *cmd;
 	unsigned int i;
 	int ret = 0;
 
-	cmd = rswap_redis_cmd_alloc(conn->sock);
+	cmd = rswap_redis_cmd_alloc(conn->sock, deadline);
 	if (!cmd)
 		return -ENOMEM;
 
+	rswap_redis_reader_init(&reader, conn->sock, deadline);
 	for (i = 0; !ret && i < nr; i++)
 		ret = rswap_redis_add_header(cmd, pages[i].key, false);
+	if (!ret)
+		ret = rswap_redis_send_cmd(cmd);
 	if (ret)
 		goto out_free;
 
-	ret = rswap_redis_send_cmd(conn->sock, cmd);
-	for (i = 0; !ret && i < nr; i++)
-		ret = rswap_redis_read_bulk(conn->sock, pages[i].page, len);
+	for (i = 0; i < nr; i++) {
+		ret = rswap_redis_read_bulk(&reader, pages[i].page, len);
+		if (ret)
+			break;
+	}
+	if (!ret && rswap_redis_reader_pending(&reader))
+		ret = -EPROTO;
 
 out_free:
 	mempool_free(cmd, rswap_redis_cmd_pool);
-	/* Unread replies or payload must never reach the next pooled request. */
-	if (ret)
+	/*
+	 * Unread replies or payload must never reach the next pooled request, so
+	 * the connection is dropped whenever the batch stopped before the end of
+	 * the reply stream.  A missing key is a complete reply, so a routine
+	 * swapin miss for the last page of a batch keeps the connection.
+	 */
+	if (ret && !(ret == -ENOENT && i + 1 == nr &&
+		     !rswap_redis_reader_pending(&reader)))
 		rswap_redis_drop(conn);
 	return ret;
+}
+
+/* Reject a batch whose keys are not the full digest strings the core made. */
+static int rswap_redis_validate(struct rswap_kv_page *pages, unsigned int nr,
+				size_t len)
+{
+	unsigned int i;
+
+	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
+		return -EINVAL;
+	for (i = 0; i < nr; i++) {
+		if (strlen(pages[i].key) + 1 != RSWAP_KV_KEY_LEN)
+			return -EINVAL;
+	}
+	return 0;
 }
 
 static int rswap_redis_store(struct rswap_kv_page *pages, unsigned int nr,
 			     size_t len)
 {
 	struct rswap_redis_conn *conn;
+	unsigned long deadline;
 	unsigned int tries = 0;
 	int ret;
 
-	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
-		return -EINVAL;
+	ret = rswap_redis_validate(pages, nr, len);
+	if (ret)
+		return ret;
 
 	conn = rswap_redis_conn_get();
 	if (!conn)
 		return -ENOMEM;
+	/* The deadline covers both attempts of the retry-once policy. */
+	deadline = rswap_redis_deadline();
 retry:
-	ret = rswap_redis_ensure(conn);
+	ret = rswap_redis_ensure(conn, deadline);
 	if (!ret)
-		ret = rswap_redis_do_store(conn, pages, nr, len);
+		ret = rswap_redis_do_store(conn, pages, nr, len, deadline);
 	if (ret && rswap_redis_transport_error(ret) && !conn->sock &&
 	    tries++ < 1) {
 		atomic64_inc(&rswap_redis_retries);
@@ -538,19 +716,23 @@ static int rswap_redis_load(struct rswap_kv_page *pages, unsigned int nr,
 			    size_t len)
 {
 	struct rswap_redis_conn *conn;
+	unsigned long deadline;
 	unsigned int tries = 0;
 	int ret;
 
-	if (!nr || nr > RSWAP_BATCH_MAX || len != PAGE_SIZE)
-		return -EINVAL;
+	ret = rswap_redis_validate(pages, nr, len);
+	if (ret)
+		return ret;
 
 	conn = rswap_redis_conn_get();
 	if (!conn)
 		return -ENOMEM;
+	/* The deadline covers both attempts of the retry-once policy. */
+	deadline = rswap_redis_deadline();
 retry:
-	ret = rswap_redis_ensure(conn);
+	ret = rswap_redis_ensure(conn, deadline);
 	if (!ret)
-		ret = rswap_redis_do_load(conn, pages, nr, len);
+		ret = rswap_redis_do_load(conn, pages, nr, len, deadline);
 	if (ret && rswap_redis_transport_error(ret) && !conn->sock &&
 	    tries++ < 1) {
 		atomic64_inc(&rswap_redis_retries);
@@ -604,11 +786,9 @@ static int __init rswap_redis_init_parts(void)
 
 		if (parts[i]) {
 			len = snprintf(buf + offset, remaining, "%s", parts[i]);
-		} else if (i == RSWAP_CMD_BULK_KEY ||
-			   i == RSWAP_CMD_BULK_PAGE_SIZE) {
+		} else if (i == RSWAP_CMD_BULK_PAGE_SIZE) {
 			len = snprintf(buf + offset, remaining, "$%zu\r\n",
-				       i == RSWAP_CMD_BULK_KEY ?
-				       (size_t)RSWAP_KV_KEY_LEN - 1 : PAGE_SIZE);
+				       (size_t)PAGE_SIZE);
 		} else {
 			switch (i) {
 			case RSWAP_CMD_USER:
@@ -635,7 +815,7 @@ static int __init rswap_redis_init_parts(void)
 
 	/* Each connection holds at most one command, including its preamble. */
 	rswap_redis_cmd_pool = mempool_create_kmalloc_pool(RSWAP_REDIS_POOL_MAX,
-						 sizeof(struct rswap_redis_cmd));
+							 sizeof(struct rswap_redis_cmd));
 	if (!rswap_redis_cmd_pool) {
 		ret = -ENOMEM;
 		goto out_free;

@@ -10,14 +10,18 @@
  * request and opens a connection for it, Redis pipelines a whole batch into
  * one round trip and keeps its connections pooled.
  *
- * The timeouts are the ones rswap_sock_connect() put on the socket, so every
- * send and receive below is bounded by the backend's send and receive
- * timeout.
+ * rswap_sock_connect() puts a connect, a send and a receive timeout on the
+ * socket, so no single socket operation runs forever.  A request is made of
+ * many such operations, and a peer that trickles one byte per timeout would
+ * still hold it for minutes, so the helpers that loop also take the absolute
+ * deadline of the request they serve (rswap_sock_deadline()) and stop with
+ * -ETIMEDOUT once it has passed.
  */
 
 #define pr_fmt(fmt) "rswap: " fmt
 
 #include <linux/bvec.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/socket.h>
@@ -31,22 +35,52 @@
 #include "rswap_backend.h"
 
 /*
+ * Absolute end of the request that is about to run: @timeout_ms from now, in
+ * jiffies.
+ *
+ * The socket timeouts bound one operation each, so a request whose parser
+ * keeps operating on a slow peer needs a budget for the whole of it.
+ */
+unsigned long rswap_sock_deadline(unsigned int timeout_ms)
+{
+	return jiffies + max_t(unsigned long, 1, msecs_to_jiffies(timeout_ms));
+}
+
+/* Has the request deadline passed? */
+bool rswap_sock_expired(unsigned long deadline)
+{
+	return time_after(jiffies, deadline);
+}
+
+/*
  * Create a TCP socket connected to @host:@port.
  *
  * Returns the socket, or an ERR_PTR() on failure.  @host is an IPv4 literal
  * (a host name would need a resolver in the swap I/O path).
+ * @connect_timeout_ms bounds the connect wait and is independent of
+ * @send_timeout_ms, which only applies to the sends that follow it: an
+ * endpoint whose round trip approaches a short send timeout must still be able
+ * to connect.
  */
 struct socket *rswap_sock_connect(const char *host, u16 port,
+				  unsigned int connect_timeout_ms,
 				  unsigned int send_timeout_ms,
 				  unsigned int recv_timeout_ms)
 {
 	struct socket *sock;
 	struct sockaddr_in sin;
+	long connect_timeo;
 	long send_timeo;
 	long recv_timeo;
 	int ret;
 
-	/* A zero timeout would mean "never block", which is never wanted. */
+	/*
+	 * Both socket timeouts have to be non-zero here: zero is not "do not
+	 * wait" but "wait forever" for sends and receives, and it makes the
+	 * connect wait non-blocking, neither of which is wanted in the swap I/O
+	 * path.
+	 */
+	connect_timeo = max_t(long, 1, msecs_to_jiffies(connect_timeout_ms));
 	send_timeo = max_t(long, 1, msecs_to_jiffies(send_timeout_ms));
 	recv_timeo = max_t(long, 1, msecs_to_jiffies(recv_timeout_ms));
 
@@ -57,8 +91,8 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 		return ERR_PTR(ret);
 	}
 
-	/* Also bounds the connect wait. */
-	sock_set_sndtimeo(sock->sk, send_timeo);
+	/* sk_sndtimeo also bounds the connect wait. */
+	sock_set_sndtimeo(sock->sk, connect_timeo);
 	WRITE_ONCE(sock->sk->sk_rcvtimeo, recv_timeo);
 
 	memset(&sin, 0, sizeof(sin));
@@ -78,6 +112,9 @@ struct socket *rswap_sock_connect(const char *host, u16 port,
 		sock_release(sock);
 		return ERR_PTR(ret);
 	}
+
+	/* The connection is up: from here on only the send timeout applies. */
+	sock_set_sndtimeo(sock->sk, send_timeo);
 
 	return sock;
 }
@@ -99,7 +136,8 @@ bool rswap_sock_alive(struct socket *sock)
 }
 
 /* Send @len bytes from @data, looping over short sends. */
-int rswap_sock_send(struct socket *sock, const void *data, size_t len)
+int rswap_sock_send(struct socket *sock, const void *data, size_t len,
+		    unsigned long deadline)
 {
 	struct msghdr mhdr = { .msg_flags = MSG_NOSIGNAL };
 	struct kvec iov = { .iov_base = (void *)data, .iov_len = len };
@@ -109,6 +147,8 @@ int rswap_sock_send(struct socket *sock, const void *data, size_t len)
 		return 0;
 
 	while (iov.iov_len) {
+		if (rswap_sock_expired(deadline))
+			return -ETIMEDOUT;
 		ret = kernel_sendmsg(sock, &mhdr, &iov, 1, iov.iov_len);
 		if (ret <= 0)
 			return ret ? ret : -EIO;
@@ -138,7 +178,7 @@ int rswap_sock_recv(struct socket *sock, void *buf, size_t len)
  * page image is never mapped across the blocking call.
  */
 int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
-			  unsigned int nr, size_t len)
+			  unsigned int nr, size_t len, unsigned long deadline)
 {
 	struct msghdr msg = { .msg_flags = MSG_NOSIGNAL };
 	int ret;
@@ -148,6 +188,8 @@ int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
 
 	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, bvecs, nr, len);
 	while (iov_iter_count(&msg.msg_iter)) {
+		if (rswap_sock_expired(deadline))
+			return -ETIMEDOUT;
 		ret = sock_sendmsg(sock, &msg);
 		if (ret <= 0)
 			return ret ? ret : -EIO;
@@ -156,16 +198,24 @@ int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
 }
 
 /* Send exactly one page image of @len bytes from @page. */
-int rswap_sock_send_page(struct socket *sock, struct page *page, size_t len)
+int rswap_sock_send_page(struct socket *sock, struct page *page, size_t len,
+			 unsigned long deadline)
 {
 	struct bio_vec bv;
 
 	bvec_set_page(&bv, page, len, 0);
-	return rswap_sock_send_bvecs(sock, &bv, 1, len);
+	return rswap_sock_send_bvecs(sock, &bv, 1, len, deadline);
 }
 
-/* Receive exactly one page image of @len bytes into @page. */
-int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t len)
+/*
+ * Receive @len bytes into @page, starting at byte @off.
+ *
+ * A parser that read headers through a buffer may already hold the first bytes
+ * of the image; it copies those into the page and asks the socket for the
+ * rest.
+ */
+int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t off,
+			 size_t len, unsigned long deadline)
 {
 	struct msghdr msg = { };
 	struct bio_vec bv;
@@ -174,9 +224,11 @@ int rswap_sock_recv_page(struct socket *sock, struct page *page, size_t len)
 	if (!len)
 		return 0;
 
-	bvec_set_page(&bv, page, len, 0);
+	bvec_set_page(&bv, page, len, off);
 	iov_iter_bvec(&msg.msg_iter, ITER_DEST, &bv, 1, len);
 	while (iov_iter_count(&msg.msg_iter)) {
+		if (rswap_sock_expired(deadline))
+			return -ETIMEDOUT;
 		ret = sock_recvmsg(sock, &msg, 0);
 		if (ret <= 0)
 			return ret ? ret : -ECONNRESET;
