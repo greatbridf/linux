@@ -19,6 +19,15 @@
  *   POST /v1/folios/<key>/write  -> 200 on success
  *
  * The server stores one file per key in <data_dir>/<key>.
+ *
+ * This is a test server, not a production store: it has no authentication
+ * and no access control of any kind, so any client that can reach the listen
+ * address can read, overwrite and enumerate every object.  Do not bind it to
+ * a publicly reachable address and do not store anything in it that matters.
+ *
+ * Only one page per object is accepted: the kernel rejects a body that is not
+ * exactly one base page (mm/rswap_http.c), so any other size is refused here
+ * instead of being stored in a form no kernel can read back.
  */
 
 #ifndef _GNU_SOURCE
@@ -42,6 +51,7 @@
 #include <pthread.h>
 #include <limits.h>
 #include <ctype.h>
+#include <stdbool.h>
 
 /* ---------- Configuration ---------- */
 
@@ -61,7 +71,18 @@
  * spelled out because this tool builds without the kernel headers.
  */
 #define KEY_HEXLEN	96
-#define MAX_BODY		(64UL * 1024 * 1024)
+#define MAX_PAGE_SIZE	65536UL
+
+/*
+ * Bodies the kernel can use.  mm/rswap_http.c rejects any object that is not
+ * exactly one base page, and a Linux page size is one of these, so any other
+ * body size would be stored in a form no kernel can read back.
+ */
+static bool is_base_page_size(size_t length)
+{
+	return length == 4096UL || length == 8192UL ||
+	       length == 16384UL || length == MAX_PAGE_SIZE;
+}
 
 /* Global config, set from cmdline. */
 static struct {
@@ -256,14 +277,19 @@ static void handle_get(int fd, const char *key)
 		return;
 	}
 
-	f = open(fpath, O_RDONLY);
+	/* Never follow a symlink planted in a world-readable data_dir. */
+	f = open(fpath, O_RDONLY | O_NOFOLLOW);
+	if (f == -1 && errno == ELOOP) {
+		send_400(fd);
+		return;
+	}
 	if (f < 0) {
 		send_404(fd);
 		return;
 	}
 
 	if (fstat(f, &st) < 0 || st.st_size < 0 ||
-	    (unsigned long long)st.st_size > MAX_BODY) {
+	    !is_base_page_size(st.st_size)) {
 		close(f);
 		send_500(fd);
 		return;
@@ -307,13 +333,14 @@ static void handle_post(int fd, const char *key,
 	char temporary[MAX_PATH];
 	int f;
 
-	if (ensure_dirs(key) < 0) {
-		send_500(fd);
+	/* Validate the key before it can name a directory to create. */
+	if (key_to_path(key, fpath, sizeof(fpath)) < 0) {
+		send_400(fd);
 		return;
 	}
 
-	if (key_to_path(key, fpath, sizeof(fpath)) < 0) {
-		send_400(fd);
+	if (ensure_dirs(key) < 0) {
+		send_500(fd);
 		return;
 	}
 
@@ -419,7 +446,7 @@ static void handle_connection(int fd)
 					end++;
 				if (have_length || !isdigit((unsigned char)*line) ||
 				    end == line || *end || errno ||
-				    length > MAX_BODY) {
+				    !is_base_page_size(length)) {
 					send_400(fd);
 					goto done;
 				}
@@ -508,7 +535,11 @@ static void print_usage(const char *prog)
 		"\n"
 		"Default data_dir: %s\n"
 		"Default port:     %d\n"
-		"Default listen:   %s\n",
+		"Default listen:   %s\n"
+		"\n"
+		"Unauthenticated test server: anyone who can reach -l can read and\n"
+		"overwrite every stored object.  Keep it on loopback.  Only bodies\n"
+		"of exactly one base page (4/8/16/64 KiB) are accepted.\n",
 		prog, DEFAULT_DIR, DEFAULT_PORT, DEFAULT_ADDR);
 }
 
@@ -528,11 +559,17 @@ int main(int argc, char **argv)
 			while (dlen > 1 && cfg.data_dir[dlen - 1] == '/')
 				cfg.data_dir[--dlen] = '\0';
 			break;
-		case 'p':
-			cfg.port = atoi(optarg);
-			if (cfg.port <= 0 || cfg.port > 65535)
+		case 'p': {
+			unsigned long port;
+			char *end = NULL;
+
+			errno = 0;
+			port = strtoul(optarg, &end, 10);
+			if (errno || end == optarg || *end || !port || port > 65535)
 				die("invalid port: %s", optarg);
+			cfg.port = (int)port;
 			break;
+		}
 		case 'l':
 			if (strlen(optarg) >= sizeof(cfg.listen_addr))
 				die("listen address too long");
@@ -549,6 +586,8 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "kvswap_server: listening on %s:%d, data in %s\n",
 		cfg.listen_addr, cfg.port, cfg.data_dir);
+	fprintf(stderr,
+		"kvswap_server: WARNING: unauthenticated test server, loopback only\n");
 
 	/* Ignore SIGPIPE so write() failures return EPIPE. */
 	signal(SIGPIPE, SIG_IGN);

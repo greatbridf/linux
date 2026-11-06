@@ -5,8 +5,11 @@
 import argparse
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
+
+from rswap_scale_test import DEFAULT_TIMEOUT, VERIFIER_SKIP
 
 
 def main():
@@ -17,11 +20,16 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--huge", action="store_true")
     parser.add_argument("--disable-zswap", action="store_true")
+    parser.add_argument("--digests", default=None,
+                        help="record every attached digest in this new file")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help=f"seconds before the verifier is killed "
+                             f"(default: {DEFAULT_TIMEOUT:.0f})")
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error("run as root to create a test cgroup")
-    if args.size_kib <= 0 or args.rounds <= 0:
-        parser.error("size and rounds must be positive")
+    if args.size_kib <= 0 or args.rounds <= 0 or args.timeout <= 0:
+        parser.error("size, rounds and timeout must be positive")
     swap_lines = pathlib.Path("/proc/swaps").read_text().splitlines()[1:]
     if not swap_lines or any(not line.startswith("xswap") for line in swap_lines):
         parser.error("requires only remote xswap devices in /proc/swaps")
@@ -39,7 +47,8 @@ def main():
         limit = max(64 * 1024 * 1024, args.size_kib * 2048)
         (cg / "memory.max").write_text(str(limit))
         (cg / "memory.swap.max").write_text(str(limit))
-        if args.disable_zswap:
+        # zswap may be built out, and then the knobs do not exist.
+        if args.disable_zswap and (cg / "memory.zswap.max").exists():
             (cg / "memory.zswap.max").write_text("0")
         # The shell enters the cgroup before exec, charging the test correctly.
         command = ["sh", "-c",
@@ -47,12 +56,22 @@ def main():
                    "rswap-test", str(cg), args.binary, str(args.size_kib),
                    str(args.rounds), "huge" if args.huge else "base",
                    str(cg / "memory.reclaim")]
-        result = subprocess.run(command, check=False)
+        if args.digests:
+            command += ["--digests", args.digests]
+        try:
+            result = subprocess.run(command, check=False, timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            print(f"FAIL: verifier killed after {args.timeout}s")
+            return 1
         print("Remaining test swap bytes:",
               (cg / "memory.swap.current").read_text().strip())
+        if result.returncode == VERIFIER_SKIP:
+            print("SKIP: verifier skipped the measurement")
+        # A failed rmdir() must not replace the verifier's status.
+        shutil.rmtree(cg, ignore_errors=True)
         return result.returncode
     finally:
-        cg.rmdir()
+        shutil.rmtree(cg, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -71,8 +71,20 @@ class KVSwapTest(unittest.TestCase):
     def test_64k(self):
         self.round_trip(65536)
 
-    def test_large_folio(self):
-        self.round_trip(2 * 1024 * 1024)
+    def test_non_page_size_body_rejected(self):
+        """Only one base page is a body the kernel can read back.
+
+        mm/rswap_http.c rejects any object that is not exactly one base page,
+        so the server refuses such a body instead of storing it.  A large
+        folio is never one KV object either: the core splits it into base
+        pages.
+        """
+        for size in (0, 1000, 2 * 1024 * 1024):
+            body = os.urandom(size)
+            key = digest_key(f"size-{size}".encode())
+            with self.subTest(size=size):
+                self.assertEqual(self.request("POST", key, body)[0], 400)
+                self.assertEqual(self.request("GET", key), (404, b""))
 
     def test_fragmented_header(self):
         body = os.urandom(16384)
@@ -132,9 +144,6 @@ class KVSwapTest(unittest.TestCase):
                 self.assertEqual(self.request("POST", key, b"page"), (400, b""))
         self.assertEqual(sorted(os.listdir(self.directory)), before,
                          "a traversal attempt left the store directory")
-
-    def test_empty_value(self):
-        self.round_trip(0)
 
     def test_oversized_request(self):
         key = "e" * KEY_HEXLEN

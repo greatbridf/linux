@@ -8,3 +8,4 @@ kvswap_server
 rswap_test
 rswap_pageout_test
 rswap_swapin_test
+__pycache__/

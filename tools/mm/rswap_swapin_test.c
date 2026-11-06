@@ -113,6 +113,7 @@ static int attach_page_hashes(void *data, size_t size, size_t page_size,
 		unsigned int hash_len;
 		char hex[EVP_MAX_MD_SIZE * 2 + 1];
 		char line[128];
+		ssize_t written;
 		size_t i, len;
 
 		if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1 ||
@@ -130,8 +131,14 @@ static int attach_page_hashes(void *data, size_t size, size_t page_size,
 		}
 		len = snprintf(line, sizeof(line), "%#lx %s\n",
 			       (unsigned long)((char *)data + offset), hex);
-		if (len >= sizeof(line) || lseek(fd, 0, SEEK_SET) < 0 ||
-		    write(fd, line, len) != (ssize_t)len) {
+		if (len >= sizeof(line) || lseek(fd, 0, SEEK_SET) < 0) {
+			perror("attach page hash");
+			goto out;
+		}
+		do {
+			written = write(fd, line, len);
+		} while (written < 0 && errno == EINTR);
+		if (written < 0 || (size_t)written != len) {
 			perror("attach page hash");
 			goto out;
 		}
@@ -204,6 +211,36 @@ static size_t nonresident(void *data, size_t size, size_t page_size,
 	return missing;
 }
 
+/*
+ * Drop swap-cache residency before measuring.  memory.reclaim reports EAGAIN
+ * when it reclaimed only part of the request, which is a normal outcome here;
+ * read errno only from the call that failed so a stale value cannot mask a
+ * real error or hide behind EAGAIN.
+ */
+static int reclaim_memory(const char *path, size_t size)
+{
+	FILE *reclaim;
+	int error = 0;
+
+	reclaim = fopen(path, "w");
+	if (!reclaim) {
+		perror("memory.reclaim");
+		return -1;
+	}
+	errno = 0;
+	if (fprintf(reclaim, "%zu swappiness=200\n", size) < 0)
+		error = errno ? errno : EIO;
+	errno = 0;
+	if (fclose(reclaim) && !error)
+		error = errno ? errno : EIO;
+	if (error && error != EAGAIN) {
+		errno = error;
+		perror("memory.reclaim");
+		return -1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct sigaction action = {
@@ -222,7 +259,6 @@ int main(int argc, char **argv)
 	unsigned char *resident;
 	uint64_t *data;
 	char *end;
-	FILE *reclaim;
 	int willneed, error;
 
 	if (argc != 6) {
@@ -281,16 +317,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	/* Drop the swap-cache residency left by MADV_PAGEOUT before measuring. */
-	reclaim = fopen(argv[5], "w");
-	if (!reclaim) {
-		perror("memory.reclaim");
+	if (reclaim_memory(argv[5], size))
 		return 1;
-	}
-	fprintf(reclaim, "%zu swappiness=200\n", size);
-	if (fclose(reclaim) && errno != EAGAIN) {
-		perror("memory.reclaim");
-		return 1;
-	}
 	missing = nonresident(data, size, page_size, resident);
 	if (count_swapped(data, pages, page_size, &swapped, &present)) {
 		perror("pagemap");

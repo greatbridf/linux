@@ -18,6 +18,9 @@
 
 #define RSWAP_ATTACH_PATH "/proc/sys/vm/rswap/attach"
 
+/* A documented skip must be distinguishable from a failure. */
+#define EXIT_SKIP 77
+
 static void sigbus_handler(int sig __always_unused,
 			  siginfo_t *info __always_unused,
 			  void *context __always_unused)
@@ -112,6 +115,7 @@ static int attach_page_hashes(void *data, size_t size, size_t page_size,
 		unsigned int hash_len;
 		char hex[EVP_MAX_MD_SIZE * 2 + 1];
 		char line[128];
+		ssize_t written;
 		size_t i, len;
 
 		if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1 ||
@@ -129,8 +133,14 @@ static int attach_page_hashes(void *data, size_t size, size_t page_size,
 		}
 		len = snprintf(line, sizeof(line), "%#lx %s\n",
 			       (unsigned long)((char *)data + offset), hex);
-		if (len >= sizeof(line) || lseek(fd, 0, SEEK_SET) < 0 ||
-		    write(fd, line, len) != (ssize_t)len) {
+		if (len >= sizeof(line) || lseek(fd, 0, SEEK_SET) < 0) {
+			perror("attach page hash");
+			goto out;
+		}
+		do {
+			written = write(fd, line, len);
+		} while (written < 0 && errno == EINTR);
+		if (written < 0 || (size_t)written != len) {
 			perror("attach page hash");
 			goto out;
 		}
@@ -249,8 +259,10 @@ int main(int argc, char **argv)
 		}
 		fclose(file);
 		printf("THP KiB: %lu/%zu\n", huge_kb, size / 1024);
-		if (huge_kb != size / 1024)
-			return 4;
+		if (huge_kb != size / 1024) {
+			fprintf(stderr, "SKIP: mapping is not fully backed by THP\n");
+			return EXIT_SKIP;
+		}
 	}
 	printf("READY pid=%d bytes=%zu pages=%zu address=%#lx\n", getpid(),
 	       size, size / page_size, (unsigned long)data);
