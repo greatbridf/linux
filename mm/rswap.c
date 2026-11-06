@@ -237,6 +237,7 @@ struct rswap_stats {
 	atomic64_t	errors_read;
 	atomic64_t	no_digest;	/* writeout, no digest attached */
 	atomic64_t	no_entry;	/* swapin, no digest stored */
+	atomic64_t	read_retries;	/* swapin batches moved again */
 };
 
 /* Backend-wide counters: the sum over all devices plus round trip timing. */
@@ -325,6 +326,14 @@ static void rswap_stats_io(struct rswap_io_stats *io, s64 ns)
 	atomic64_inc(&io->batches);
 	atomic64_add(ns, &io->ns);
 	rswap_stats_max(&io->max_ns, ns);
+}
+
+/* One read batch attempt that was repeated; see rswap_flush_batch(). */
+static void rswap_stats_retry(struct rswap_stats *stats)
+{
+	if (!stats)
+		return;
+	atomic64_inc(&stats->read_retries);
 }
 
 /* ---------- Per-page digests (page_ext) ---------- */
@@ -981,20 +990,84 @@ static int rswap_submit_batch(struct rswap_kv_page *pages, unsigned int nr,
 }
 
 /*
+ * How many times a read batch is moved again after a transient transport
+ * failure, i.e. at most three attempts.  Sibling of RSWAP_READ_MAX_INFLIGHT
+ * (see below): a retry costs one more backend round trip of the same bound as
+ * the first, and the fault that waits for the batch waits for all of them.
+ * Two retries ride out a connection that a peer or a signal killed without
+ * turning a dead store into a long stall in the swapin path.
+ */
+#define RSWAP_READ_MAX_RETRIES	2
+
+/*
+ * Is @err a transport failure that is worth moving the batch again?
+ *
+ * Only failures a later attempt can plausibly survive belong here.  A missing
+ * object (-ENOENT), a rejected one (-EMSGSIZE), a server error (-EIO), a
+ * refused credential (-EACCES), a malformed reply (-EPROTO), a bad parameter
+ * (-EINVAL) and an allocation failure (-ENOMEM) are answers about the request
+ * or the store, not about this attempt, so repeating them would delay the
+ * fault that reports the real cause.
+ *
+ * A page store answers every read with the same object, so a read batch is
+ * idempotent and the whole batch is moved again, not just the pages an
+ * earlier attempt had not reached yet.
+ */
+static bool rswap_read_retryable(int err)
+{
+	switch (err) {
+	case -EINTR:
+	case -ETIMEDOUT:
+	case -ECONNRESET:
+	case -ECONNREFUSED:
+	case -ECONNABORTED:
+	case -EPIPE:
+	case -ENETUNREACH:
+	case -EHOSTUNREACH:
+	case -ENETDOWN:
+	case -EAGAIN:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
  * Flush one batch: time it, move it, and account it per device and in total.
  * Pages of a failed batch count as failed, not as moved.
+ *
+ * A read batch is moved again when it failed with a transient transport error,
+ * because nothing above it would: the first negative errno fails the whole swap
+ * request and the task that touched the page dies with it.  Writeout stays
+ * single attempt: reclaim keeps the folio resident and drives the page again,
+ * so a retry there would only delay reclaim.
+ *
+ * Each attempt is a backend call, so it is counted and timed as one; the pages
+ * and the errors of a batch are accounted once, from its final outcome.
  */
 static int rswap_flush_batch(struct rswap_kv_page *pages,
 			     struct rswap_stats *stats, unsigned int nr, int rw)
 {
-	s64 started = ktime_get_ns();
+	unsigned int attempt;
 	s64 elapsed;
 	int ret;
 	int i;
 
-	ret = rswap_submit_batch(pages, nr, rw);
-	elapsed = ktime_get_ns() - started;
-	rswap_stats_io(rw == WRITE ? &rswap_write_io : &rswap_read_io, elapsed);
+	for (attempt = 0; ; attempt++) {
+		s64 started = ktime_get_ns();
+
+		ret = rswap_submit_batch(pages, nr, rw);
+		elapsed = ktime_get_ns() - started;
+		rswap_stats_io(rw == WRITE ? &rswap_write_io : &rswap_read_io,
+			       elapsed);
+		if (!ret || rw == WRITE ||
+		    attempt >= RSWAP_READ_MAX_RETRIES ||
+		    !rswap_read_retryable(ret))
+			break;
+		rswap_stats_retry(&rswap_total);
+		rswap_stats_retry(stats);
+		cond_resched();
+	}
 
 	if (!ret) {
 		rswap_stats_pages(&rswap_total, rw, nr);
@@ -1192,6 +1265,9 @@ out:
  * connection, and the measured WILLNEED throughput of the remote Redis test
  * server stopped improving beyond eight concurrent batches (22.5 MiB/s with
  * eight callers against 9.7 MiB/s with one).
+ *
+ * A batch that fails with a transient transport error is moved again, up to
+ * RSWAP_READ_MAX_RETRIES times (see rswap_flush_batch()).
  */
 #define RSWAP_READ_MAX_INFLIGHT	8
 
@@ -1802,6 +1878,8 @@ static int rswap_stats_show(struct seq_file *m, void *unused)
 		   atomic64_read(&rswap_total.errors_read));
 	seq_printf(m, "read_no_entry\t%llu\n",
 		   atomic64_read(&rswap_total.no_entry));
+	seq_printf(m, "read_retries\t%llu\n",
+		   atomic64_read(&rswap_total.read_retries));
 	seq_printf(m, "read_avg_ns\t%llu\n",
 		   rswap_stats_avg(&rswap_read_io.ns, &rswap_read_io.batches));
 	seq_printf(m, "read_max_ns\t%llu\n",
@@ -1840,6 +1918,8 @@ static int rswap_dev_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "errors_read\t%llu\n",
 		   atomic64_read(&stats->errors_read));
 	seq_printf(m, "no_entry\t%llu\n", atomic64_read(&stats->no_entry));
+	seq_printf(m, "read_retries\t%llu\n",
+		   atomic64_read(&stats->read_retries));
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(rswap_dev_stats);
