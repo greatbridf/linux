@@ -197,12 +197,14 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 		unsigned long end, struct mm_walk *walk)
 {
 	struct vm_area_struct *vma = walk->private;
+	struct swap_info_struct *si = NULL;	/* device pinned for @ctx */
 	struct swap_io_ctx ctx = {};
 	pte_t *ptep = NULL;
 	spinlock_t *ptl;
 	unsigned long addr;
 
 	for (addr = start; addr < end; addr += PAGE_SIZE) {
+		struct swap_info_struct *entry_si;
 		pte_t pte;
 		softleaf_t entry;
 		struct folio *folio;
@@ -221,6 +223,23 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 		pte_unmap_unlock(ptep, ptl);
 		ptep = NULL;
 
+		/*
+		 * @ctx is submitted after the loop, so the device has to stay
+		 * pinned until then: read_swap_cache_async() only pins it for its
+		 * own duration and the swap_ops of the queued request read the
+		 * device when swap_read_submit() runs.
+		 */
+		entry_si = get_swap_device(entry);
+		if (IS_ERR_OR_NULL(entry_si))
+			continue;
+		if (si != entry_si) {
+			/* The queued request belongs to @si; submit it first. */
+			swap_read_submit(&ctx);
+			if (si)
+				put_swap_device(si);
+			si = entry_si;
+		}
+
 		folio = read_swap_cache_async(&ctx, entry, GFP_HIGHUSER_MOVABLE,
 					vma, addr);
 		if (folio)
@@ -230,6 +249,8 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 	if (ptep)
 		pte_unmap_unlock(ptep, ptl);
 	swap_read_submit(&ctx);
+	if (si)
+		put_swap_device(si);
 	cond_resched();
 
 	return 0;

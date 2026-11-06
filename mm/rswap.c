@@ -140,6 +140,15 @@ static const __initconst struct rswap_backend *rswap_backends[] = {
 #endif
 };
 
+/*
+ * A device without a backend cannot move a single page: rswap_backends[]
+ * would be empty, the late init would fail and every device create would be
+ * rejected with -ENODEV.  Catch that at build time instead.
+ */
+#if !IS_ENABLED(CONFIG_RSWAP_KV_HTTP) && !IS_ENABLED(CONFIG_RSWAP_KV_REDIS)
+#error "RSWAP needs at least one KV backend: enable RSWAP_KV_HTTP or RSWAP_KV_REDIS"
+#endif
+
 static int __init rswap_backend_setup(void)
 {
 	const struct rswap_backend *backend = NULL;
@@ -214,8 +223,14 @@ static int rswap_kv_load(struct rswap_kv_page *pages, unsigned int nr,
  * Per-device I/O counters, reachable from struct swap_info_struct.  They are
  * lock-free: swap I/O runs on many CPUs at once and stats must never
  * serialize it, and a lost update on a debugfs read is harmless.
+ *
+ * Every batch counts into the block of its device, so the block has to
+ * outlive the device: @refs is held once by the device and once by every
+ * batch that captured the pointer, which is what keeps a batch queued while
+ * the device is torn down from writing into freed memory.
  */
 struct rswap_stats {
+	refcount_t	refs;
 	atomic64_t	pages_written;
 	atomic64_t	pages_read;
 	atomic64_t	errors_written;
@@ -235,6 +250,21 @@ struct rswap_io_stats {
 
 static struct rswap_io_stats rswap_write_io;
 static struct rswap_io_stats rswap_read_io;
+
+/* Take a reference on a device's counter block; @stats may be NULL. */
+static struct rswap_stats *rswap_stats_get(struct rswap_stats *stats)
+{
+	if (stats)
+		refcount_inc(&stats->refs);
+	return stats;
+}
+
+/* Drop a reference, freeing the block once nothing counts into it any more. */
+static void rswap_stats_put(struct rswap_stats *stats)
+{
+	if (stats && refcount_dec_and_test(&stats->refs))
+		kfree(stats);
+}
 
 static void rswap_stats_max(atomic64_t *max, s64 value)
 {
@@ -564,21 +594,32 @@ static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
  *
  * The anonymous caller runs under the page table lock, so the program must
  * not sleep and must not fault.
+ *
+ * The program is published into the VMA by rswap_attach_prog() and can be
+ * replaced or detached at any time from a task that only holds the mmap lock in
+ * write mode, which does not exclude the page table and rmap locks the callers
+ * of this function hold.  The pointer is therefore loaded inside an RCU
+ * read-side section, and that section is also what keeps the program alive:
+ * bpf_prog_put() never frees a program synchronously, it defers the free through
+ * a grace period (__bpf_prog_put_noref()), so a lookuper that fetched the
+ * program before the detach still runs on live memory.
  */
 static int rswap_hash_lookup(struct vm_area_struct *vma, unsigned long addr,
 			     u8 *hash)
 {
 	struct rswap_hash_ctx ctx = { .vaddr = addr };
-	struct bpf_prog *prog = vma->rswap_prog;
+	struct bpf_prog *prog;
+	int ret = -ENOENT;
 
-	if (!prog)
-		return -ENOENT;
+	rcu_read_lock();
+	prog = rcu_dereference(vma->rswap_prog);
+	if (prog && bpf_prog_run(prog, &ctx)) {
+		memcpy(hash, ctx.hash, RSWAP_HASH_LEN);
+		ret = 0;
+	}
+	rcu_read_unlock();
 
-	if (!bpf_prog_run(prog, &ctx))
-		return -ENOENT;
-
-	memcpy(hash, ctx.hash, RSWAP_HASH_LEN);
-	return 0;
+	return ret;
 }
 
 /*
@@ -628,16 +669,17 @@ void rswap_prepare_hashes(struct folio *folio, gfp_t gfp)
 void rswap_vma_dup(struct vm_area_struct *vma)
 {
 	/* Digests are a property of the mapping that attached them. */
-	vma->rswap_prog = NULL;
+	rcu_assign_pointer(vma->rswap_prog, NULL);
 	vm_flags_clear(vma, VM_HASHED);
 }
 
 void rswap_vma_free(struct vm_area_struct *vma)
 {
-	if (vma->rswap_prog) {
-		bpf_prog_put(vma->rswap_prog);
-		vma->rswap_prog = NULL;
-	}
+	struct bpf_prog *prog;
+
+	prog = rcu_replace_pointer(vma->rswap_prog, NULL, true);
+	if (prog)
+		bpf_prog_put(prog);
 }
 
 /*
@@ -681,8 +723,7 @@ int rswap_attach_prog(unsigned long vaddr, int prog_fd)
 		goto unlock;
 	}
 
-	old_prog = vma->rswap_prog;
-	WRITE_ONCE(vma->rswap_prog, prog);
+	old_prog = rcu_replace_pointer(vma->rswap_prog, prog, true);
 	if (prog)
 		vm_flags_set(vma, VM_HASHED);
 	else
@@ -690,6 +731,12 @@ int rswap_attach_prog(unsigned long vaddr, int prog_fd)
 
 	mmap_write_unlock(mm);
 
+	/*
+	 * The replacement is published, so a lookup that runs now either sees
+	 * @prog or the old one.  The old one is only dropped here, and its free is
+	 * deferred by bpf_prog_put() through a grace period, so a lookup that
+	 * already fetched it under rcu_read_lock() finishes on a live program.
+	 */
 	if (old_prog)
 		bpf_prog_put(old_prog);
 	return 0;
@@ -973,12 +1020,15 @@ struct rswap_read_req;
  * allocated for the duration of the batch.
  *
  * A batch belongs to one asynchronous read request while it is queued or
- * running in a worker (@req is NULL on the synchronous write path).  The
- * per-device counters in @stats stay valid until the batch is freed: swapoff
- * drains the read workqueue before it frees the device table.
+ * running in a worker (@req is NULL on the synchronous write path).  It never
+ * dereferences its swap device once it left the submitting task: the errors it
+ * reports and the counters it updates come from @type and @stats, and @stats
+ * holds a reference so the block outlives the device.  Keys and base page
+ * addresses are resolved at submit time for the same reason.
  */
 struct rswap_batch {
-	struct swap_info_struct	*si;
+	struct rswap_stats	*stats;		/* referenced, may be NULL */
+	unsigned int		type;		/* swap type, for diagnostics */
 	unsigned int		nr;
 
 	struct rswap_read_req	*req;		/* NULL on the synchronous path */
@@ -995,9 +1045,19 @@ static struct rswap_batch *rswap_batch_alloc(struct swap_info_struct *si)
 	if (unlikely(!batch))
 		return NULL;
 
-	batch->si = si;
+	/* Taken here, in the submitting task, while the device is pinned. */
+	batch->stats = rswap_stats_get(si->rswap_stats);
+	batch->type = si->type;
 
 	return batch;
+}
+
+static void rswap_batch_free(struct rswap_batch *batch)
+{
+	if (!batch)
+		return;
+	rswap_stats_put(batch->stats);
+	kfree(batch);
 }
 
 /*
@@ -1032,15 +1092,14 @@ static int rswap_batch_add(struct rswap_batch *batch,
 static int rswap_batch_flush(struct rswap_batch *batch, int rw)
 {
 	unsigned int nr = batch->nr;
-	struct rswap_stats *stats = batch->si->rswap_stats;
 	int ret;
 
 	batch->nr = 0;
-	ret = rswap_flush_batch(batch->pages, stats, nr, rw);
+	ret = rswap_flush_batch(batch->pages, batch->stats, nr, rw);
 	if (ret)
 		pr_err_ratelimited("%s type %u failed: %d\n",
 				   rw == WRITE ? "write" : "read",
-				   batch->si->type, ret);
+				   batch->type, ret);
 	return ret;
 }
 
@@ -1110,14 +1169,14 @@ key_error:
 	 */
 	nr_left = (sio->len >> PAGE_SHIFT) - nr_moved - batch->nr;
 	rswap_stats_key_failure(&rswap_total, rw, ret, nr_left);
-	rswap_stats_key_failure(ctx->sis->rswap_stats, rw, ret, nr_left);
+	rswap_stats_key_failure(batch->stats, rw, ret, nr_left);
 	pr_err_ratelimited("%s type %u offset %lu failed: %d\n",
 			   rw == WRITE ? "write" : "read",
 			   ctx->sis->type,
 			   swp_offset(folio_page_swap_entry(folio, page)),
 			   ret);
 out:
-	kfree(batch);
+	rswap_batch_free(batch);
 	memalloc_noio_restore(noio_flags);
 	sio->iocb.ki_complete(&sio->iocb, ret < 0 ? ret : sio->len);
 }
@@ -1245,7 +1304,7 @@ static void rswap_read_batch_work(struct work_struct *work)
 	memalloc_noio_restore(noio_flags);
 
 	rswap_read_req_error(req, ret);
-	kfree(batch);
+	rswap_batch_free(batch);
 	rswap_read_req_put(req);
 	rswap_read_leave(1);
 }
@@ -1285,7 +1344,7 @@ static bool rswap_read_dispatch(struct rswap_batch *batch)
 	atomic64_inc(&rswap_read_fallbacks);
 	ret = rswap_batch_flush(batch, READ);
 	rswap_read_req_error(req, ret);
-	kfree(batch);
+	rswap_batch_free(batch);
 
 	return held;
 }
@@ -1403,7 +1462,7 @@ key_error:
 	 */
 	nr_left = (sio->len >> PAGE_SHIFT) - nr_queued - batch->nr;
 	rswap_stats_key_failure(&rswap_total, READ, ret, nr_left);
-	rswap_stats_key_failure(batch->si->rswap_stats, READ, ret, nr_left);
+	rswap_stats_key_failure(batch->stats, READ, ret, nr_left);
 	pr_err_ratelimited("read type %u offset %lu failed: %d\n",
 			   ctx->sis->type,
 			   swp_offset(folio_page_swap_entry(folio, page)),
@@ -1411,7 +1470,7 @@ key_error:
 out_error:
 	rswap_read_req_error(req, ret);
 out:
-	kfree(batch);
+	rswap_batch_free(batch);
 	memalloc_noio_restore(noio_flags);
 	atomic64_inc(&rswap_read_submits);
 	atomic64_add(ktime_get_ns() - started, &rswap_read_submit_ns);
@@ -1588,12 +1647,14 @@ static int rswap_stats_alloc(struct swap_info_struct *si)
 	si->rswap_stats = kzalloc_obj(*si->rswap_stats, GFP_KERNEL);
 	if (!si->rswap_stats)
 		return -ENOMEM;
+	/* The device holds the first reference; batches take their own. */
+	refcount_set(&si->rswap_stats->refs, 1);
 	return 0;
 }
 
 static void rswap_stats_free(struct swap_info_struct *si)
 {
-	kfree(si->rswap_stats);
+	rswap_stats_put(si->rswap_stats);
 	si->rswap_stats = NULL;
 }
 
@@ -1669,21 +1730,23 @@ int rswap_enable(struct swap_info_struct *si)
 void rswap_disable(struct swap_info_struct *si)
 {
 	/*
-	 * Every queued or running read batch still updates si->rswap_stats, so
-	 * drain the workqueue before freeing it.  The drain is what makes the
-	 * per-batch device pointers safe; each batch completes its request from
-	 * the worker, which also unlocks the folios it holds.
+	 * Reclaim waits for the writeback flag that writeout clears, but a read
+	 * batch still completes its request from the worker and unlocks the folios
+	 * it holds, so drain the read workqueue here.
+	 *
+	 * The counter block is not freed here and si->rswap_stats is left as it is:
+	 * a batch does not reach back into the device, it carries its own reference
+	 * to the counters (struct rswap_batch), and the block is freed by whichever
+	 * rswap_stats_put() releases the last reference - i.e. only once neither a
+	 * worker nor a queued batch can observe it any more.  The debugfs file that
+	 * reads the block is removed by the swap core as part of the teardown.
 	 *
 	 * The digest slots themselves belong to the swap clusters, which are
 	 * released by the swap core, so nothing else is ours to free here.
-	 *
-	 * No new submit can be in flight here: __swapoff() killed si->users,
-	 * synchronized RCU and waited for its holders before calling us, and
-	 * we run without a lock held.
 	 */
 	if (rswap_read_wq)
 		flush_workqueue(rswap_read_wq);
-	rswap_stats_free(si);
+	rswap_stats_put(si->rswap_stats);
 }
 
 void rswap_swapoff(struct swap_info_struct *si)

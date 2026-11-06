@@ -151,9 +151,10 @@ config RSWAP
 	  The attach file accepts:
 	    <virtual-address> <64 hexadecimal SHA-256 digits>
 
-	  Both backends store one page object per SHA-256 digest.  Select at
-	  least one backend below, then pick it with rswap.backend= and point
-	  it at a server with rswap.host= / rswap.port=.
+	  Both backends store one page object per SHA-256 digest.  At least one
+	  backend must be selected below, otherwise rswap cannot be built:
+	  pick it at boot with rswap.backend= and point it at a server with
+	  rswap.host= / rswap.port=.
 
 	  To use:
 	    1. Build and start the KV server (tools/mm/kvswap_server.c) or a
@@ -163,6 +164,10 @@ config RSWAP
 	  If unsure, say N.
 
 if RSWAP
+
+# At least one backend is required: a build with neither of them has an empty
+# backend list and cannot create a single device, so mm/rswap.c rejects it with
+# #error.
 
 config RSWAP_KV_HTTP
 	bool "HTTP/1.0 KV backend (kvswap_server)"
