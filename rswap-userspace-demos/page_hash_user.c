@@ -7,8 +7,9 @@
  *
  *   <virtual-address> <sha256-hex>
  *
- * The mapping remains resident until the program is interrupted so the
- * attached page_ext metadata can be exercised by rswap.
+ * The mapping is deliberately not mlock()ed by default: a pinned mapping
+ * cannot be reclaimed, so the demo could never show rswap writing the pages
+ * out.  --mlock pins it instead, for measuring only the attach side.
  */
 
 #define _GNU_SOURCE
@@ -103,23 +104,43 @@ static bool attach_hash(int fd, unsigned long addr,
 	return true;
 }
 
-static int parse_size_mib(int argc, char **argv, size_t *size_mib)
+static void print_usage(const char *prog)
 {
-	unsigned long long value;
-	char *end;
+	fprintf(stderr,
+		"Usage: %s [size_MiB] [--mlock]\n"
+		"\n"
+		"Default size: %d MiB\n"
+		"The mapping is not mlocked, so rswap can reclaim it.  --mlock pins\n"
+		"it in RAM instead, which keeps writeout from happening.\n",
+		prog, DEFAULT_SIZE_MIB);
+}
 
-	value = DEFAULT_SIZE_MIB;
-	if (argc > 2) {
-		fprintf(stderr, "Usage: %s [size_MiB]\n", argv[0]);
-		return -1;
+static int parse_args(int argc, char **argv, size_t *size_mib, bool *mlock)
+{
+	unsigned long long value = DEFAULT_SIZE_MIB;
+	const char *size_arg = NULL;
+	int i;
+
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--mlock")) {
+			if (*mlock)
+				return -1;
+			*mlock = true;
+			continue;
+		}
+		if (size_arg || argv[i][0] == '-')
+			return -1;
+		size_arg = argv[i];
 	}
 
-	if (argc == 2) {
+	if (size_arg) {
+		char *end;
+
 		errno = 0;
-		value = strtoull(argv[1], &end, 10);
-		if (errno || end == argv[1] || *end || !value ||
+		value = strtoull(size_arg, &end, 10);
+		if (errno || end == size_arg || *end || !value ||
 		    value > SIZE_MAX / MIB_TO_BYTES) {
-			fprintf(stderr, "Invalid size: %s\n", argv[1]);
+			fprintf(stderr, "Invalid size: %s\n", size_arg);
 			return -1;
 		}
 	}
@@ -134,6 +155,7 @@ int main(int argc, char **argv)
 	unsigned char first_hash[RSWAP_HASH_LEN] = { 0 };
 	EVP_MD_CTX *ctx = NULL;
 	size_t size_mib;
+	bool mlock_mapping = false;
 	long page_size;
 	size_t nr_pages;
 	size_t region_size;
@@ -145,8 +167,10 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	setvbuf(stderr, NULL, _IOLBF, 0);
 
-	if (parse_size_mib(argc, argv, &size_mib))
+	if (parse_args(argc, argv, &size_mib, &mlock_mapping)) {
+		print_usage(argv[0]);
 		return 1;
+	}
 
 	page_size = sysconf(_SC_PAGESIZE);
 	if (page_size <= 0) {
@@ -160,6 +184,7 @@ int main(int argc, char **argv)
 	printf("  Region      : %zu MiB (%zu pages, %ld-byte pages)\n",
 	       size_mib, nr_pages, page_size);
 	printf("  Sysctl      : %s\n", RSWAP_ATTACH_PATH);
+	printf("  mlock       : %s\n", mlock_mapping ? "yes" : "no");
 
 	attach_fd = open(RSWAP_ATTACH_PATH, O_WRONLY);
 	if (attach_fd < 0) {
@@ -177,7 +202,7 @@ int main(int argc, char **argv)
 	printf("  Mapping     : %p .. %p\n", mapping,
 	       mapping + region_size - 1);
 
-	if (mlock(mapping, region_size))
+	if (mlock_mapping && mlock(mapping, region_size))
 		fprintf(stderr, "  Warning: mlock: %s\n", strerror(errno));
 
 	seed = (uint64_t)getpid() ^ UINT64_C(0xdeadbeefcafe);

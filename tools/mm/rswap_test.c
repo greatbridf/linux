@@ -16,6 +16,9 @@
 
 #define RSWAP_ATTACH_PATH "/proc/sys/vm/rswap/attach"
 
+/* A documented skip must be distinguishable from a failure. */
+#define EXIT_SKIP 77
+
 static void sigbus_handler(int sig __always_unused,
 			  siginfo_t *info __always_unused,
 			  void *context __always_unused)
@@ -35,7 +38,13 @@ static uint64_t pattern(uint64_t word, uint64_t seed)
 	return value ^ (value >> 31);
 }
 
-static int attach_page_hashes(void *data, size_t size, size_t page_size)
+/*
+ * Attach one digest per base page and record every digest in @keys, the
+ * manifest a runner audits the backend against.  The manifest is opened with
+ * "wx": one run owns one file.
+ */
+static int attach_page_hashes(void *data, size_t size, size_t page_size,
+			      FILE *keys)
 {
 	EVP_MD_CTX *ctx;
 	size_t offset;
@@ -54,6 +63,7 @@ static int attach_page_hashes(void *data, size_t size, size_t page_size)
 		unsigned int hash_len;
 		char hex[EVP_MAX_MD_SIZE * 2 + 1];
 		char line[128];
+		ssize_t written;
 		size_t i, len;
 
 		if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1 ||
@@ -65,10 +75,20 @@ static int attach_page_hashes(void *data, size_t size, size_t page_size)
 		}
 		for (i = 0; i < hash_len; i++)
 			snprintf(hex + i * 2, 3, "%02x", hash[i]);
+		if (keys && fprintf(keys, "%s\n", hex) < 0) {
+			perror("write digest manifest");
+			goto out;
+		}
 		len = snprintf(line, sizeof(line), "%#lx %s\n",
 			       (unsigned long)((char *)data + offset), hex);
-		if (len >= sizeof(line) || lseek(fd, 0, SEEK_SET) < 0 ||
-		    write(fd, line, len) != (ssize_t)len) {
+		if (len >= sizeof(line) || lseek(fd, 0, SEEK_SET) < 0) {
+			perror("attach page hash");
+			goto out;
+		}
+		do {
+			written = write(fd, line, len);
+		} while (written < 0 && errno == EINTR);
+		if (written < 0 || (size_t)written != len) {
 			perror("attach page hash");
 			goto out;
 		}
@@ -80,6 +100,36 @@ out:
 		close(fd);
 	EVP_MD_CTX_free(ctx);
 	return ret;
+}
+
+/*
+ * Bounded cgroup reclaim of the mapping.  memory.reclaim reports EAGAIN when
+ * it reclaimed only part of the request, which is a normal outcome here; read
+ * errno only from the call that failed so a stale value cannot mask a real
+ * error or hide behind EAGAIN.
+ */
+static int reclaim_memory(const char *path, size_t size)
+{
+	FILE *file;
+	int error = 0;
+
+	file = fopen(path, "w");
+	if (!file) {
+		perror("open memory.reclaim");
+		return -1;
+	}
+	errno = 0;
+	if (fprintf(file, "%zu swappiness=200\n", size) < 0)
+		error = errno ? errno : EIO;
+	errno = 0;
+	if (fclose(file) && !error)
+		error = errno ? errno : EIO;
+	if (error && error != EAGAIN) {
+		errno = error;
+		perror("memory.reclaim");
+		return -1;
+	}
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -95,23 +145,47 @@ int main(int argc, char **argv)
 	uint64_t base_seed;
 	unsigned char *resident;
 	unsigned int round;
-	int huge = argc > 3 && !strcmp(argv[3], "huge");
-	const char *reclaim = argc > 4 ? argv[4] : NULL;
+	const char *positional[4];
+	const char *digests = NULL;
+	const char *reclaim = NULL;
+	FILE *keys = NULL;
+	int huge;
+	int i, nr_positional = 0;
 	size_t alignment = page_size;
 	void *mapping;
 	size_t prefix;
 
-	if (argc > 1)
-		size = strtoul(argv[1], NULL, 0) * 1024;
-	if (argc > 2)
-		rounds = strtoul(argv[2], NULL, 0);
-	if (!size || size % page_size || !rounds) {
-		fprintf(stderr, "Usage: %s [size_KiB] [rounds] [huge]\n",
-			argv[0]);
-		return 1;
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--digests")) {
+			if (++i == argc || digests)
+				goto usage;
+			digests = argv[i];
+		} else if (nr_positional == 4) {
+			goto usage;
+		} else {
+			positional[nr_positional++] = argv[i];
+		}
 	}
+	huge = nr_positional > 2 && !strcmp(positional[2], "huge");
+	if (nr_positional > 3)
+		reclaim = positional[3];
+	if (nr_positional > 0)
+		size = strtoul(positional[0], NULL, 0) * 1024;
+	if (nr_positional > 1)
+		rounds = strtoul(positional[1], NULL, 0);
+	if (!size || size % page_size || !rounds ||
+	    (nr_positional > 2 && strcmp(positional[2], "huge") &&
+	     strcmp(positional[2], "base")))
+		goto usage;
 	sigaction(SIGBUS, &action, NULL);
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (digests) {
+		keys = fopen(digests, "wx");
+		if (!keys) {
+			perror(digests);
+			return 1;
+		}
+	}
 	/* Reclaim must not evict the verifier's own stack and runtime state. */
 	if (mlockall(MCL_CURRENT)) {
 		perror("mlockall");
@@ -160,7 +234,7 @@ int main(int argc, char **argv)
 
 		for (i = 0; i < size / sizeof(*data); i++)
 			data[i] = pattern(i, seed);
-		if (attach_page_hashes(data, size, page_size))
+		if (attach_page_hashes(data, size, page_size, keys))
 			return 1;
 		if (huge) {
 			FILE *file = fopen("/proc/self/smaps", "r");
@@ -184,26 +258,17 @@ int main(int argc, char **argv)
 			fclose(file);
 			printf("Round %u: %lu KiB backed by THP\n",
 			       round + 1, huge_kb);
-			if (!huge_kb)
-				return 4;
+			if (!huge_kb) {
+				fprintf(stderr, "SKIP: mapping has no THP\n");
+				return EXIT_SKIP;
+			}
 		}
 		if (madvise(data, size, MADV_PAGEOUT)) {
 			perror("MADV_PAGEOUT");
 			return 1;
 		}
-		if (reclaim) {
-			FILE *file = fopen(reclaim, "w");
-
-			if (!file) {
-				perror("open memory.reclaim");
-				return 1;
-			}
-			fprintf(file, "%zu swappiness=200\n", size);
-			if (fclose(file) && errno != EAGAIN) {
-				perror("memory.reclaim");
-				return 1;
-			}
-		}
+		if (reclaim && reclaim_memory(reclaim, size))
+			return 1;
 		usleep(100000);
 		if (mincore(data, size, resident)) {
 			perror("mincore");
@@ -216,7 +281,7 @@ int main(int argc, char **argv)
 		       round + 1, evicted, size / page_size);
 		if (!evicted) {
 			fprintf(stderr, "SKIP: no pages evicted; not a swap test\n");
-			return 4;
+			return EXIT_SKIP;
 		}
 		/* Force base-page faults after a large-folio write. */
 		if (huge && madvise(data, size, MADV_NOHUGEPAGE)) {
@@ -248,6 +313,16 @@ int main(int argc, char **argv)
 	}
 	munmap(data, size);
 	free(resident);
+	if (keys && fclose(keys)) {
+		perror("close digest manifest");
+		return 1;
+	}
 	puts("PASS");
 	return 0;
+
+usage:
+	fprintf(stderr,
+		"Usage: %s [size_KiB] [rounds] [base|huge] [memory.reclaim] [--digests manifest]\n",
+		argv[0]);
+	return 1;
 }

@@ -17,11 +17,14 @@ import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 
-from rswap_scale_test import read_swaps, restore_swap
+from rswap_scale_test import (DEFAULT_TIMEOUT, VERIFIER_SKIP, SkipRun,
+                              read_swaps, restore_swap)
 
 DEBUG = pathlib.Path('/sys/kernel/debug/rswap')
 XSWAP = pathlib.Path('/sys/kernel/mm/xswap')
@@ -151,6 +154,10 @@ def run_test(args, output, instance, cg):
     proc = subprocess.Popen(command, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
+    # A hung kernel must not pin the run: kill the verifier after --timeout
+    # and let the checks below report it, like the server shutdown below.
+    watchdog = threading.Timer(args.timeout, proc.kill)
+    watchdog.start()
     before = after = ready = pageout = evidence = None
     log = []
     try:
@@ -180,12 +187,20 @@ def run_test(args, output, instance, cg):
                 proc.stdin.flush()
         ret = proc.wait()
     finally:
+        watchdog.cancel()
         if proc.poll() is None:
             proc.terminate()
             proc.wait()
-        proc.stdin.close()
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
         proc.stdout.close()
         (output / 'verifier.log').write_text(''.join(log))
+    if ret == VERIFIER_SKIP:
+        raise SkipRun(f'verifier reported a documented skip (exit {ret})')
+    if ret == -signal.SIGKILL:
+        raise RuntimeError(f'verifier killed after {args.timeout}s')
     if not ready or not pageout or evidence is None:
         raise RuntimeError(f'verifier did not finish pageout (exit {ret})')
     verified = counters()
@@ -232,10 +247,15 @@ def main():
     parser.add_argument('--takeover-swap', action='store_true')
     parser.add_argument('--output', type=pathlib.Path,
                         help='new directory for results, traces and digest manifest')
+    parser.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT,
+                        help=f'seconds before the verifier is killed '
+                             f'(default: {DEFAULT_TIMEOUT:.0f})')
     args = parser.parse_args()
     sys.stdout.reconfigure(line_buffering=True)
-    if os.geteuid() or args.size_kib <= 0 or args.size_kib * 1024 % os.sysconf('SC_PAGE_SIZE'):
-        parser.error('requires root and a positive native-page-aligned size')
+    if (os.geteuid() or args.size_kib <= 0 or args.timeout <= 0 or
+            args.size_kib * 1024 % os.sysconf('SC_PAGE_SIZE')):
+        parser.error('requires root, a positive native-page-aligned size '
+                     'and a positive timeout')
     if not pathlib.Path(args.binary).is_file():
         parser.error('build with make -C tools/mm rswap_pageout_test')
     if not (DEBUG / 'stats').exists() or not (TRACE / 'dynamic_events').exists():
@@ -272,7 +292,11 @@ def main():
             (cg / 'memory.max').write_text(str(limit))
             (cg / 'memory.swap.max').write_text(str(limit))
             (cg / 'memory.zswap.max').write_text('0')
-            run_test(args, output, instance, cg)
+            try:
+                run_test(args, output, instance, cg)
+            except SkipRun as skip:
+                print(f'SKIP: {skip}')
+                return VERIFIER_SKIP
     finally:
         # Attempt every restoration step even if one fails.
         errors = []
