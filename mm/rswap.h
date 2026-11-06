@@ -28,7 +28,10 @@
  * 2. Create an rswap device (via xswap sysfs):
  *      echo rswap [prio] > /sys/kernel/mm/xswap/create
  *
- * The backend is chosen at boot, before any device exists:
+ * The backend is chosen at boot, before any device exists, and cannot be
+ * switched afterwards: a live device keeps the store it was written with.
+ * The two timeouts can also be written at runtime through
+ * /sys/module/rswap/parameters/.
  *
  *      rswap.backend=http|redis	rswap.host=	rswap.port=
  *      rswap.redis_user=	rswap.redis_password=	rswap.redis_db=

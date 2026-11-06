@@ -62,8 +62,6 @@ static struct {
 	char		user[RSWAP_KV_HOST_LEN];
 	char		password[128];
 	unsigned int	db;
-	unsigned int	send_timeout_ms;
-	unsigned int	recv_timeout_ms;
 } rswap_redis;
 
 /*
@@ -75,8 +73,8 @@ static struct {
 static unsigned long rswap_redis_deadline(void)
 {
 	return rswap_sock_deadline(RSWAP_REDIS_CONNECT_TIMEOUT_MS +
-				   rswap_redis.send_timeout_ms +
-				   2 * rswap_redis.recv_timeout_ms);
+				   rswap_kv_send_timeout() +
+				   2 * rswap_kv_recv_timeout());
 }
 
 /* ---------- RESP wire format ---------- */
@@ -523,8 +521,8 @@ static int rswap_redis_ensure(struct rswap_redis_conn *conn,
 
 	conn->sock = rswap_sock_connect(rswap_redis.host, rswap_redis.port,
 					RSWAP_REDIS_CONNECT_TIMEOUT_MS,
-					rswap_redis.send_timeout_ms,
-					rswap_redis.recv_timeout_ms);
+					rswap_kv_send_timeout(),
+					rswap_kv_recv_timeout());
 	if (IS_ERR(conn->sock)) {
 		ret = PTR_ERR(conn->sock);
 		conn->sock = NULL;
@@ -844,8 +842,6 @@ static int __init rswap_redis_init(const struct rswap_kv_config *cfg)
 
 	rswap_redis.port = cfg->port;
 	rswap_redis.db = cfg->db;
-	rswap_redis.send_timeout_ms = cfg->send_timeout_ms;
-	rswap_redis.recv_timeout_ms = cfg->recv_timeout_ms;
 	return rswap_redis_init_parts();
 }
 

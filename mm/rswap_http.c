@@ -34,8 +34,6 @@
 static struct {
 	char		host[RSWAP_KV_HOST_LEN];
 	u16		port;
-	unsigned int	send_timeout_ms;
-	unsigned int	recv_timeout_ms;
 } rswap_http;
 
 /*
@@ -46,16 +44,16 @@ static struct {
 static unsigned long rswap_http_deadline(void)
 {
 	return rswap_sock_deadline(RSWAP_HTTP_CONNECT_TIMEOUT_MS +
-				   rswap_http.send_timeout_ms +
-				   2 * rswap_http.recv_timeout_ms);
+				   rswap_kv_send_timeout() +
+				   2 * rswap_kv_recv_timeout());
 }
 
 static struct socket *rswap_http_open(void)
 {
 	return rswap_sock_connect(rswap_http.host, rswap_http.port,
 				  RSWAP_HTTP_CONNECT_TIMEOUT_MS,
-				  rswap_http.send_timeout_ms,
-				  rswap_http.recv_timeout_ms);
+				  rswap_kv_send_timeout(),
+				  rswap_kv_recv_timeout());
 }
 
 /* Build and send an HTTP GET request. */
@@ -337,8 +335,6 @@ static int rswap_http_init(const struct rswap_kv_config *cfg)
 		return -EINVAL;
 
 	rswap_http.port = cfg->port;
-	rswap_http.send_timeout_ms = cfg->send_timeout_ms;
-	rswap_http.recv_timeout_ms = cfg->recv_timeout_ms;
 	return 0;
 }
 
