@@ -744,11 +744,24 @@ void rswap_attach_hash_shmem(struct folio *folio, unsigned long addr,
 		slot = kzalloc_obj(*slot, GFP_NOWAIT);
 		if (!slot)
 			continue;
+		/* Digest first, so a reachable slot never has a stale one. */
 		rswap_hash_publish(slot, hash);
 
+		/*
+		 * xa_store() takes ownership of @slot on success and returns
+		 * the entry it replaced, which then belongs to this caller;
+		 * @slot stays ours only if the store failed.  Freeing @slot on
+		 * success would leave the xarray pointing at freed memory,
+		 * which the later xa_erase() in rswap_shmem_move_hashes() and
+		 * rswap_shmem_drop_hashes() reads or frees, and would leak the
+		 * replaced slot.
+		 */
 		old = xa_store(&info->rswap_hashes, index, slot, GFP_NOWAIT);
-		if (xa_is_err(old) || old)
+		if (xa_is_err(old)) {
 			kfree(slot);
+			continue;
+		}
+		kfree(old);
 	}
 }
 
