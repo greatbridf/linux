@@ -491,6 +491,20 @@ static struct rswap_hash *rswap_slot_get(struct swap_info_struct *si,
 	return new_slot;
 }
 
+/*
+ * Store @hash in @slot and make it readable.
+ *
+ * The pointer published by rswap_slot_get() only makes the object reachable;
+ * @valid is what publishes the digest bytes.  Clearing it first keeps a slot
+ * that is reused for a new digest from exposing the bytes of the old one.
+ */
+static void rswap_hash_publish(struct rswap_hash *slot, const u8 *hash)
+{
+	smp_store_release(&slot->valid, 0);		/* old digest is gone */
+	memcpy(slot->data, hash, RSWAP_HASH_LEN);
+	smp_store_release(&slot->valid, 1);		/* digest is readable */
+}
+
 static int rswap_hash_store(struct swap_info_struct *si, swp_entry_t entry,
 			    const u8 *hash)
 {
@@ -500,7 +514,7 @@ static int rswap_hash_store(struct swap_info_struct *si, swp_entry_t entry,
 	if (!slot)
 		return -ENOMEM;
 
-	memcpy(slot->data, hash, RSWAP_HASH_LEN);
+	rswap_hash_publish(slot, hash);
 	return 0;
 }
 
@@ -510,6 +524,10 @@ static bool rswap_hash_load(struct swap_info_struct *si, swp_entry_t entry,
 	struct rswap_hash *slot = rswap_slot_lookup(si, swp_offset(entry));
 
 	if (!slot)
+		return false;
+
+	/* Pair with rswap_hash_publish(): a reserved slot has no digest yet. */
+	if (!smp_load_acquire(&slot->valid))
 		return false;
 
 	memcpy(hash, slot->data, RSWAP_HASH_LEN);
@@ -544,7 +562,11 @@ static int rswap_hash_lookup(struct vm_area_struct *vma, unsigned long addr,
 	return 0;
 }
 
-/* Reserve the slots of a folio that just entered the swap cache. */
+/*
+ * Reserve the slots of a folio that just entered the swap cache.  A reserved
+ * slot is not valid: it reports "no digest" until rswap_attach_hash() or the
+ * legacy page_ext fallback stores one.
+ */
 void rswap_prepare_hashes(struct folio *folio)
 {
 	struct swap_info_struct *si;
@@ -686,7 +708,7 @@ void rswap_attach_hash(swp_entry_t entry, unsigned long addr,
 	if (!slot)
 		return;
 
-	memcpy(slot->data, hash, RSWAP_HASH_LEN);
+	rswap_hash_publish(slot, hash);
 }
 
 /*
@@ -722,7 +744,7 @@ void rswap_attach_hash_shmem(struct folio *folio, unsigned long addr,
 		slot = kzalloc_obj(*slot, GFP_NOWAIT);
 		if (!slot)
 			continue;
-		memcpy(slot->data, hash, RSWAP_HASH_LEN);
+		rswap_hash_publish(slot, hash);
 
 		old = xa_store(&info->rswap_hashes, index, slot, GFP_NOWAIT);
 		if (xa_is_err(old) || old)
@@ -763,11 +785,16 @@ void rswap_shmem_move_hashes(struct inode *inode, struct folio *folio)
 		staged = xa_erase(&info->rswap_hashes, folio->index + i);
 		if (!staged)
 			continue;
+		/* rswap_hash_publish() set this when the digest was staged. */
+		if (!smp_load_acquire(&staged->valid)) {
+			kfree(staged);
+			continue;
+		}
 
 		slot = rswap_slot_get(si, swp_offset(folio_swap_entry(folio, i)),
 				      GFP_NOWAIT);
 		if (slot)
-			memcpy(slot->data, staged->data, sizeof(slot->data));
+			rswap_hash_publish(slot, (const u8 *)staged->data);
 		kfree(staged);
 	}
 }
@@ -1504,20 +1531,22 @@ void rswap_hash_invalidate(struct swap_info_struct *si, unsigned long offset,
 
 	end = offset + min_t(unsigned long, nr_entries, si->max - offset);
 	for (; offset < end; offset++) {
-		struct swap_cluster_info *ci;
-		struct rswap_hash_table *table;
+		struct rswap_hash *slot;
 
-		ci = __swap_offset_to_cluster(si, offset);
-		table = READ_ONCE(ci->hash_table);
-		if (!table)
+		slot = rswap_slot_lookup(si, offset);
+		if (!slot)
 			continue;
 
 		/*
 		 * The swap slot is about to be reused; a published digest must not
 		 * outlive it, or the next page in the slot would be stored under the
-		 * key of the previous one.  Pair with rswap_slot_lookup().
+		 * key of the previous one.  Only @valid is cleared: the object stays
+		 * owned by the cluster and is freed by rswap_hash_table_free().
+		 * Lookups are lock-free, so a kfree() here would be a use after
+		 * free, and one slot per swap offset is the bound on this memory.
+		 * Pair with rswap_hash_load().
 		 */
-		smp_store_release(&table->hashes[offset % SWAPFILE_CLUSTER], NULL);
+		smp_store_release(&slot->valid, 0);
 	}
 }
 

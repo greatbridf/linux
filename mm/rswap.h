@@ -48,8 +48,23 @@ struct vm_area_struct;
 
 #define RSWAP_HASH_LEN 48
 
+/*
+ * One digest slot.  @data holds the digest user space supplied for the base
+ * page using this swap offset; @valid says that the bytes may be read.
+ *
+ * The slot object is published once, by rswap_slot_get(), and then belongs to
+ * its cluster, so the pointer alone only means "this offset has a slot".  A
+ * slot is reserved when a folio enters the swap cache, long before the digest
+ * for it is known, and it outlives the swap entry it describes, so validity
+ * is tracked separately: a reserved but unresolved slot, and a slot whose
+ * swap entry was released, report "no digest" instead of a zero digest.
+ *
+ * Writers copy @data and then publish with smp_store_release(&slot->valid, 1);
+ * readers do smp_load_acquire(&slot->valid) before touching @data.
+ */
 struct rswap_hash {
 	char data[RSWAP_HASH_LEN];
+	u8 valid;
 };
 
 /*
@@ -64,7 +79,8 @@ struct rswap_hash_ctx {
 /*
  * One table per swap cluster, allocated when the cluster is first used and
  * freed with it.  Slot i describes swap offset
- * cluster_start + i; a NULL slot means "no hash resolved".
+ * cluster_start + i; a NULL slot means "no slot reserved", and a slot whose
+ * valid flag is clear means "no hash resolved".
  */
 struct rswap_hash_table {
 	struct rswap_hash *hashes[SWAPFILE_CLUSTER];
