@@ -371,11 +371,31 @@ static int rswap_sock_recv_page(struct socket *sock, struct page *page,
     return recv_all(sock, page->data + off, len);
 }
 
-/* Buffered reads return the byte count, as the kernel helper does. */
-static int rswap_sock_recv(struct socket *sock, void *buf, size_t len)
-{
-    ssize_t done = recv(sock->fd, buf, len, 0);
+/*
+ * The kernel reads the effective timeouts per request (mm/rswap.c), so the
+ * backend no longer keeps a copy of them.  The harness fixes them here.
+ */
+#define RSWAP_TEST_TIMEOUT_MS 5000
 
+static unsigned int rswap_kv_send_timeout(void)
+{
+    return RSWAP_TEST_TIMEOUT_MS;
+}
+
+static unsigned int rswap_kv_recv_timeout(void)
+{
+    return RSWAP_TEST_TIMEOUT_MS;
+}
+
+/* Buffered reads return the byte count, as the kernel helper does. */
+static int rswap_sock_recv(struct socket *sock, void *buf, size_t len,
+                           unsigned long deadline)
+{
+    ssize_t done;
+
+    if (rswap_sock_expired(deadline))
+        return -ETIMEDOUT;
+    done = recv(sock->fd, buf, len, 0);
     if (!done)
         return -ECONNRESET;
     return done < 0 ? -errno : done;
@@ -436,8 +456,6 @@ int main(int argc, char **argv)
     snprintf(rswap_redis.password, sizeof(rswap_redis.password), "%s",
              argv[4]);
     rswap_redis.db = atoi(argv[5]);
-    rswap_redis.send_timeout_ms = 5000;
-    rswap_redis.recv_timeout_ms = 5000;
     command = argv[6];
     key = argv[7];
     /* The wire fragments and the command pool: the real backend init. */
