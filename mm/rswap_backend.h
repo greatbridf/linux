@@ -113,6 +113,12 @@ struct rswap_backend {
  * rswap_sock_deadline(), and fail with -ETIMEDOUT once it has passed.  That is
  * what keeps the wall time of one request bounded however slowly the peer
  * answers.
+ *
+ * An operation interrupted by a signal (-EINTR, -ERESTARTSYS) transferred
+ * nothing, so the helpers repeat it while the request deadline allows instead
+ * of reporting it.  No other errno is retried here: whether a transport
+ * failure may be retried depends on the protocol and is decided by the
+ * backend that knows which of its operations are idempotent.
  */
 struct socket *rswap_sock_connect(const char *host, u16 port,
 				  unsigned int connect_timeout_ms,
@@ -124,7 +130,8 @@ unsigned long rswap_sock_deadline(unsigned int timeout_ms);
 bool rswap_sock_expired(unsigned long deadline);
 int rswap_sock_send(struct socket *sock, const void *data, size_t len,
 		    unsigned long deadline);
-int rswap_sock_recv(struct socket *sock, void *buf, size_t len);
+int rswap_sock_recv(struct socket *sock, void *buf, size_t len,
+		    unsigned long deadline);
 int rswap_sock_send_bvecs(struct socket *sock, struct bio_vec *bvecs,
 			  unsigned int nr, size_t len, unsigned long deadline);
 int rswap_sock_send_page(struct socket *sock, struct page *page, size_t len,

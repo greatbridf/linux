@@ -283,7 +283,8 @@ static int rswap_redis_reader_fill(struct rswap_redis_reader *reader)
 		return 0;
 	if (rswap_sock_expired(reader->deadline))
 		return -ETIMEDOUT;
-	ret = rswap_sock_recv(reader->sock, reader->buf, sizeof(reader->buf));
+	ret = rswap_sock_recv(reader->sock, reader->buf, sizeof(reader->buf),
+			      reader->deadline);
 	if (ret <= 0)
 		return ret ? ret : -ECONNRESET;
 	reader->filled = ret;
