@@ -315,6 +315,19 @@ rswap.send_timeout_ms=<ms>        0 selects the backend default, else 1..60000
 rswap.recv_timeout_ms=<ms>        0 selects the backend default, else 1..60000
 ```
 
+The unit of both parameters, of the backend defaults and of the deadline
+budgets is milliseconds; on the socket they become jiffies.
+`rswap_sock_connect()` converts each one with `msecs_to_jiffies()` and writes
+`sk_rcvtimeo` and `sk_sndtimeo` directly, because `sock_set_sndtimeo()` takes
+its argument in seconds and multiplies it by `HZ` (`net/core/sock.c`). The
+defaults are 1000 ms connect, 1000 ms send and 1000 ms receive for HTTP, and
+10000 ms for each of the three Redis timeouts. The HTTP send bound is 1 s
+rather than something tight, because the first 128 KiB batch over a cold remote
+path costs about 45 ms and a healthy endpoint must survive one slow send; what
+actually bounds a request is the deadline (`rswap_http_deadline()`,
+`rswap_redis_deadline()`), i.e. connect + send + 2 × receive, 4 s for HTTP and
+40 s for Redis.
+
 A write is validated and rejected with `-EINVAL` above 60000 ms, or when the
 value does not parse. `rswap_http_deadline()` and `rswap_redis_deadline()`
 call `rswap_kv_send_timeout()`/`rswap_kv_recv_timeout()` per request, so a
