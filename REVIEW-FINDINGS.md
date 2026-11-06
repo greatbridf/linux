@@ -447,7 +447,9 @@ it. `EINTR` must not be treated as "the store is broken".
 
 ### L2 — A failed swapin is fatal to the task that touches the page
 
-`open`.
+`fixed` — `97e9ae0f0740` and `0ea1b0df34a8` (bounded read retries) plus the
+L2b commit of this series, `mm: rswap: keep a failed swapin local to the
+accessing task`.
 
 On failure `swap_read_end()` (`mm/page_io.c:584-600`) neither marks the folio
 uptodate nor in error, so `do_swap_page()` takes the `!folio_test_uptodate()`
@@ -455,15 +457,28 @@ branch and returns `VM_FAULT_SIGBUS`. That is the mechanism the live run hit:
 the process touching a KV page went down mid-run with `Read-error on
 swap-device` in the log.
 
-Nothing in the rswap path calls `folio_set_error()`, and the readahead failure
-path in `mm/swap_state.c` has to be audited for handing a non-uptodate folio
-back to the caller: if it does, "swapin failed" can present as a page of zeros
-rather than a fault, which is worse than dying.
+That fault is the intended outcome, and the audit shows it is the only one. The
+"mark the folio in error" part of this finding was written against `PG_error`,
+which `09022bc196d2` ("mm: remove PG_error") deleted: `folio_set_error()`,
+`folio_test_error()` and `SetPageError()` have no user in this tree. The state
+`swap_read_end()` already leaves is the failure marker:
 
-Fix: make the failure explicit and local — mark the folio in error so a
-repeated access fails the same way instead of returning garbage, keep the fault
-to the accessing task (SIGBUS), and log once, rate limited, with device type
-and swap offset so the failing key can be identified.
+- `do_swap_page()` waits on the folio lock that `swap_read_end()` drops
+  (`mm/page_io.c:597`), then fails its own check and takes `VM_FAULT_SIGBUS`
+  without installing a PTE (`mm/memory.c:5114-5117`).
+- A repeated access finds the same folio in the swap cache
+  (`mm/memory.c:5030`), so it is not read again and reaches the same check.
+- Readahead only queues the neighbours and drops its reference
+  (`mm/swap_state.c:918-927`, `:1031-1049`); it never returns contents to a
+  fault. shmem fails with `-EIO` (`mm/shmem.c:2584`) and poisons the entry
+  (`mm/shmem.c:2373`); swapoff installs a poisoned entry
+  (`mm/swapfile.c:2905-2914`).
+
+So a failed swapin never presents as a page of zeros, the fault stays with the
+accessing task (no SIGKILL, no panic), and `mm/swap_state.c` needs no change.
+What was missing was identifying the failing object: the batch failure log now
+names the swap type, the first offset of the batch, the page count and the key
+prefix, one rate-limited line per batch instead of one per page.
 
 ### L3 — The backend timeouts cannot be changed at runtime
 

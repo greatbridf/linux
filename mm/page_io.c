@@ -588,6 +588,20 @@ static void swap_read_end(struct swap_iocb *sio, bool failed)
 	for (p = 0; p < sio->nr_bvecs; p++) {
 		struct folio *folio = bvec_folio(&sio->bvecs[p]);
 
+		/*
+		 * A failed read leaves the folio in the swap cache and not
+		 * uptodate.  That is the whole failure marker: since PG_error was
+		 * removed in 09022bc196d2 ("mm: remove PG_error") there is no
+		 * error bit to set, and this state already cannot be mistaken for
+		 * data.  The access that waits for the lock dropped below fails
+		 * its own !folio_test_uptodate() check in do_swap_page() and takes
+		 * SIGBUS without a PTE being installed; a repeated access finds
+		 * the same folio in the swap cache, is not read again and faults
+		 * the same way; shmem turns it into a poisoned swap entry and
+		 * swapoff poisons the entry.  A failed swapin therefore never
+		 * presents as a zero page, and readahead may still have brought in
+		 * the neighbouring folios, which complete independently.
+		 */
 		if (!failed) {
 			count_mthp_stat(folio_order(folio), MTHP_STAT_SWPIN);
 			count_memcg_folio_events(folio, PSWPIN,
