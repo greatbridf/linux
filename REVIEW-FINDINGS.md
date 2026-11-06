@@ -15,11 +15,15 @@ the code.
 Status legend: `open`, `fixed` (commit listed), `deferred` (accepted, not in
 this pass), `invalid` (raised by the review, disproved against the tree).
 
+Status after the fix series: every BLOCKER and every MAJOR finding is fixed
+except M6 (`deferred`) and M4 (`invalid`); the MINOR items fixed by the series
+are listed at the end of the MINOR section.
+
 ## BLOCKER
 
 ### B1 — Unattached pages are written under the all-zero key
 
-`open`.
+`fixed` — `e19c7859301a`.
 
 `rswap_prepare_hashes()` reserves a digest slot for every folio entering the
 swap cache (`mm/swapfile.c:2146`). The reservation allocates a zeroed object
@@ -49,7 +53,7 @@ bytes) and never publish a usable slot before a digest exists.
 
 ### B2 — `xa_store()` error path frees the live xarray entry
 
-`open`. `mm/rswap.c:727-729`:
+`fixed` — `578c19d9cb2b`. `mm/rswap.c:727-729`:
 
 ```c
 old = xa_store(&info->rswap_hashes, index, slot, GFP_NOWAIT);
@@ -71,7 +75,7 @@ index.
 
 ### B3 — Every swap-slot release leaks a digest slot object
 
-`open`. `rswap_hash_invalidate()` (`mm/rswap.c:1519`) publishes `NULL` over the
+`fixed` — `e19c7859301a`. `rswap_hash_invalidate()` (`mm/rswap.c:1519`) publishes `NULL` over the
 slot pointer and drops the only reference to the 48-byte object allocated in
 `rswap_slot_get()` (`mm/rswap.c:482`). No other path frees it:
 `rswap_hash_table_free()` (`mm/rswap.c:657-667`) only walks slots that are
@@ -87,7 +91,7 @@ lifetime and clear the `valid` flag, which bounds the memory at
 
 ### B4 — `mm/rswap_http.c` does not compile against the backend interface
 
-`open`. `struct rswap_kv_page` is `{ const char *key; struct page *page; }`
+`fixed` — `2c6ce8ec9a24`. `struct rswap_kv_page` is `{ const char *key; struct page *page; }`
 (`mm/rswap_backend.h:38-41`) and the core fills `->page` (`mm/rswap.c:955`),
 but the HTTP backend still dereferences the removed `->data` member at
 `mm/rswap_http.c:207` and `:232`. `CONFIG_RSWAP_KV_HTTP` is `default y`
@@ -96,7 +100,7 @@ but the HTTP backend still dereferences the removed `->data` member at
 
 ### B5 — `kvswap_server` rejects every key the kernel sends
 
-`open`. The kernel emits `2 * RSWAP_HASH_LEN` = 96 hex characters
+`fixed` — `c2f5cc126fbc`. The kernel emits `2 * RSWAP_HASH_LEN` = 96 hex characters
 (`mm/rswap.h:49`, `mm/rswap.c:77,839-840`, pinned by the `static_assert` at
 `mm/rswap.c:81`), while `tools/mm/kvswap_server.c:54,218` accepts exactly 64.
 Every POST/GET is answered with 400, which the backend maps to `-EIO`
@@ -110,7 +114,7 @@ the contradictory comments.
 
 ### B6 — Both source-level regression suites are stale
 
-`open`. `tools/mm/rswap_backend_test.py:114-117` shims the removed
+`fixed` — `b06a7451974b`. `tools/mm/rswap_backend_test.py:114-117` shims the removed
 `struct rswap_kv_page { … void *data; }`, never defines `RSWAP_HASH_HEXLEN`
 (used by the extracted `mm/rswap.c:840`), pins `RSWAP_KV_KEY_LEN 65` against the
 real `97` (`mm/rswap_backend.h:24`), and sizes `expected_hex[]` at
@@ -124,7 +128,9 @@ and nothing currently guards the invariants in AGENTS.md.
 
 ### M1 — A read batch can be queued after the `rswap_disable()` drain
 
-`open`. `rswap_disable()` (`mm/rswap.c:1559-1577`) frees `si->rswap_stats`
+`fixed` — `6628bb9540b0` (batch carries its own counters reference, and
+`swapin_walk_pmd_entry()` keeps the device pinned across
+`swap_read_submit()`). `rswap_disable()` (`mm/rswap.c:1559-1577`) frees `si->rswap_stats`
 after `flush_workqueue()`, assuming no submission can still be in flight. That
 does not hold for `MADV_WILLNEED`: `read_swap_cache_async()` drops the device
 pin before the caller runs `swap_read_submit(&ctx)` (`mm/madvise.c:224-232`),
@@ -138,7 +144,8 @@ at submit time from a stable owner, and stop freeing it in `rswap_disable()`.
 
 ### M2 — `vma->rswap_prog` lifetime is unprotected
 
-`open`. `rswap_hash_lookup()` (`mm/rswap.c:533-546`) loads the pointer and
+`fixed` — `6628bb9540b0` (RCU read-side lookup, `rcu_replace_pointer()` in the
+writers, `bpf_prog_put()` defers the free). `rswap_hash_lookup()` (`mm/rswap.c:533-546`) loads the pointer and
 calls `bpf_prog_run()` with no reference, while `rswap_attach_prog()`
 (`mm/rswap.c:630-651`) replaces it under `mmap_write_lock()` and
 `bpf_prog_put()`s the old program after unlocking. The lookup runs from
@@ -151,7 +158,8 @@ Fix: `rcu_read_lock()` + `rcu_dereference()` around the lookup and
 
 ### M3 — Per-request wall time is unbounded (one-byte reads)
 
-`open`. Both parsers read headers a byte per syscall, and `sk_rcvtimeo` is
+`fixed` — `bb27e27f073a` (absolute per-request deadline, header block read in
+one receive, separate connect timeout). Both parsers read headers a byte per syscall, and `sk_rcvtimeo` is
 per syscall: HTTP up to 2047 calls at `recv_timeout_ms` (default 1000 ms,
 `mm/rswap_http.c:137-147`, `mm/rswap_sock.c:54`), Redis up to 256 calls at
 `RSWAP_REDIS_RECV_TIMEOUT_MS` (default 10 s, `mm/rswap_redis.c:209-229`). A
@@ -180,7 +188,8 @@ the only rswap-attributable behaviour change there is enabling readahead for
 
 ### M5 — "At least one backend" is not enforced
 
-`open`. `mm/Kconfig:134-184` lets both `RSWAP_KV_HTTP` and `RSWAP_KV_REDIS` be
+`fixed` — `6628bb9540b0` (build error, and `mm/Kconfig` states the
+requirement). `mm/Kconfig:134-184` lets both `RSWAP_KV_HTTP` and `RSWAP_KV_REDIS` be
 off, which leaves `rswap_backends[]` empty (`mm/rswap.c:133-140`), fails the
 late init (`:154-158`) and rejects every device with `-ENODEV` (`:1529-1531`).
 
@@ -195,7 +204,7 @@ table is the only digest store.
 
 ### M7 — `mm/rswap.h` has no include guard
 
-`open`. The header pulls `<linux/swap.h>` and `"swap.h"` only inside
+`fixed` — `3fc96a65d9a5`. The header pulls `<linux/swap.h>` and `"swap.h"` only inside
 `#ifdef CONFIG_RSWAP`, while the `CONFIG_RSWAP=n` stubs (e.g.
 `struct swap_cluster_info *ci`, `mm/rswap.h:138`) rely on the includer having
 included them first. It compiles only because of include order in
@@ -203,7 +212,11 @@ included them first. It compiles only because of include order in
 
 ### M8 — Coverage cannot catch the invariants it claims
 
-`open`. The real `rswap_hash_invalidate()` lies outside every extraction range
+`fixed` — `b06a7451974b` (both source harnesses rebuilt, drift guard, the real
+`rswap_hash_invalidate()` extracted and asserted) and `864af43d0c7a` (live
+runners audit keys against the digest manifest, runner defects). Still not
+covered: migration, `rswap_page_ext_copy()`/`rswap_page_ext_reset()` and digest
+staleness; see `TODOS.md`. The real `rswap_hash_invalidate()` lies outside every extraction range
 in `tools/mm/rswap_backend_test.py:315-321`; the harness emulates the release
 inline at `:775-778`, so a no-op body passes. `tools/mm/rswap_scale_test.py`
 audits object count and size only (`:88-101`) and never compares keys against
@@ -215,7 +228,8 @@ coverage at all.
 
 ### M9 — Documentation drift
 
-`open`. `AGENTS.md` describes a design that no longer exists: the per-device
+`fixed` — stage 12 of this series (see `TODOS.md`, "What the November 2026
+review series changed"). `AGENTS.md` describes a design that no longer exists: the per-device
 `kvcalloc(si->max, …)` table with `struct rswap_hash_entry { u8 hash[32]; u8
 valid; }`, a 64-hex-digit key, digests living in `page_ext`, and "eBPF
 integration is postponed". The tree ships the per-VMA digest program
@@ -324,6 +338,42 @@ too.
 - `tools/mm/rswap_backend_test.py:270-275` stubs `rswap_page_key()` by deriving
   a key from `entry.val`, which reads like the banned pattern.
 - `rswap-userspace-demos/` contains a compiled binary and has no `.gitignore`.
+
+### Minor items fixed by this series
+
+- Unused `char data[]` bounce buffer in `struct rswap_batch`, its 1-4 MiB
+  footprint and the `kvmalloc()`, fixed by `25f2d094abf9`.
+- `rswap_prepare_hashes()` allocating under `GFP_NOWAIT`, fixed by
+  `25f2d094abf9` (`gfp_t` parameter, `GFP_NOIO` from `folio_alloc_swap()`).
+- `ci->hash_table` read without acquire pairing, fixed by `25f2d094abf9`
+  (`smp_load_acquire()` / `cmpxchg_release()`).
+- `rswap_read_leave()` releasing the inline slot early and
+  `rswap_read_enter_inline()` exceeding the inflight bound, the single-page
+  accounting of a key error, the dead `rswap_dentry` field, `mm/rswap.h`
+  include guard and the over-long lines, fixed by `3fc96a65d9a5`.
+- Redis bulk key length derived from `RSWAP_KV_KEY_LEN`, pooled connection
+  dropped on a routine `-ENOENT`, `-EACCES`/`-ENOMEM`/`-EINVAL` treated as
+  transport errors, the 20 ms send timeout also bounding `connect()`, and the
+  wrong "zero timeout means never block" comment, fixed by `bb27e27f073a`.
+- `kvswap_test.py` key-length boundary (0/63/65/128/192) and traversal cases
+  in `c2f5cc126fbc`.
+- Verifiers not retrying `EINTR`, stale `errno` after `fclose()`,
+  `rswap_run_test.py`'s `rmdir()` in `finally` and unconditional
+  `memory.zswap.max` write, the missing verifier `timeout=`, skips reported as
+  failures, the hardcoded KV port in `rswap_scale_test.py`, the entry-derived
+  key stub in `rswap_backend_test.py`, `kvswap_server` accepting non-page
+  bodies and `atoi()` for `--port`, `mlock()`ing the mapping in
+  `page_hash_user.c`, and the untracked demo binary, fixed by
+  `864af43d0c7a`.
+
+`rswap_redis.c` no longer keeps private send/receive loops either: it uses
+`rswap_sock_send_bvecs()` and `rswap_sock_recv_page()` (`bb27e27f073a`), and
+`kvswap_test.py` no longer has the `test_large_folio` case.
+
+Still open or deferred: the Redis pool semaphore shared by writeout and the
+read queue, idle pooled sockets never being closed, and `rswap_vma_dup()`
+dropping `VM_HASHED` on every VMA copy (now documented as a limitation in
+`AGENTS.md`).
 
 ## What the review confirmed is correct
 

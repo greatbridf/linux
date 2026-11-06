@@ -9,19 +9,32 @@ rules that future coding agents must preserve.
 **Never calculate or derive an rswap page key from a swap entry in the
 kernel.**
 
-User space hashes page contents and supplies the SHA-256 digest. The kernel
-must not run a hash function over `swp_entry_t`, the page contents, or any
-other kernel-derived value to create a key.
+User space supplies the digest of every page it wants stored remotely. The
+kernel must not run a hash function over `swp_entry_t`, the page contents, or
+any other kernel-derived value to create a key.
 
-Writeout behavior is strict:
+The digest is an opaque 48-byte value (`RSWAP_HASH_LEN`, `mm/rswap.h`). The key
+is that value rendered with `bin2hex()`: `RSWAP_HASH_HEXLEN` = 96 hex
+characters in `RSWAP_KV_KEY_LEN` = 97 bytes including the NUL
+(`mm/rswap_backend.h`, pinned by the `static_assert` in `mm/rswap.c`). Today's
+digest program emits 32 bytes of SHA-256 and leaves the rest zero, and a digest
+attached through `/proc/sys/vm/rswap/attach` is a 32-byte SHA-256 zero extended
+to the slot width, but nothing in the key layout depends on that.
 
-1. Read the userspace digest from `page_ext`.
-2. Store that digest in the rswap device table at the page's swap offset.
-3. Use only that stored digest as the HTTP KV key.
+The key comes from one of two user-space interfaces, in this order:
 
-If no digest is attached, writeout fails with `-ENODATA`. Do not add a
-fallback key. Swapin reads only the per-entry table and fails with `-ENOENT`
-if no digest was stored.
+1. A digest program attached to the VMA that maps the page
+   (`/sys/kernel/mm/xswap/rswap_attach`). The kernel runs it at unmap time,
+   while the page is still mapped, and stages the result in the digest slot of
+   the page's swap cluster.
+2. The legacy page_ext digest attached to the base page through
+   `/proc/sys/vm/rswap/attach`, consulted on writeout only when the cluster
+   slot holds no valid digest.
+
+Writeout uses the slot digest, falls back to the page_ext digest, stores
+whichever it used in the slot, and fails with `-ENODATA` when neither exists.
+Do not add a fallback key. Swapin reads only the cluster slot and fails with
+`-ENOENT` if it holds no valid digest.
 
 An earlier implementation incorrectly hashed swap entries. That behavior was
 removed in commit `e254942f9d5ac ("mm: rswap: use userspace provided hash
@@ -30,19 +43,19 @@ only")` and must not return.
 ## Project Purpose
 
 rswap is a fileless xswap backend that stores swap pages in an external
-key-value store. Each base page is stored under a SHA-256 hex key supplied by
-user space for that page.
+key-value store. Each base page is stored under the 96 hex character key
+rendered from the 48-byte digest user space supplied for that page.
 
 The store is reached through a pluggable KV backend. The core (`mm/rswap.c`)
-owns the keys, the page_ext digests, the per-device table and the `swap_ops`
-wiring; a backend only moves one page image to and from the store. Two
-backends ship with the kernel:
+owns the keys, the per-cluster digest slots, the legacy page_ext digests and
+the `swap_ops` wiring; a backend only moves one page image to and from the
+store. Two backends ship with the kernel:
 
 - `http` (`mm/rswap_http.c`): HTTP/1.0 `POST`/`GET` to a userspace
   `kvswap_server` that stores one file per key.
 - `redis` (`mm/rswap_redis.c`): RESP `SET`/`GET` against a Redis server, using
-  the same SHA-256 hex keys, so server contents can be audited against the
-  userspace digests.
+  the same keys, so server contents can be audited against the userspace
+  digests.
 
 Both are deliberately simple:
 
@@ -56,6 +69,19 @@ Both are deliberately simple:
   has closed is detected and dropped, and a batch that fails on the transport
   is retried once on a fresh connection, which is safe because `SET`/`GET` are
   idempotent. HTTP opens a connection per request as before.
+- A request is bounded in wall time, not just per socket operation.
+  `rswap_sock_deadline()` turns a budget into an absolute deadline; each
+  backend budgets connect, send and two receive timeouts for one request and
+  the Redis budget also covers both attempts of the retry-once policy.
+  `rswap_sock_send()`, `rswap_sock_send_bvecs()` and `rswap_sock_recv_page()`
+  check it before each blocking operation and fail with `-ETIMEDOUT`. Both
+  parsers read the header block in one receive into the remaining buffer space
+  and rescan for the terminator instead of reading it a byte per syscall.
+- Only genuine socket failures are retried: Redis `-EACCES`, `-ENOMEM` and
+  `-EINVAL` are not transport errors. A pooled connection is dropped only when
+  a reply of the batch is still outstanding, so a routine swapin `-ENOENT`
+  does not cost a reconnect, and `connect()` has its own timeout so that a
+  short send timeout cannot make a high-latency endpoint unconnectable.
 - `->can_merge()` accepts merging so several folios (up to the swap core's
   `SWAP_CLUSTER_MAX` bvecs) share one request; that is what fills a batch on
   the base-page path, where every folio is a single 4 KiB/16 KiB page.
@@ -89,7 +115,10 @@ One work item is one `rswap_flush_batch()` call, so Redis still pipelines up
 to 32 GET commands and HTTP still sends one object per request; the difference
 is that batches of one request now overlap instead of being serialized.
 `RSWAP_READ_MAX_INFLIGHT` (8) bounds queued plus running batches, which bounds
-the 32-page bounce buffers (1-4 MiB) and the pinned folios. 8 matches
+the folios they pin, and the batch bookkeeping is only
+`RSWAP_BATCH_MAX` keys plus one `struct rswap_kv_page` per page: there is no
+bounce buffer, a page image travels between the folio page and the socket. 8
+matches
 `RSWAP_REDIS_POOL_MAX` and the point where measured WILLNEED throughput
 stopped improving. When no slot is free, the workqueue refuses the item or the
 request structure cannot be allocated, that batch is moved in the submitting
@@ -105,11 +134,14 @@ and once per dispatched batch: the last batch to finish calls
 success is never exposed as uptodate. All batches of a request share one
 completion, and no batch touches the request after `ki_complete()`.
 
-Teardown is fenced in `rswap_disable()`: it calls
-`flush_workqueue(rswap_read_wq)` before freeing the per-device table and
-counters, which is what makes the per-batch device pointers safe. `__swapoff()`
-kills `si->users`, runs `synchronize_rcu()` and waits for its holders before
-calling it, and runs without a lock held there, so the drain cannot deadlock.
+Teardown is fenced in `rswap_disable()`: it drains the read workqueue with
+`flush_workqueue(rswap_read_wq)`. A batch never dereferences the device; it
+carries the swap type and a referenced pointer to the device's counter block,
+which the last `rswap_stats_put()` frees - the device drops only its own
+reference there. The digest slots belong to the swap clusters and are released
+with them. `__swapoff()` kills `si->users`, runs `synchronize_rcu()` and waits
+for its holders before calling it, and runs without a lock held there, so the
+drain cannot deadlock.
 
 `read_avg_ns`/`read_max_ns` are measured around the backend call in the
 worker, so they are real remote batch latency. `read_inflight`,
@@ -125,7 +157,8 @@ only `LOADED` means the remote reads finished.
 - No payload encryption and no persistence guarantees beyond the backend
   implementation. The HTTP server has no authentication at all; Redis uses
   `AUTH` and `SELECT` when a password resp. a database number is configured.
-- eBPF integration is postponed and is not part of the active build.
+- The digest program (a `BPF_PROG_TYPE_SYSCALL` program) is shipped and part
+  of the active build; see "Digest Program" below.
 
 ## Architecture
 
@@ -151,14 +184,24 @@ The interface is write-only and root/CAP_SYS_ADMIN protected.
 The userspace tool seeks its sysctl descriptor to offset zero before each
 write. This lets one descriptor issue multiple command writes.
 
+That sysctl is the legacy path: it attaches one digest to one base page and
+the core uses it only when the page's cluster slot holds no digest from a
+digest program. The shipped interface is the digest program, attached to the
+VMA at `/sys/kernel/mm/xswap/rswap_attach`; both are documented in
+`Documentation/ABI/testing/sysfs-kernel-mm-xswap-rswap` and
+`Documentation/admin-guide/sysctl/vm.rst`. `rswap-userspace-demos/` still
+builds only the userspace sysctl tool, so `page_hash_kern.bpf.c` and
+`page_hash_test_mod.c` are demo sources the kernel does not depend on.
+
 ### Kernel Entry Point
 
 `mm/rswap.c` is the core implementation. It contains:
 
 - swap page I/O through the `swap_ops` interface;
-- the `/proc/sys/vm/rswap/attach` sysctl;
-- page_ext digest access;
-- per-device swap-offset hash storage;
+- the `/proc/sys/vm/rswap/attach` sysctl and the page_ext digest it fills;
+- the per-cluster digest slots and the hooks `mm/swapfile.c`, `mm/rmap.c` and
+  `mm/shmem.c` call to fill, move and release them;
+- the per-VMA digest program and `/sys/kernel/mm/xswap/rswap_attach`;
 - backend selection and the boot parameters below;
 - debugfs backend, endpoint and per-device port reporting.
 
@@ -181,8 +224,8 @@ struct rswap_backend {
 };
 
 struct rswap_kv_page {
-        const char      *key;   /* 64 digit hex SHA-256 */
-        void            *data;  /* one base page image */
+        const char      *key;   /* hex digest, RSWAP_KV_KEY_LEN bytes */
+        struct page     *page;  /* exactly one base page image */
 };
 ```
 
@@ -226,19 +269,23 @@ It selects `PAGE_EXTENSION` and `CRYPTO_LIB_SHA256`. `RSWAP_KV_HTTP`
 (default y) and `RSWAP_KV_REDIS` (default n) build the individual backends;
 at least one is required.
 
-### Page-Ext Stage
+### Legacy Page-Ext Digest
 
-Before writeout, a page's userspace digest lives in page_ext:
+A digest attached through `/proc/sys/vm/rswap/attach` lives in page_ext on the
+base page:
 
 ```text
 struct rswap_page_ext {
-        u8 hash[32];
+        u8 hash[SHA256_DIGEST_SIZE];
         bool valid;
 };
 ```
 
 The page-ext client is registered in `mm/page_ext.c`, declared in
-`include/linux/page_ext.h`, and selected by `CONFIG_RSWAP`.
+`include/linux/page_ext.h`, and selected by `CONFIG_RSWAP`. Its `need`
+callback returns true unconditionally, so its bytes per base page are reserved
+whenever `CONFIG_RSWAP=y`, even if no rswap device is ever created (review
+finding M6, deferred).
 
 Access to the page digest is serialized by `rswap_hash_lock`, a global
 spinlock for the short protected copy. Page-ext metadata is not assumed to
@@ -250,82 +297,119 @@ stay with one physical page forever:
 `mm/migrate.c` invokes the copy hook. `mm/page_alloc.c` invokes the reset
 hook on normal and hardware-poisoned page free paths.
 
-### Per-Device Entry Table
+Writeout is the only reader of this digest, and only when the cluster slot has
+no valid digest; the value is then zero extended to the 48-byte slot width and
+stored there. Swapin never looks at page_ext, because the page may have been
+evicted and its page-ext data may no longer exist.
 
-page_ext alone is insufficient on swapin. A swap-cache page may have been
-evicted, so its original `struct page` and page-ext data may no longer exist.
+### Per-Cluster Digest Slots
 
-`struct swap_info_struct` therefore owns an rswap table:
+The digest is resolved while the folio is still mapped, at unmap time, so the
+slot lives with the swap clusters rather than with the device:
 
 ```text
-struct rswap_hash_entry {
-        u8 hash[32];
+struct rswap_hash {
+        char data[RSWAP_HASH_LEN];
         u8 valid;
+};
+
+struct rswap_hash_table {
+        struct rswap_hash *hashes[SWAPFILE_CLUSTER];
 };
 ```
 
-The table is indexed directly by `swp_offset(entry)` and is allocated with
-`kvcalloc(si->max, sizeof(*si->rswap_hashes), GFP_KERNEL)`. The valid byte
-makes the table 33 bytes per swap slot for the current layout.
+One table per swap cluster, reached through `swap_cluster_info`; slot `i`
+describes swap offset `cluster_start + i`. There is no per-device
+`kvcalloc(si->max, ...)` table. A NULL slot means "no slot reserved", and a
+slot whose `valid` flag is clear means "no digest resolved".
 
 Writeout:
 
 1. Resolve each base page and its precise swap entry.
-2. Read the page-ext digest.
-3. Return `-ENODATA` if the page has no attached digest.
-4. Copy the digest into `si->rswap_hashes[swp_offset(entry)]`.
-5. Publish validity with release semantics.
-6. POST the page using the stored digest as the key.
+2. Acquire-load the cluster slot's `valid` byte; if it is set, use the digest.
+3. Otherwise take the legacy page_ext digest; return `-ENODATA` if there is
+   none either.
+4. Publish the digest into the slot with release semantics.
+5. Send the page using the digest as the key.
 
 Swapin:
 
-1. Resolve the swap device from the entry.
-2. Acquire-load the table slot validity.
+1. Resolve the swap device and cluster from the entry.
+2. Acquire-load the slot's `valid` byte.
 3. Return `-ENOENT` if no digest is stored.
-4. GET the page using the stored digest as the key.
+4. Read the page using the stored digest as the key.
 
-Slot release calls `rswap_hash_invalidate()` from `mm/swapfile.c`, clearing
-table validity before the slot is reused. Device teardown frees the full
-table.
+Filling the slot:
 
-The `valid` flag uses release/acquire ordering so a reader cannot observe a
-valid slot before the digest contents are visible.
+- `rswap_prepare_hashes()` reserves a slot for every base page of a folio that
+  enters the swap cache (`folio_alloc_swap()`, `GFP_NOIO`, so it may sleep). A
+  reserved slot is not valid: it reports "no digest" until one is stored.
+- `rswap_attach_hash()` runs from `try_to_unmap_one()` right before the PTE is
+  replaced by a swap entry. It runs the VMA's digest program and publishes the
+  result into the slot.
+- Shmem has no swap entry at unmap time, so `rswap_attach_hash_shmem()` stages
+  the digest in the inode's xarray and `rswap_shmem_move_hashes()` moves the
+  staged digests into the slots once the folio is in a cluster.
+
+`rswap_hash_publish()` clears `valid`, copies the digest and then sets `valid`
+with release semantics; readers acquire-load `valid` before touching the
+bytes. That pairing means a reserved or released slot never reads back as an
+all-zero digest.
+
+Slot release calls `rswap_hash_invalidate()` from `mm/swapfile.c`, which
+clears `valid` and keeps the object for the cluster's lifetime; the memory is
+bounded at one slot per swap offset and is freed with the cluster by
+`rswap_hash_table_free()`, so a lock-free lookup can never race a free.
 
 ### Data Flow
 
 ```text
 user mmap
-  -> userspace SHA-256 per base page
-  -> /proc/sys/vm/rswap/attach
-  -> page_ext hash + valid
+  -> userspace computes a digest per base page
+  -> digest program attached to the VMA
+     (/sys/kernel/mm/xswap/rswap_attach)
+  -> unmap: try_to_unmap_one() -> rswap_attach_hash()
+  -> cluster slot: data[48] + valid, store-release
   -> reclaim / swapout
-  -> device table[swp_offset] = page_ext hash
-  -> HTTP POST /v1/folios/<hash>/write
+  -> rswap_page_key(): slot digest, else page_ext digest, else -ENODATA
+  -> bin2hex() -> 96 hex characters -> <key>
+  -> POST /v1/folios/<key>/write   (or Redis SET <key>)
 
 swap fault
-  -> device table[swp_offset]
-  -> HTTP GET /v1/folios/<hash>/read
-  -> page is filled and unmapped metadata may disappear
-  -> swap slot release invalidates the table entry
+  -> cluster slot of swp_offset(entry), acquire-load valid
+  -> GET /v1/folios/<key>/read     (or Redis GET <key>)
+  -> page is filled
+  -> swap slot release: rswap_hash_invalidate() clears valid, keeps the slot
 ```
 
 ## Relevant Files
 
-- `mm/rswap.c`: rswap core, backend selection, sysctl, page-ext and table
-  implementation.
+- `mm/rswap.c`: rswap core, digest slots, page-ext fallback, digest program,
+  sysctl, backend selection.
 - `mm/rswap_backend.h`: pluggable KV backend interface and transport API.
-- `mm/rswap_sock.c`: TCP connect/send/receive helpers shared by backends.
+- `mm/rswap_sock.c`: TCP connect/send/receive helpers and the request deadline
+  shared by backends.
 - `mm/rswap_http.c`: HTTP/1.0 KV backend for `kvswap_server`.
 - `mm/rswap_redis.c`: RESP KV backend for Redis.
-- `mm/rswap.h`: rswap lifecycle declarations and no-op configuration stubs.
-- `include/linux/page_ext.h`: page-ext client declarations and lifecycle hooks.
-- `mm/page_ext.c`: page-ext client registration.
-- `include/linux/swap.h`: per-device hash table pointer in
+- `mm/rswap.h`: digest slot layout, rswap lifecycle declarations, hook
+  prototypes and no-op configuration stubs.
+- `include/linux/mm_types.h`: `struct vm_area_struct::rswap_prog`.
+- `include/linux/mm.h`: `VM_HASHED`.
+- `include/linux/page_ext.h` / `mm/page_ext.c`: page-ext client declarations,
+  lifecycle hooks and registration.
+- `include/linux/swap.h`: `rswap_kv_port` and `rswap_stats` in
   `struct swap_info_struct`.
-- `mm/page_alloc.c`: clear page-ext digest on page free.
-- `mm/migrate.c`: copy page-ext digest on migration.
-- `mm/swapfile.c`: xswap device creation/destruction and slot-release hash
-  invalidation.
+- `mm/swapfile.c`: xswap device creation/destruction, the
+  `/sys/kernel/mm/xswap/rswap_attach` sysfs file, slot reservation and
+  slot-release invalidation.
+- `mm/rmap.c`: `try_to_unmap_one()`, which resolves the digest at unmap time.
+- `mm/shmem.c`: shmem staging of digests until a swap entry exists.
+- `mm/vma_init.c`: `rswap_vma_dup()`/`rswap_vma_free()` in the VMA copy and
+  free paths.
+- `mm/page_alloc.c`: clear the page-ext digest on page free.
+- `mm/migrate.c`: copy the page-ext digest on migration.
+- `Documentation/ABI/testing/sysfs-kernel-mm-xswap-rswap`: the sysfs attach
+  ABI for the digest program.
 - `Documentation/admin-guide/sysctl/vm.rst`: sysctl ABI documentation.
 - `rswap-userspace-demos/`: mmap, userspace hashing, and sysctl attach tool.
 - `tools/mm/kvswap_server.c`: HTTP KV backend.
@@ -333,15 +417,15 @@ swap fault
   hashes before reclaim.
 - `tools/mm/rswap_run_test.py`: cgroup-based live test runner.
 - `tools/mm/rswap_scale_test.py`: scaled live test (512 MiB by default) that
-  sets up a local HTTP KV server and swap device, then audits backend keys;
-  it is not a Redis setup/audit runner.
+  sets up a local HTTP KV server and swap device, then audits backend keys
+  against the digest manifest; it is not a Redis setup/audit runner.
 - `tools/mm/rswap_pageout_test.c` / `.py` / `.rst`: separate whole-mapping
   MADV_PAGEOUT test, trace runner, and usage notes; measures batch overlap,
   swap PTEs, and physical residency independently.
 - `tools/mm/rswap_swapin_test.c` / `.py` / `.rst`: separate cold swapin
   benchmark comparing WILLNEED with page faults and multiple reader threads.
-- `tools/mm/rswap_backend_test.py`: source-level backend, batching, counter and
-  table regressions.
+- `tools/mm/rswap_backend_test.py`: source-level regressions for the digest
+  slot, the key path, batching, counters and the response parser.
 - `tools/mm/rswap_redis_test.py`: RESP client test against a scripted server,
   plus `--live` against a real Redis server.
 - `tools/mm/kvswap_test.py`: HTTP protocol regression tests.
@@ -374,9 +458,12 @@ tools/mm/kvswap_server -d /tmp/rswap-kv -p 6789
 The server endpoints are:
 
 ```text
-POST /v1/folios/<sha256>/write
-GET  /v1/folios/<sha256>/read
+POST /v1/folios/<key>/write
+GET  /v1/folios/<key>/read
 ```
+
+`<key>` is the 96 hex character digest, i.e. `RSWAP_HASH_HEXLEN` characters;
+`kvswap_server` rejects any other width with 400.
 
 Or boot with the Redis backend and point it at a server:
 
@@ -385,8 +472,8 @@ rswap.backend=redis rswap.host=192.0.2.10 rswap.port=6379
 rswap.redis_user=default rswap.redis_password=<secret> rswap.redis_db=0
 ```
 
-Redis objects are the raw page images stored under the 64 hex digit digest,
-so `GET <sha256>` on the server must return exactly one base page.
+Redis objects are the raw page images stored under the same 96 hex character
+key, so `GET <key>` on the server must return exactly one base page.
 
 Selected backend information and the I/O counters are exposed through
 debugfs:
@@ -585,7 +672,11 @@ testing.
 
 ## Verified Behavior
 
-The no-fallback design has been tested live on ARM64 with 16 KiB base pages:
+The no-fallback design has been tested live on ARM64 with 16 KiB base pages.
+The live results in this section predate the 48-byte digest and the 96 hex
+character key: they were recorded with the 64 hex digit SHA-256 key of that
+time. Their page and byte counts, eviction checks and content audits still
+hold; only the key width they quote is the old one.
 
 - 512/512 attached pages for an 8 MiB userspace mapping.
 - A two-page negative test with one attached digest produced exactly one
@@ -614,7 +705,8 @@ kernel booted with `CONFIG_RSWAP_KV_REDIS=y`:
 - `rswap_redis_test.py --live` passes against a real password-protected Redis
   server: the page is stored as one 4 KiB object under the userspace SHA-256
   hex key, reads back byte-for-byte, a missing key fails with `-ENOENT`, and
-  the test leaves no objects behind.
+  the test leaves no objects behind. (64 hex digits at the time; that digest
+  is now the low half of a 96 hex character key.)
 
 With a kernel booted as `rswap.backend=redis` against a remote server, the
 verifier attached digests before each round and the Redis database was audited
@@ -717,14 +809,21 @@ are not backend transport failures or evidence of a fallback path.
 
 ## Known Limitations
 
-- A page intended for remote swap must have a userspace digest attached
-  before reclaim. If it does not, writeout fails and the page stays resident,
-  which can eventually lead to OOM under pressure.
-- The caller must update the digest after modifying page contents.
-- The device table is in memory and is not persistent across swapoff,
-  device destruction, or reboot. Remote server objects may remain.
-- The current digest is an integrity input supplied by user space. The kernel
-  does not independently recompute or verify it against page contents.
+- A page intended for remote swap must have a digest before reclaim: either a
+  digest program on its VMA or the legacy page_ext attach. Otherwise writeout
+  fails with `-ENODATA` and the page stays resident, which can eventually lead
+  to OOM under pressure.
+- The digest is resolved once, at unmap time, and the caller owns its
+  correctness. The kernel does not recompute or verify it against the page
+  contents, and it does not notice that the contents changed after the digest
+  was resolved.
+- Shmem digests are staged in the inode and moved into the cluster when the
+  folio reaches the swap cache; a shmem page is therefore keyed by the digest
+  resolved at its last unmap, not by any later modification.
+- The per-cluster slots are in memory and are not persistent across swapoff,
+  device destruction or reboot, and the swap slot release clears their
+  validity, so a released slot never reuses its digest. Remote server objects
+  may remain.
 - The HTTP KV server has no authentication and the kernel sends no
   credentials to it. Redis supports `AUTH`/`SELECT`, but its secret is a boot
   parameter and is stored in plain text while the kernel runs.
@@ -736,22 +835,58 @@ are not backend transport failures or evidence of a fallback path.
   throughput. A backend switch needs a reboot, and the backend for a device is
   never recorded, so a device written with one backend cannot be read back
   with another.
-- Read batches queue up to 8 bounce buffers of `RSWAP_BATCH_MAX` pages each
-  (1-4 MiB), so the transient memory of asynchronous swapin is bounded by the
-  queue depth, not by the number of swapin callers.
-- `RSWAP_BATCH_MAX` also bounds the core's per-request batch buffer (32 base
-  pages: 128 KiB with 4 KiB pages, 512 KiB with 16 KiB pages), kvmalloc'ed for
-  the duration of a request, plus the same amount again in the Redis request
-  buffer. That memory buys fewer round trips; with several CPUs in the swap I/O
-  path at once the transient cost is a few MiB.
-- There is no active eBPF integration.
+- A batch holds only bookkeeping: `RSWAP_BATCH_MAX` keys of `RSWAP_KV_KEY_LEN`
+  bytes plus one `struct rswap_kv_page` per page, so a few KiB per batch and
+  one pinned folio per page. Neither backend copies a page image: the bytes
+  travel between the folio page and the socket as a `struct bio_vec`, so the
+  transient cost of a batch is its folios, not a bounce buffer.
+- The digest program runs under the page table lock, from
+  `try_to_unmap_one()`, so it must not sleep and must not fault. It cannot
+  take locks that reclaim or the page table lock holder may already hold.
+- `VM_HASHED` and `rswap_prog` live on the VMA. `rswap_vma_dup()` drops both
+  on every VMA copy, so `fork` does not inherit a digest program and a range
+  split by `mprotect()` or `mremap()` stops resolving digests; such pages fall
+  back to the legacy page_ext digest and otherwise fail writeout.
+- The kernel preallocates the page-ext client while `CONFIG_RSWAP=y`, so its
+  bytes per base page are reserved even when no rswap device exists (review
+  finding M6, deferred).
 
-## eBPF Status
+## Digest Program
 
-The eBPF prototype is postponed. `rswap-userspace-demos/page_hash_kern.bpf.c`
-and `page_hash_test_mod.c` may remain as experimental source, but the active
-Makefile builds only the userspace sysctl tool. Do not re-enable eBPF without
-an explicit design change.
+The digest program is shipped and part of the active build.
+
+What it provides:
+
+- `struct vm_area_struct::rswap_prog` (`include/linux/mm_types.h`) and
+  `VM_HASHED` (`include/linux/mm.h`) mark a VMA whose pages must be hashed.
+- `/sys/kernel/mm/xswap/rswap_attach` (`mm/swapfile.c`) attaches a program fd
+  to the VMA that holds a given address in the writing task, or detaches it
+  with a zero fd. It requires `CAP_SYS_ADMIN`. The ABI is documented in
+  `Documentation/ABI/testing/sysfs-kernel-mm-xswap-rswap`.
+- The program type is `BPF_PROG_TYPE_SYSCALL`, so it may write to its context
+  (`struct rswap_hash_ctx`: the page's virtual address and the 48-byte digest
+  buffer) and signal success through its return value.
+- `rswap_attach_hash()` runs it from `try_to_unmap_one()` for anonymous folios,
+  `rswap_attach_hash_shmem()` stages the reply for shmem, and the result is
+  published into the cluster digest slot.
+- The program pointer is read with `rcu_dereference()` inside an RCU read-side
+  section, writers publish with `rcu_replace_pointer()`, and `bpf_prog_put()`
+  defers the free through a grace period, so attach and detach are safe against
+  a concurrent unmap.
+
+What it does not provide:
+
+- It cannot sleep or fault: it is called under the page table lock, in the
+  middle of unmapping, so no blocking operation, no userspace access and no
+  allocation that may reclaim.
+- It does not fix the digest to the contents: it is asked once, at unmap time,
+  and the caller is responsible for what it returns.
+- It does not survive a VMA copy. `rswap_vma_dup()` clears the flag and the
+  program, so `fork` and VMA splits lose it.
+- The userspace demos do not build a program: `make -C rswap-userspace-demos
+  user` builds only `page_hash_user`, the legacy sysctl tool, while
+  `page_hash_kern.bpf.c` and `page_hash_test_mod.c` are demo sources the kernel
+  does not depend on.
 
 ## Kernel Contribution Rules
 

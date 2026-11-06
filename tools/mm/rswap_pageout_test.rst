@@ -21,14 +21,19 @@ smaller runs. The output directory must not already exist.
 ``--takeover-swap`` temporarily disables other swap devices and restores
 them afterward. The runner creates an rswap device if necessary and removes
 only the device it created. The workload runs in a bounded cgroup with
-zswap disabled for that cgroup. The backend is the one selected at boot;
-the runner does not start a server or change backend configuration.
+zswap disabled for that cgroup. The backend and the endpoint are the boot
+parameters (``rswap.backend=``, ``rswap.host=``, ``rswap.port=``, and the
+Redis ones), not an address compiled into ``mm/rswap.c``: the runner reads
+``/sys/kernel/debug/rswap/backend`` and ``/sys/kernel/debug/rswap/endpoint``,
+does not start a server, and does not change backend configuration.
 
 Measurements
 ------------
 
 The runner creates a private tracefs instance and four temporary fprobe
-events on ``do_madvise`` and ``rswap_flush_batch``. Entry/return pairing
+events on ``do_madvise`` and ``rswap_flush_batch``. ``rswap_flush_batch()`` is
+the core function every writeout batch goes through, so the probes are backend
+independent; the swapin runner traces the backend's load function instead. Entry/return pairing
 checks that there was exactly one MADV_PAGEOUT covering the requested
 address and length, counts pages in every write batch, and measures peak
 simultaneous backend batches across all writer threads. It checks the

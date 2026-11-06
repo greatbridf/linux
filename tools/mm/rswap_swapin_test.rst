@@ -5,6 +5,13 @@ Cold rswap read performance
 with a 512 MiB anonymous mapping by default. They are separate from the
 existing integrity and whole-mapping pageout tests.
 
+The backend and the endpoint are boot parameters (``rswap.backend=``,
+``rswap.host=``, ``rswap.port=`` and the Redis ones), never a compiled-in
+address: the runner reads ``/sys/kernel/debug/rswap/backend`` and
+``/sys/kernel/debug/rswap/endpoint`` and uses whatever the running kernel
+booted with. It does not start or configure a server, so the endpoint must
+already be reachable.
+
 Build and run with the configured KV server reachable, rswap enabled,
 ``CONFIG_FPROBE_EVENTS`` enabled, and debugfs/tracefs mounted::
 
@@ -24,8 +31,11 @@ all reads through the selected backend.
 Preparing genuinely cold reads
 ------------------------------
 
-Each run fills a fresh mapping, computes and attaches SHA-256 digests in
-userspace, and records them in ``digests.txt``. It calls ``MADV_PAGEOUT`` and
+Each run fills a fresh mapping, computes SHA-256 over every native base page,
+attaches the 64 hexadecimal digits through ``/proc/sys/vm/rswap/attach``, and
+records them in ``digests.txt``. That is the legacy attach path: rswap's key is
+96 hexadecimal characters, the 48-byte digest slot, of which this interface
+fills the first 32 bytes and leaves the rest zero. It calls ``MADV_PAGEOUT`` and
 then uses its bounded cgroup's ``memory.reclaim`` to remove remaining
 swap-cache residency. Before measurement it requires every page to be
 nonresident according to ``mincore()`` and every PTE to be swapped according
@@ -71,9 +81,12 @@ no workqueue). ``read_submits`` and ``read_submit_avg_ns`` describe the
 submission path itself. Throughput is computed from total wall time, not the
 sum of overlapping batch durations.
 
-Temporary fprobe entry/return events on ``rswap_flush_batch`` measure the
-batch-size histogram, peak simultaneous read batches, and per-batch p50,
-p95, p99 and maximum latency. These are backend-call latencies, not individual
+Temporary fprobe entry/return events on the backend's load function measure
+the batch-size histogram, peak simultaneous read batches, and per-batch p50,
+p95, p99 and maximum latency. The traced symbol is
+``rswap_<backend>_load``, with ``<backend>`` taken from
+``/sys/kernel/debug/rswap/backend`` (``http`` or ``redis``); writeout is not
+probed by this runner. These are backend-call latencies, not individual
 page-fault latency or bare network RTT. ``do_madvise`` probes validate that
 the WILLNEED calls cover the mapping exactly once with disjoint ranges. Read
 batches run on the backend's worker threads, so a batch is paired per thread
