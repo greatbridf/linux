@@ -532,3 +532,44 @@ to spill. `RSWAP_BATCH_MAX` (32) and `RSWAP_READ_MAX_INFLIGHT` (8)
 the pool semaphore is shared with writeout. Raising them is a measurement
 exercise, not a bug fix: it needs the same pageout test at two settings, and it
 costs transient memory per queued batch.
+
+### L5 — The send timeout has never been in effect: `sock_set_sndtimeo()` takes seconds
+
+`open`. Found while fixing L1.
+
+`rswap_sock_connect()` converts both timeouts with `msecs_to_jiffies()` and then
+uses two different interfaces for them (`mm/rswap_sock.c`):
+
+```c
+send_timeo = max_t(long, 1, msecs_to_jiffies(send_timeout_ms));   /* jiffies */
+recv_timeo = max_t(long, 1, msecs_to_jiffies(recv_timeout_ms));   /* jiffies */
+...
+WRITE_ONCE(sock->sk->sk_rcvtimeo, recv_timeo);   /* correct: jiffies */
+...
+sock_set_sndtimeo(sock->sk, send_timeo);         /* wrong: takes seconds */
+```
+
+`sock_set_sndtimeo()` is `void sock_set_sndtimeo(struct sock *sk, s64 secs)` and
+does `WRITE_ONCE(sk->sk_sndtimeo, secs * HZ)` (`net/core/sock.c:819-827`), so
+every configured send timeout has been multiplied by `HZ`:
+
+- HTTP default 20 ms → `msecs_to_jiffies(20)` = 5 → **5 seconds**;
+- Redis default 10000 ms → 2500 → **2500 seconds**, about 42 minutes.
+
+Consequences: the "20 ms send timeout" that the HTTP backend documents never
+existed, so a wedged send could block for seconds; a timeout tuning done by an
+operator through the parameter changed it by a factor of `HZ`; and the
+`RSWAP_HTTP_SEND_TIMEOUT_MS` comment ("a send that cannot accept a page in
+20 ms is a broken endpoint") described behaviour the code did not have.
+`sk_rcvtimeo` was always correct, which is why receive-side timeouts and the
+per-request deadline behaved as documented.
+
+The connect wait got the same treatment in `97e9ae0f0740` (it now writes
+jiffies directly, because a `sock_set_sndtimeo()` call would have turned a 1 s
+connect budget into 1 s × `HZ`).
+
+Fix: write `sk_sndtimeo` in jiffies like `sk_rcvtimeo`, and raise the HTTP send
+default to 1000 ms at the same time. Fixing the unit alone would make 20 ms
+real, and 20 ms is below the measured cost of the first 128 KiB batch on a cold
+remote path (~45 ms), so the default has to change with the unit or a healthy
+endpoint would start failing.
