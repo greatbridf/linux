@@ -242,8 +242,10 @@ request fails, which is why `rswap_can_merge()` only merges folios whose pages
 all have a digest: a page that cannot be moved must fail alone instead of
 taking its request neighbours down with it.
 
-Backends are chosen at boot, never at runtime: switching a live device to a
-different store would strand every page already written to the old one.
+The store is chosen at boot, never at runtime: switching a live device to a
+different store would strand every page already written to the old one. The
+two timeouts do not decide where a page goes, so they are the exception and
+stay tunable.
 
 ```text
 rswap.backend=http|redis          default http
@@ -252,9 +254,23 @@ rswap.port=<port>                 0 selects the backend default
 rswap.redis_user=<acl user>       empty uses the Redis default user
 rswap.redis_password=<secret>     empty sends no AUTH
 rswap.redis_db=<n>                Redis database number
-rswap.send_timeout_ms=<ms>        0 selects the backend default
-rswap.recv_timeout_ms=<ms>        0 selects the backend default
 ```
+
+Those six are boot-only and `0444` in sysfs. The timeouts are boot parameters
+and module parameters, writable at `/sys/module/rswap/parameters/`:
+
+```text
+rswap.send_timeout_ms=<ms>        0 selects the backend default, else 1..60000
+rswap.recv_timeout_ms=<ms>        0 selects the backend default, else 1..60000
+```
+
+A write is validated and rejected with `-EINVAL` above 60000 ms, or when the
+value does not parse. `rswap_http_deadline()` and `rswap_redis_deadline()`
+call `rswap_kv_send_timeout()`/`rswap_kv_recv_timeout()` per request, so a
+change applies to requests started afterwards: a batch already in flight keeps
+the budget it computed at its start, and a pooled Redis connection keeps the
+socket timeouts it was opened with until it is dropped. Zero means "the
+backend default" at runtime too, so `echo 0` returns to it.
 
 The secrets are boot parameters only; `rswap.redis_password` is deliberately
 not exposed in sysfs and must not be committed to the tree.

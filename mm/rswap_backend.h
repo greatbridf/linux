@@ -56,8 +56,6 @@ struct rswap_kv_config {
 	const char	*user;		/* RESP ACL user, NULL if unused */
 	const char	*password;	/* RESP AUTH secret, NULL if unused */
 	unsigned int	db;		/* Redis database number */
-	unsigned int	send_timeout_ms;
-	unsigned int	recv_timeout_ms;
 };
 
 /*
@@ -67,8 +65,8 @@ struct rswap_kv_config {
  * @description:		human readable name, for logs
  * @default_host:		used when rswap.host is not set
  * @default_port:		used when rswap.port is not set
- * @default_send_timeout_ms:	used when rswap.send_timeout_ms is not set
- * @default_recv_timeout_ms:	used when rswap.recv_timeout_ms is not set
+ * @default_send_timeout_ms:	used while rswap.send_timeout_ms is 0
+ * @default_recv_timeout_ms:	used while rswap.recv_timeout_ms is 0
  * @init:			optional; copy @cfg, validate it, return -errno
  * @store:			write @nr page images
  * @load:			read @nr page images
@@ -101,6 +99,18 @@ struct rswap_backend {
 			       size_t len);
 	void		(*show_stats)(struct seq_file *m);
 };
+
+/*
+ * Effective backend timeouts in milliseconds, for a request that starts now:
+ * the rswap.send_timeout_ms / rswap.recv_timeout_ms parameter, or the
+ * selected backend's default while it is 0.  A backend asks for them when it
+ * budgets a request and when it opens a connection, so a runtime write through
+ * /sys/module/rswap/parameters/ reaches the next request, while a batch that
+ * already started keeps the budget it computed and a pooled connection keeps
+ * the socket timeouts it was opened with.
+ */
+unsigned int rswap_kv_send_timeout(void);
+unsigned int rswap_kv_recv_timeout(void);
 
 /*
  * TCP transport shared by the backends (mm/rswap_sock.c).  The helpers keep

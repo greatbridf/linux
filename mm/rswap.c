@@ -83,7 +83,8 @@ static_assert(RSWAP_HASH_HEXLEN + 1 == RSWAP_KV_KEY_LEN);
 /*
  * Backend selection.  These are boot parameters: switching a live swap device
  * to a different store would strand every page already written to the old
- * one, so none of them is writable at runtime.
+ * one, so none of them is writable at runtime.  The two timeouts below are
+ * the exception, because they do not decide where a page goes.
  */
 static char rswap_backend_name[16] = "http";
 module_param_string(backend, rswap_backend_name, sizeof(rswap_backend_name),
@@ -112,15 +113,52 @@ static unsigned int rswap_kv_db;
 module_param_named(redis_db, rswap_kv_db, uint, 0444);
 MODULE_PARM_DESC(redis_db, "Redis database number");
 
-static unsigned int rswap_kv_send_timeout_ms;
-module_param_named(send_timeout_ms, rswap_kv_send_timeout_ms, uint, 0444);
-MODULE_PARM_DESC(send_timeout_ms,
-		 "Send/connect timeout; 0 selects the backend default");
+/*
+ * Upper bound for both timeouts.  One minute is already far beyond a healthy
+ * remote store, and the request deadline adds a connect and two receive
+ * timeouts on top of it; letting a typo through would configure a request
+ * that outlives the memory pressure that started it.
+ */
+#define RSWAP_TIMEOUT_MAX_MS	60000
 
+static unsigned int rswap_kv_send_timeout_ms;
 static unsigned int rswap_kv_recv_timeout_ms;
-module_param_named(recv_timeout_ms, rswap_kv_recv_timeout_ms, uint, 0444);
+
+/*
+ * Both timeouts are writable so they can be tuned against a slow path without
+ * a reboot.  The value is read per request by the backend, so a bad value
+ * would cost a live request its bound instead of failing the write: check it
+ * first.  Zero keeps its boot meaning, "use the backend default", when it is
+ * written at runtime as well, so one value never means two things.
+ */
+static int rswap_timeout_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int timeout_ms;
+	int ret;
+
+	ret = kstrtouint(val, 0, &timeout_ms);
+	if (ret)
+		return ret;
+	if (timeout_ms > RSWAP_TIMEOUT_MAX_MS)
+		return -EINVAL;
+
+	return param_set_uint(val, kp);
+}
+
+static const struct kernel_param_ops rswap_timeout_ops = {
+	.set	= rswap_timeout_set,
+	.get	= param_get_uint,
+};
+
+module_param_cb(send_timeout_ms, &rswap_timeout_ops,
+		&rswap_kv_send_timeout_ms, 0644);
+MODULE_PARM_DESC(send_timeout_ms,
+		 "Send/connect timeout in ms for requests started afterwards; 0 selects the backend default, at most 60000");
+
+module_param_cb(recv_timeout_ms, &rswap_timeout_ops,
+		&rswap_kv_recv_timeout_ms, 0644);
 MODULE_PARM_DESC(recv_timeout_ms,
-		 "Receive timeout; 0 selects the backend default");
+		 "Receive timeout in ms for requests started afterwards; 0 selects the backend default, at most 60000");
 
 /* ---------- KV backend selection ---------- */
 
@@ -128,6 +166,25 @@ MODULE_PARM_DESC(recv_timeout_ms,
 static const struct rswap_backend *rswap_backend;
 static struct rswap_kv_config rswap_backend_cfg;
 static char rswap_backend_endpoint[RSWAP_KV_HOST_LEN + 8];
+
+/*
+ * Effective timeout of a request that starts now, in milliseconds: the
+ * parameter, or the selected backend's default while the parameter is 0.  A
+ * backend asks for it per request, so a runtime write reaches the next
+ * request, a batch already in flight keeps the budget it computed when it
+ * started, and a pooled Redis connection keeps the socket timeouts it was
+ * opened with until it is dropped.  Only reached once rswap_backend_setup()
+ * has selected a backend, because no swap device can exist before that.
+ */
+unsigned int rswap_kv_send_timeout(void)
+{
+	return rswap_kv_send_timeout_ms ?: rswap_backend->default_send_timeout_ms;
+}
+
+unsigned int rswap_kv_recv_timeout(void)
+{
+	return rswap_kv_recv_timeout_ms ?: rswap_backend->default_recv_timeout_ms;
+}
 
 static void __init rswap_debugfs_init(void);
 
@@ -174,10 +231,6 @@ static int __init rswap_backend_setup(void)
 	cfg->user = rswap_kv_user[0] ? rswap_kv_user : NULL;
 	cfg->password = rswap_kv_password[0] ? rswap_kv_password : NULL;
 	cfg->db = rswap_kv_db;
-	cfg->send_timeout_ms = rswap_kv_send_timeout_ms ?:
-		backend->default_send_timeout_ms;
-	cfg->recv_timeout_ms = rswap_kv_recv_timeout_ms ?:
-		backend->default_recv_timeout_ms;
 
 	if (backend->init) {
 		ret = backend->init(cfg);
