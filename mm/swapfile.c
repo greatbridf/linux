@@ -3440,6 +3440,7 @@ static void xswap_release_slot_backend(struct swap_info_struct *si,
 {
 	swp_entry_t entry = swp_entry(si->type, cluster_offset(si, ci) + slot);
 	struct swap_info_struct *psi;
+	unsigned short id = xswap_entry_id(ci, slot);
 	swp_entry_t phys = { .val = ci->xs_table[slot] };
 
 	WRITE_ONCE(ci->xs_table[slot], 0);
@@ -3448,7 +3449,13 @@ static void xswap_release_slot_backend(struct swap_info_struct *si,
 	if (psi)
 		xswap_free_phys_slot(psi, entry, phys);
 
-	xswap_backend_uncharge(entry, 1);
+	/*
+	 * ci->lock is held here, so read the owner out of the swap table
+	 * directly. xswap_backend_uncharge() would take the same lock
+	 * again, and a spinlock is not recursive.
+	 */
+	if (id)
+		mem_cgroup_swap_uncharge(id, 1);
 }
 
 /*
