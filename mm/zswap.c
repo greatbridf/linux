@@ -1133,7 +1133,7 @@ static int zswap_writeback_entry(struct swap_io_ctx *ctx,
 
 	/* Reserve the destination before dropping the zswap copy. */
 	if (is_xswap) {
-		phys = xswap_backend_alloc(swpentry);
+		phys = xswap_backend_alloc(swpentry, 0);
 		if (!phys.val) {
 			ret = -ENOMEM;
 			goto err;
@@ -1178,7 +1178,7 @@ static int zswap_writeback_entry(struct swap_io_ctx *ctx,
 
 err:
 	if (is_xswap && phys.val)
-		xswap_backend_free(swpentry, phys);
+		xswap_backend_free(swpentry, phys, 0);
 	swap_cache_del_folio(folio);
 	folio_unlock(folio);
 	folio_put(folio);

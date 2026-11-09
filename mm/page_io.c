@@ -269,7 +269,7 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
 		swp_entry_t phys;
 
 		/* The pool refused it: fall back to a real swap device. */
-		phys = xswap_backend_alloc(entry);
+		phys = xswap_backend_alloc(entry, folio_order(folio));
 		if (!phys.val) {
 			folio_mark_dirty(folio);
 			return AOP_WRITEPAGE_ACTIVATE;
