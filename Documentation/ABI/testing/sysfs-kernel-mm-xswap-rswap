@@ -1,0 +1,62 @@
+What:		/sys/kernel/mm/xswap/rswap_attach
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:	Attach or detach the rswap digest program of a VMA
+		(only present with CONFIG_RSWAP=y).
+
+		Input is a single line, written to the file:
+
+		::
+
+		    <virtual-address-hex> <program-fd>
+
+		The virtual address is read in hexadecimal and must lie inside
+		a VMA of the writing task; it is used as written, it is not
+		rounded to a page boundary.  The second field is a decimal file
+		descriptor of a loaded BPF program, or 0 to detach the program
+		that is currently attached.
+
+		The program is the digest source for the pages that VMA maps.
+		rswap calls it from the swap-out path, while the page is still
+		mapped, with a writable context:
+
+		::
+
+		    struct rswap_hash_ctx {
+			__u64 vaddr;
+			__u8  hash[48];
+		    };
+
+		The program must be of type BPF_PROG_TYPE_SYSCALL and fill
+		``hash`` with the digest user space wants used as the remote
+		key for the page at ``vaddr``, returning non-zero.  A zero
+		return value, or no attached program, means "no digest"; rswap
+		then falls back to the digest attached to the base page through
+		/proc/sys/vm/rswap/attach if there is one, and fails writeout
+		with -ENODATA if there is none either.  The digest is used as
+		the key of one base page in the remote key-value store; the
+		kernel never derives it from the swap entry or from the page.
+
+		The program runs under the page table lock, in the middle of
+		unmapping a folio.  It must not sleep, must not fault, must not
+		access user memory, and must not take locks that reclaim or the
+		page table lock holder may already hold.  It annotates a page
+		for swap-out; it does not read, modify or write back anything.
+
+		The kernel does not recompute or verify the digest against the
+		page contents, so user space must make sure it still matches,
+		and it must supply a new one after modifying a page.  A digest
+		is a property of the mapping that attached the program: a VMA
+		copy (fork()) does not inherit the program, and a range split by
+		mprotect() or mremap() stops resolving digests.
+
+		Writing requires CAP_SYS_ADMIN.  Attaching a program replaces a
+		previously attached one; on error the previous program stays
+		attached.  Errors: -EPERM without CAP_SYS_ADMIN, -EINVAL for a
+		malformed line or for a program that is not a
+		BPF_PROG_TYPE_SYSCALL program whose context fits
+		rswap_hash_ctx, -ENOENT when no VMA covers the address, -ESRCH
+		for a task without an mm, -EINTR when the mmap lock could not be
+		taken, and the program-descriptor lookup's own errno for an
+		invalid descriptor.
