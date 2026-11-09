@@ -28,7 +28,7 @@ struct swap_memcg_table {
  * NULL:     |---------------- 0 ---------------| - Free slot
  * Shadow:   |SWAP_COUNT|Z|---- SHADOW_VAL ---|1| - Swapped out slot
  * PFN:      |SWAP_COUNT|Z|------ PFN -------|10| - Cached slot
- * Pointer:  |----------- Pointer ----------|100| - (Unused)
+ * Pointer:  |C|-- xswap type/offset --|100| - Backend slot
  * Bad:      |------------- 1 -------------|1000| - Bad slot
  * HIB:      |    0     |------- 1 -------|10000| - Hibernation slot
  *
@@ -50,9 +50,9 @@ struct swap_memcg_table {
  * - PFN: Swap slot is in use, and cached. Memcg info is recorded on the page
  *   struct.
  *
- * - Pointer: Unused yet. `0b100` is reserved for potential pointer usage
- *   because only the lower three bits can be used as a marker for 8 bytes
- *   aligned pointers.
+ * - Pointer: A physical swap slot backed by an xswap entry. `0b100` marks it
+ *   and the xswap type and offset go above it; C is SWP_RMAP_CACHE_ONLY. See
+ *   the layout in the CONFIG_XSWAP block below.
  *
  * - Bad: Swap slot is reserved, protects swap header or holes on swap devices.
  *
@@ -89,6 +89,59 @@ struct swap_memcg_table {
 
 /* Hibernation slot: ends with 0b10000, no count, rests of bits are all 1 */
 #define SWP_TB_HIB		(((~0UL) << 4) & ~SWP_TB_COUNT_MASK)
+
+#ifdef CONFIG_XSWAP
+/*
+ * Pointer-tagged swap table entry: the reverse map from a physical slot to
+ * the xswap entry it backs. Layout:
+ *
+ *   Pointer:  | xswap_type(8) | xswap_offset(53) |100|
+ *
+ * The low three bits identify the entry: 0b000 is a free or bad slot, a
+ * shadow entry ends in 0b01 and a cached folio in 0b10, which leaves
+ * 0b100 as the only marker still free.
+ */
+#define SWP_TB_PTR_MARK			0b100UL
+#define SWP_TB_PTR_OFF_BITS		53
+#define SWP_TB_PTR_TYPE_BITS		8
+#define SWP_TB_PTR_OFF_SHIFT		3
+#define SWP_TB_PTR_TYPE_SHIFT		(SWP_TB_PTR_OFF_SHIFT + \
+					 SWP_TB_PTR_OFF_BITS)
+#define SWP_TB_PTR_OFF_MASK		((1UL << SWP_TB_PTR_OFF_BITS) - 1)
+#define SWP_TB_PTR_TYPE_MASK		((1UL << SWP_TB_PTR_TYPE_BITS) - 1)
+
+static inline bool swp_tb_is_pointer(unsigned long swp_tb)
+{
+	return (swp_tb & (BIT(3) - 1)) == SWP_TB_PTR_MARK;
+}
+
+static inline unsigned long xswap_entry_to_rmap(swp_entry_t entry)
+{
+	unsigned long type = swp_type(entry);
+	unsigned long off = swp_offset(entry);
+
+	VM_WARN_ON_ONCE(type > SWP_TB_PTR_TYPE_MASK);
+	VM_WARN_ON_ONCE(off > SWP_TB_PTR_OFF_MASK);
+	return (type << SWP_TB_PTR_TYPE_SHIFT) |
+	       (off << SWP_TB_PTR_OFF_SHIFT) |
+	       SWP_TB_PTR_MARK;
+}
+
+static inline swp_entry_t xswap_rmap_to_entry(unsigned long swp_tb)
+{
+	unsigned long type = (swp_tb >> SWP_TB_PTR_TYPE_SHIFT) &
+			     SWP_TB_PTR_TYPE_MASK;
+	unsigned long off = (swp_tb >> SWP_TB_PTR_OFF_SHIFT) &
+			    SWP_TB_PTR_OFF_MASK;
+
+	return swp_entry(type, off);
+}
+#else /* !CONFIG_XSWAP */
+static inline bool swp_tb_is_pointer(unsigned long swp_tb)
+{
+	return false;
+}
+#endif /* CONFIG_XSWAP */
 
 /* Macro for shadow offset calculation */
 #define SWAP_COUNT_SHIFT	SWP_TB_FLAGS_BITS

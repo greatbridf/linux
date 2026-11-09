@@ -1192,6 +1192,9 @@ static bool cluster_scan_range(struct swap_info_struct *si,
 		swp_tb = __swap_table_get(ci, ci_off);
 		if (swp_tb_is_null(swp_tb))
 			continue;
+		/* Backs an xswap entry: the slot is not allocatable. */
+		if (swp_tb_is_pointer(swp_tb))
+			return false;
 		if (swp_tb_is_folio(swp_tb) && !__swp_tb_get_count(swp_tb)) {
 			if (!vm_swap_full())
 				return false;
