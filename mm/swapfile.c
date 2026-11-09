@@ -603,19 +603,6 @@ offset_to_swap_extent(struct swap_info_struct *sis, unsigned long offset)
 	BUG();
 }
 
-sector_t swap_folio_sector(struct folio *folio)
-{
-	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
-	struct swap_extent *se;
-	sector_t sector;
-	pgoff_t offset;
-
-	offset = swp_offset(folio->swap);
-	se = offset_to_swap_extent(sis, offset);
-	sector = se->start_block + (offset - se->start_page);
-	return sector << (PAGE_SHIFT - 9);
-}
-
 sector_t swap_entry_sector(swp_entry_t entry)
 {
 	struct swap_info_struct *sis = __swap_entry_to_info(entry);
