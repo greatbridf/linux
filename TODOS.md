@@ -32,15 +32,19 @@ caller's submission stream.
   `rswap_flush_batch()` call, exactly as before. Batch latency
   (`read_avg_ns`/`read_max_ns`) is therefore measured around the real backend
   call in the worker, not at submission.
-- `RSWAP_READ_MAX_INFLIGHT` (8) bounds queued plus running batches, which
-  bounds the pinned folios and the per-batch bookkeeping (`RSWAP_BATCH_MAX`
-  keys of `RSWAP_KV_KEY_LEN` bytes plus one `struct rswap_kv_page` per page;
-  there is no page buffer). The value matches `RSWAP_REDIS_POOL_MAX`; the
-  measured WILLNEED throughput plateaued around eight concurrent batches.
-- Forward progress under pressure: a batch that cannot take a slot, an item
-  the workqueue refuses, and a missing request structure all fall back to
-  moving that batch in the submitting task, which is the previous synchronous
-  behaviour. `WQ_MEM_RECLAIM` keeps a worker runnable while reclaim waits.
+- `RSWAP_READ_MAX_ACTIVE` (8) is the read workqueue's `max_active`, i.e. how
+  many batches a worker may move at once; the submitting task never waits for
+  one of those slots, so a single caller queues every batch its readahead
+  produced and the workqueue decides how many round trips overlap. The
+  per-batch bookkeeping is `RSWAP_BATCH_MAX` keys of `RSWAP_KV_KEY_LEN` bytes
+  plus one `struct rswap_kv_page` per page (there is no page buffer), and the
+  folios a batch names are pinned by the swap request either way. The value
+  matches `RSWAP_REDIS_POOL_MAX`; the measured WILLNEED throughput plateaued
+  around eight concurrent batches.
+- Forward progress under pressure: a batch the workqueue refuses (or a missing
+  workqueue) and a missing request structure fall back to moving that batch in
+  the submitting task, which is the previous synchronous behaviour.
+  `WQ_MEM_RECLAIM` keeps a worker runnable while reclaim waits.
 - Completion is exactly once, from a `refcount_t` that the submitter holds
   once and every dispatched batch holds once. The last batch to finish calls
   `sio->iocb.ki_complete(&sio->iocb, ret ? ret : sio->len)`; the normal
@@ -57,7 +61,9 @@ caller's submission stream.
   `synchronize_rcu()` and waited for its holders, so the drain cannot
   deadlock.
 - New `stats` lines: `read_inflight`, `read_peak_inflight`, `read_fallbacks`,
-  `read_submits` and `read_submit_avg_ns`. Page, batch, error, `no_entry` and
+  `read_submits` and `read_submit_avg_ns`. `read_inflight` and
+  `read_peak_inflight` count the batches a worker is moving, not the workqueue
+  backlog, so they still measure overlap. Page, batch, error, `no_entry` and
   batch-latency counters keep their previous meaning.
 - `tools/mm/rswap_swapin_test.c` now reports `SUBMITTED` (submission latency)
   separately from `LOADED` (every page of the mapping resident again, which
@@ -70,8 +76,8 @@ caller's submission stream.
 
 - `tools/mm/rswap_backend_test.py` compiles the real async code with
   `queue_work()` running the work item inline, so an asynchronous read request
-  completes exactly once through `rswap_read_batch_work()` and releases its
-  slot; it also covers the no-workqueue inline fallback.
+  completes exactly once through `rswap_read_batch_work()` and drops its
+  count; it also covers the no-workqueue inline fallback.
 - Live, on a booted kernel with the new code:
 
 ```sh
@@ -98,8 +104,9 @@ remote reads. Both backends need a pass.
 - ~~No new timeout~~: the request deadline added in `bb27e27f073a` bounds a
   whole request (connect, send and two receive timeouts, plus both attempts of
   the Redis retry), so a worker can no longer pay one receive timeout per
-  parser byte. A worker still holds its slot and its locked folios for the
-  length of that budget, now bounded by 8 slots instead of unlimited.
+  parser byte. A worker still holds its worker slot and its locked folios for
+  the length of that budget, now bounded by the workqueue's `max_active`
+  instead of unlimited.
 - Writeout is still synchronous. It could reuse the same batch/work item
   machinery if the writeback-flag latency of reclaim turns out to matter.
 - The reported `read_peak_inflight` is a boot-lifetime maximum reset at device
@@ -133,7 +140,7 @@ batch, i.e. ~22 MB/s (`written_pages` 16963 -> 19872, visible in `MONITOR` and
 in the backend counters). At that rate a 32k-token DeepSeek prefill (~10 GiB)
 needs about eight minutes to spill.
 
-- The knobs are `RSWAP_BATCH_MAX` (32), `RSWAP_READ_MAX_INFLIGHT` (8) and
+- The knobs are `RSWAP_BATCH_MAX` (32), `RSWAP_READ_MAX_ACTIVE` (8) and
   `RSWAP_REDIS_POOL_MAX`, all compile-time constants. The connection pool
   semaphore is shared by the read queue and writeout, so raising the read depth
   alone does not give writeout more concurrent connections.
@@ -178,7 +185,7 @@ finding recorded in `REVIEW-FINDINGS.md` except M6. In rswap terms:
   it on the boot parameter, or drop the page_ext client once the per-cluster
   slot is the only digest store.
 - The Redis connection pool semaphore is shared by writeout and the read queue
-  and its size equals `RSWAP_READ_MAX_INFLIGHT`, so a saturated read queue
+  and its size equals `RSWAP_READ_MAX_ACTIVE`, so a saturated read queue
   delays reclaim-context writeout by one remote batch.
 - The Redis pool never closes idle sockets; a connection is reused or dropped
   only when a batch finds it broken.

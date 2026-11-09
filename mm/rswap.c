@@ -1044,7 +1044,7 @@ static int rswap_submit_batch(struct rswap_kv_page *pages, unsigned int nr,
 
 /*
  * How many times a read batch is moved again after a transient transport
- * failure, i.e. at most three attempts.  Sibling of RSWAP_READ_MAX_INFLIGHT
+ * failure, i.e. at most three attempts.  Sibling of RSWAP_READ_MAX_ACTIVE
  * (see below): a retry costs one more backend round trip of the same bound as
  * the first, and the fault that waits for the batch waits for all of them.
  * Two retries ride out a connection that a peer or a signal killed without
@@ -1325,28 +1325,38 @@ out:
 /* ---------- asynchronous swapin ---------- */
 
 /*
- * How many read batches may be outstanding at once.  A batch is bookkeeping
- * only - RSWAP_BATCH_MAX keys and one struct rswap_kv_page per page, a few
- * KiB - so what this bound really limits is the folios a queued batch pins
- * until its remote reads finished.  Eight matches
+ * How many read batches a worker may move at the same time, i.e. the
+ * workqueue's max_active.  The submitting task never waits for one of these:
+ * it hands every batch over as soon as the batch is built, so one caller of
+ * MADV_WILLNEED can fill the queue with everything its readahead produced and
+ * the workqueue decides how many remote round trips actually overlap.
+ *
+ * max_active of a bound workqueue is a per-CPU limit, so it bounds the
+ * batches a submitter queued on one CPU, not the total.  Eight matches
  * RSWAP_REDIS_POOL_MAX: a ninth concurrent batch would only wait for a pooled
  * connection, and the measured WILLNEED throughput of the remote Redis test
  * server stopped improving beyond eight concurrent batches (22.5 MiB/s with
- * eight callers against 9.7 MiB/s with one).
+ * eight callers against 9.7 MiB/s with one).  A backend that opens a
+ * connection per request, like HTTP, is the one that can use a larger value.
+ *
+ * A queued batch is bookkeeping only - RSWAP_BATCH_MAX keys and one
+ * struct rswap_kv_page per page, a few KiB - and the folios it names are the
+ * ones the swap request already pins, so queue depth costs no page images.
  *
  * A batch that fails with a transient transport error is moved again, up to
  * RSWAP_READ_MAX_RETRIES times (see rswap_flush_batch()).
  */
-#define RSWAP_READ_MAX_INFLIGHT	8
+#define RSWAP_READ_MAX_ACTIVE	8
 
 /*
- * Batches holding one of the RSWAP_READ_MAX_INFLIGHT slots: queued or running
- * in a worker, or moved in the submitting task while a slot was free.
+ * Batches a worker is moving: a remote round trip in progress.  A batch that
+ * waits in the workqueue is not counted, because the queue is not bounded any
+ * more and its depth would say nothing about how much work overlaps.
  */
 static atomic_t rswap_read_inflight;
 /* Largest value the above reached; reset when a device is created. */
 static atomic_t rswap_read_peak_inflight;
-/* Batches moved in the submitting task instead (queue full or absent). */
+/* Batches moved in the submitting task instead (no workqueue, item refused). */
 static atomic64_t rswap_read_fallbacks;
 /* Submissions and the time they spent before returning to the caller. */
 static atomic64_t rswap_read_submits;
@@ -1370,29 +1380,21 @@ static void rswap_read_peak_update(int value)
 		;
 }
 
-/* Take one of the RSWAP_READ_MAX_INFLIGHT slots; false when saturated. */
-static bool rswap_read_enter(void)
+/* Account a batch as running and track how many run at the same time. */
+static void rswap_read_begin(void)
 {
-	int value = atomic_read(&rswap_read_inflight);
-
-	do {
-		if (value >= RSWAP_READ_MAX_INFLIGHT)
-			return false;
-	} while (!atomic_try_cmpxchg(&rswap_read_inflight, &value, value + 1));
-
-	rswap_read_peak_update(value + 1);
-	return true;
+	rswap_read_peak_update(atomic_inc_return(&rswap_read_inflight));
 }
 
 /*
- * Release @nr read slots.  A batch releases its slot only after it dropped its
- * request reference, i.e. after the completion it may have triggered ran: a
- * worker in rswap_read_batch_work(), a batch moved in the submitting task in
- * rswap_read_async() after its final drop.
+ * Account a batch as finished.  A worker releases its count only after it
+ * dropped its request reference, i.e. after the completion it may have
+ * triggered ran, so the last batch of a request completes it before the gauge
+ * drops.
  */
-static void rswap_read_leave(unsigned int nr)
+static void rswap_read_end(void)
 {
-	atomic_sub(nr, &rswap_read_inflight);
+	atomic_dec(&rswap_read_inflight);
 }
 
 /*
@@ -1444,53 +1446,44 @@ static void rswap_read_batch_work(struct work_struct *work)
 	int ret;
 
 	noio_flags = memalloc_noio_save();
+	rswap_read_begin();
 	ret = rswap_batch_flush(batch, READ);
 	memalloc_noio_restore(noio_flags);
 
 	rswap_read_req_error(req, ret);
 	rswap_batch_free(batch);
 	rswap_read_req_put(req);
-	rswap_read_leave(1);
+	rswap_read_end();
 }
 
 /*
  * Hand one batch to a worker, or move it in the submitting task when the
- * queue is saturated, the workqueue is unavailable or it refuses the item.
- * The inline path is exactly the previous synchronous behaviour, so swapin
- * always makes forward progress under memory pressure.
+ * workqueue is unavailable or refuses the item.  The inline path is exactly
+ * the previous synchronous behaviour, so swapin always makes forward progress
+ * under memory pressure.
  *
- * Returns true when the batch was moved here and holds a read slot, which the
- * submitting task releases after its final reference drop.
+ * There is no submission-side slot to take: RSWAP_READ_MAX_ACTIVE batches may
+ * run at the same time and the rest wait in the workqueue, so a task that
+ * submits many batches does not block in the middle of its submission.
  */
-static bool rswap_read_dispatch(struct rswap_batch *batch)
+static void rswap_read_dispatch(struct rswap_batch *batch)
 {
 	struct rswap_read_req *req = batch->req;
-	bool held;
 	int ret;
 
-	held = rswap_read_enter();
-	if (held && rswap_read_wq) {
+	if (rswap_read_wq) {
 		refcount_inc(&req->refs);
 		INIT_WORK(&batch->work, rswap_read_batch_work);
 		if (queue_work(rswap_read_wq, &batch->work))
-			return false;
+			return;
 		refcount_dec(&req->refs);
-		rswap_read_leave(1);
-		held = false;
 	}
 
-	/*
-	 * Move the batch here instead.  Either the queue was saturated, so no
-	 * slot was taken and read_inflight cannot exceed the bound, or there is
-	 * no workqueue and the slot taken above stays held until the submitter
-	 * dropped its final reference.
-	 */
+	/* No workqueue, or it refused the item: move the batch here. */
 	atomic64_inc(&rswap_read_fallbacks);
 	ret = rswap_batch_flush(batch, READ);
 	rswap_read_req_error(req, ret);
 	rswap_batch_free(batch);
-
-	return held;
 }
 
 static int rswap_read_wq_init(void)
@@ -1499,9 +1492,13 @@ static int rswap_read_wq_init(void)
 
 	if (rswap_read_wq)
 		return 0;
-	/* WQ_MEM_RECLAIM: the workers must run while reclaim waits for them. */
-	wq = alloc_workqueue("rswap_read", WQ_MEM_RECLAIM,
-			     RSWAP_READ_MAX_INFLIGHT);
+	/*
+	 * WQ_MEM_RECLAIM: the workers must run while reclaim waits for them.
+	 * max_active is the only bound on concurrent reads; the queue itself
+	 * accepts every batch the submitting task builds.
+	 */
+	wq = alloc_workqueue("rswap_read", WQ_UNBOUND | WQ_MEM_RECLAIM,
+			     RSWAP_READ_MAX_ACTIVE);
 	if (!wq) {
 		pr_warn("no read workqueue, swapin stays synchronous\n");
 		return -ENOMEM;
@@ -1523,7 +1520,7 @@ static int rswap_read_wq_init(void)
  *
  * Batch bookkeeping is kzalloc'ed under GFP_NOIO one batch at a time, so the
  * submitter never needs memory for the whole request.  When even that fails,
- * or no batch slot is free, the batch is moved right here.
+ * or the workqueue refuses a batch, that batch is moved right here.
  */
 static void rswap_read_async(struct swap_io_ctx *ctx)
 {
@@ -1534,7 +1531,6 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 	struct folio *folio;
 	struct page *page;
 	unsigned int nr_queued = 0;
-	unsigned int nr_inline = 0;
 	unsigned int nr_left;
 	s64 started = ktime_get_ns();
 	unsigned int noio_flags;
@@ -1579,8 +1575,7 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 
 			batch->req = req;
 			nr_queued += batch->nr;
-			if (rswap_read_dispatch(batch))
-				nr_inline++;
+			rswap_read_dispatch(batch);
 			batch = rswap_batch_alloc(ctx->sis);
 			if (!batch) {
 				ret = -ENOMEM;
@@ -1591,8 +1586,7 @@ static void rswap_read_async(struct swap_io_ctx *ctx)
 	if (batch->nr) {
 		batch->req = req;
 		nr_queued += batch->nr;
-		if (rswap_read_dispatch(batch))
-			nr_inline++;
+		rswap_read_dispatch(batch);
 		batch = NULL;
 	}
 	goto out;
@@ -1620,8 +1614,6 @@ out:
 	atomic64_add(ktime_get_ns() - started, &rswap_read_submit_ns);
 	/* Drop the submitting task's reference; the last batch completes. */
 	rswap_read_req_put(req);
-	/* The request ran; release the slots of the batches moved here. */
-	rswap_read_leave(nr_inline);
 }
 
 static void rswap_submit_write(struct swap_io_ctx *ctx)

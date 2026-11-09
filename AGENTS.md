@@ -114,17 +114,22 @@ before it continues.
 One work item is one `rswap_flush_batch()` call, so Redis still pipelines up
 to 32 GET commands and HTTP still sends one object per request; the difference
 is that batches of one request now overlap instead of being serialized.
-`RSWAP_READ_MAX_INFLIGHT` (8) bounds queued plus running batches, which bounds
-the folios they pin, and the batch bookkeeping is only
-`RSWAP_BATCH_MAX` keys plus one `struct rswap_kv_page` per page: there is no
-bounce buffer, a page image travels between the folio page and the socket. 8
-matches
-`RSWAP_REDIS_POOL_MAX` and the point where measured WILLNEED throughput
-stopped improving. When no slot is free, the workqueue refuses the item or the
-request structure cannot be allocated, that batch is moved in the submitting
-task instead, i.e. the previous synchronous behaviour, so swapin always makes
-forward progress under memory pressure. `WQ_MEM_RECLAIM` keeps a worker
-runnable while reclaim waits for it.
+`RSWAP_READ_MAX_ACTIVE` (8) is the read workqueue's `max_active`, i.e. the
+number of batches a worker may move at once; the submitting task never waits
+for one of those slots, so a single `MADV_WILLNEED` caller queues everything
+its readahead produced and the workqueue decides how many remote round trips
+overlap. max_active of a bound workqueue applies per CPU, so a submitter that
+migrates can have more than eight batches running. The queue itself is not
+bounded, and the batch bookkeeping is only `RSWAP_BATCH_MAX` keys plus one
+`struct rswap_kv_page` per page: there is no bounce buffer, a page image
+travels between the folio page and the socket, and the folios a batch names are
+pinned by the swap request anyway. 8 matches `RSWAP_REDIS_POOL_MAX` and the
+point where measured WILLNEED throughput stopped improving. When there is no
+workqueue or it refuses the item, or the request structure cannot be
+allocated, that batch is moved in the submitting task instead, i.e. the
+previous synchronous behaviour, so swapin always makes forward progress under
+memory pressure. `WQ_MEM_RECLAIM` keeps a worker runnable while reclaim waits
+for it.
 
 Completion is exactly once, through a `refcount_t` held once by the submitter
 and once per dispatched batch: the last batch to finish calls
@@ -144,9 +149,12 @@ for its holders before calling it, and runs without a lock held there, so the
 drain cannot deadlock.
 
 `read_avg_ns`/`read_max_ns` are measured around the backend call in the
-worker, so they are real remote batch latency. `read_inflight`,
-`read_peak_inflight` (a boot-lifetime maximum, reset when a device is created),
-`read_fallbacks` and `read_submits` describe the queue itself. The swapin
+worker, so they are real remote batch latency. `read_inflight` is the number of
+batches a worker is moving right now and `read_peak_inflight` the largest
+number that ever ran at once (a boot-lifetime maximum, reset when a device is
+created); a batch waiting in the workqueue is not counted, because the queue is
+not bounded. `read_fallbacks` counts batches moved in the submitting task
+instead of a worker, and `read_submits` the read requests queued. The swapin
 performance test separates `SUBMITTED` from `LOADED` for the same reason:
 only `LOADED` means the remote reads finished.
 
@@ -583,16 +591,18 @@ read_submits           1024
 read_submit_avg_ns     210000
 ```
 
-`read_inflight` is the number of read batches queued or running,
-`read_peak_inflight` the largest value it reached since the device was
-created, `read_fallbacks` batches that had to be moved in the submitting task
-(no free queue slot or no workqueue), `read_submits` read requests queued and
-`read_submit_avg_ns` the average time a submission spent before returning to
-the caller. `read_retries` counts read batches moved again after a transient
-transport failure (see "Read retry policy"); it is printed with the page
-counters, between `read_no_entry` and `read_avg_ns`. A request that finds no
-memory for its queue bookkeeping at all runs the previous synchronous path
-inside `rswap_submit()` instead and shows up only in
+`read_inflight` is the number of read batches a worker is moving, i.e. of
+remote round trips in progress, `read_peak_inflight` the largest value it
+reached since the device was created, `read_fallbacks` batches that had to be
+moved in the submitting task (no workqueue or a refused work item),
+`read_submits` read requests queued and `read_submit_avg_ns` the average time a
+submission spent before returning to the caller. A batch waiting in the
+workqueue is not counted in `read_inflight`: the queue is not bounded, so its
+depth would not say anything about overlap. `read_retries` counts read batches
+moved again after a transient transport failure (see "Read retry policy"); it
+is printed with the page counters, between `read_no_entry` and `read_avg_ns`.
+A request that finds no memory for its queue bookkeeping at all runs the
+previous synchronous path inside `rswap_submit()` instead and shows up only in
 `read_pages`/`read_batches`. `read_batches` and `read_avg_ns` still count
 and time the backend calls themselves, now from the worker.
 
@@ -875,7 +885,7 @@ about eight pages per batch. WILLNEED batch p50/p95 latency increased from
 load time fell because requests overlapped. Throughput flattened around
 four to eight callers; individual runs do not establish physical link
 capacity. Those findings motivated the asynchronous `submit_read` path, which
-turns one WILLNEED caller into up to `RSWAP_READ_MAX_INFLIGHT` overlapping
+turns one WILLNEED caller into up to `RSWAP_READ_MAX_ACTIVE` overlapping
 batches; the numbers in this table predate it and were measured with a
 synchronous backend.
 
@@ -910,21 +920,21 @@ are not backend transport failures or evidence of a fallback path.
 - The HTTP KV server has no authentication and the kernel sends no
   credentials to it. Redis supports `AUTH`/`SELECT`, but its secret is a boot
   parameter and is stored in plain text while the kernel runs.
-- Swapin batches overlap, but at most `RSWAP_READ_MAX_INFLIGHT` (8) are in
-  flight, so a single caller of `MADV_WILLNEED` reaches at most the throughput
-  of eight concurrent round trips. The depth is a compile-time constant, and
-  the HTTP backend still opens one connection per object. Both the
-  single-threaded HTTP server and this depth are for testing, not production
-  throughput. A backend switch needs a reboot, and the backend for a device is
-  never recorded, so a device written with one backend cannot be read back
-  with another.
-- Read throughput is bounded by the batch size and the in-flight depth, both
-  compile-time constants: a live run reached ~22 MB/s, i.e. roughly eight
-  minutes for a 32k-token DeepSeek prefill (~10 GiB) to spill, at 22.8 ms per
-  32-page batch. The Redis connection pool semaphore is shared with writeout,
-  so a saturated read queue delays reclaim-context writeout by one remote
-  batch. Raising either number is a measurement exercise, not a bug fix; it
-  costs transient memory per queued batch.
+- Swapin batches overlap, but at most `RSWAP_READ_MAX_ACTIVE` (8) are moved at
+  once, because that is the read workqueue's `max_active`, so a single caller
+  of `MADV_WILLNEED` reaches at most the throughput of eight concurrent round
+  trips on one CPU. The depth is a compile-time constant, and the HTTP backend
+  still opens one connection per object. Both the single-threaded HTTP server
+  and this depth are for testing, not production throughput. A backend switch
+  needs a reboot, and the backend for a device is never recorded, so a device
+  written with one backend cannot be read back with another.
+- Read throughput is bounded by the batch size and the workqueue's
+  `max_active`, both compile-time constants: a live run reached ~22 MB/s, i.e.
+  roughly eight minutes for a 32k-token DeepSeek prefill (~10 GiB) to spill, at
+  22.8 ms per 32-page batch. The Redis connection pool semaphore is shared with
+  writeout, so a saturated read queue delays reclaim-context writeout by one
+  remote batch. Raising either number is a measurement exercise, not a bug fix;
+  it costs transient memory per queued batch.
 - A transient failure of a read batch is retried twice per batch and then
   reported, so a store that stays down costs three round trips (three request
   budgets) per batch before the fault. Reclaim retries the page instead:

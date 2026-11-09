@@ -76,8 +76,10 @@ by ``LOADED``, and ``read_inflight`` must be zero at that point. A single
 WILLNEED call now batches pages and overlaps several batches without further
 userspace callers; the trace's peak active batch count and the debugfs
 ``read_peak_inflight`` line report whether it did, and ``read_fallbacks``
-counts batches that had to be moved in the submitting task (no queue slot or
-no workqueue). ``read_submits`` and ``read_submit_avg_ns`` describe the
+counts batches that had to be moved in the submitting task (no workqueue or a
+refused work item). ``read_inflight`` counts the batches a worker is moving,
+not the ones waiting in the workqueue, which is what makes its zero a
+completion gate. ``read_submits`` and ``read_submit_avg_ns`` describe the
 submission path itself. Throughput is computed from total wall time, not the
 sum of overlapping batch durations.
 
