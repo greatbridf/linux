@@ -4855,12 +4855,15 @@ static unsigned long thp_swapin_suitable_orders(struct swap_info_struct *si,
 	if (unlikely(userfaultfd_armed(vma)))
 		return 0;
 
+	entry = softleaf_from_pte(vmf->orig_pte);
+
 	/*
 	 * A large swapped out folio could be partially or fully in zswap. We
 	 * lack handling for such cases, so fallback to swapping in order-0
 	 * folio.
 	 */
-	if (!zswap_never_enabled())
+	if (!(__swap_entry_to_info(entry)->flags & SWP_XSWAP) &&
+	    !zswap_never_enabled())
 		return 0;
 
 	/*
@@ -4871,7 +4874,6 @@ static unsigned long thp_swapin_suitable_orders(struct swap_info_struct *si,
 	if (!data_race(si->flags & SWP_BLKDEV))
 		return 0;
 
-	entry = softleaf_from_pte(vmf->orig_pte);
 	/*
 	 * Get a list of all the (large) orders below PMD_ORDER that are enabled
 	 * and suitable for swapping THP.

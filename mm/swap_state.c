@@ -209,6 +209,12 @@ static int __swap_cache_add_check(struct swap_cluster_info *ci,
 	if (nr == 1)
 		return 0;
 
+	/* A zswap-backed or mixed batch falls back to a smaller order. */
+	if (__swap_entry_to_info(targ_entry)->flags & SWP_XSWAP) {
+		if (xswap_check_backing(ci, round_down(ci_off, nr), nr) != nr)
+			return -EBUSY;
+	}
+
 	is_zero = __swap_table_test_zero(ci, ci_off);
 	ci_off = round_down(ci_off, nr);
 	ci_end = ci_off + nr;
