@@ -1088,6 +1088,8 @@ static int zswap_writeback_entry(struct swap_io_ctx *ctx,
 	struct folio *folio;
 	struct mempolicy *mpol;
 	struct swap_info_struct *si;
+	swp_entry_t phys = {};
+	bool is_xswap;
 	int ret = 0;
 
 	/* try to allocate swap cache folio */
@@ -1095,10 +1097,7 @@ static int zswap_writeback_entry(struct swap_io_ctx *ctx,
 	if (IS_ERR_OR_NULL(si))
 		return -ENOENT;
 
-	if (si->flags & SWP_XSWAP) {
-		put_swap_device(si);
-		return -EINVAL;
-	}
+	is_xswap = !!(si->flags & SWP_XSWAP);
 
 	mpol = get_task_policy(current);
 	folio = __swap_cache_alloc_folio(swpentry, GFP_KERNEL, BIT(0), NULL, mpol,
@@ -1130,6 +1129,15 @@ static int zswap_writeback_entry(struct swap_io_ctx *ctx,
 	if (entry != xa_load(tree, offset)) {
 		ret = -ENOMEM;
 		goto err;
+	}
+
+	/* Reserve the destination before dropping the zswap copy. */
+	if (is_xswap) {
+		phys = xswap_backend_alloc(swpentry);
+		if (!phys.val) {
+			ret = -ENOMEM;
+			goto err;
+		}
 	}
 
 	if (!zswap_decompress(entry, folio)) {
@@ -1164,11 +1172,13 @@ static int zswap_writeback_entry(struct swap_io_ctx *ctx,
 	folio_put(folio);
 
 	/* start writeback */
-	__swap_writeout(ctx, folio, folio->swap);
+	__swap_writeout(ctx, folio, is_xswap ? phys : folio->swap);
 
 	return 0;
 
 err:
+	if (is_xswap && phys.val)
+		xswap_backend_free(swpentry, phys);
 	swap_cache_del_folio(folio);
 	folio_unlock(folio);
 	folio_put(folio);
@@ -1606,8 +1616,12 @@ static bool zswap_store_page(struct folio *folio, long index,
 	entry->referenced = true;
 	if (entry->length) {
 		INIT_LIST_HEAD(&entry->lru);
-		/* No backing store: nothing to write these back to. */
-		if (!(__swap_entry_to_info(page_swpentry)->flags & SWP_XSWAP))
+		/*
+		 * An xswap entry with no real swap device cannot be written
+		 * back, so keep it off the shrinker's LRU.
+		 */
+		if (!(__swap_entry_to_info(page_swpentry)->flags & SWP_XSWAP) ||
+		    atomic_read(&nr_real_swapfiles))
 			zswap_lru_add(entry);
 	}
 
