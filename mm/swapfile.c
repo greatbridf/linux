@@ -2200,6 +2200,7 @@ int folio_alloc_swap(struct folio *folio)
 {
 	unsigned int order = folio_order(folio);
 	unsigned int size = 1 << order;
+	unsigned short swap_id = 0;
 	/* True unless the gate below finds an xswap device to route away from. */
 	bool may_zswap = true;
 	bool zswap_checked = false;
@@ -2262,10 +2263,17 @@ again:
 		}
 	}
 
-	/* Need to call this even if allocation failed, for MEMCG_SWAP_FAIL. */
-	if (unlikely(mem_cgroup_try_charge_swap(folio))) {
-		swap_cache_del_folio(folio);
-		goto failed;
+	/*
+	 * Need to call this even if allocation failed, for MEMCG_SWAP_FAIL.
+	 * The owner is taken here, then charged and recorded.
+	 */
+	if (mem_cgroup_swap_get(folio, &swap_id)) {
+		if (unlikely(mem_cgroup_swap_charge(swap_id, size))) {
+			mem_cgroup_swap_put(swap_id, size);
+			swap_cache_del_folio(folio);
+			goto failed;
+		}
+		mem_cgroup_swap_record(folio, swap_id);
 	}
 
 	if (unlikely(!folio_test_swapcache(folio)))
@@ -2411,6 +2419,13 @@ put_out:
 	return ERR_PTR(-EIO);
 }
 
+/* Uncharge a batch of freed swap slots and drop their owner refs. */
+static void memcg_swap_free(unsigned short id, unsigned int nr)
+{
+	mem_cgroup_swap_uncharge(id, nr);
+	mem_cgroup_swap_put(id, nr);
+}
+
 /*
  * Free a set of swap slots after their swap count dropped to zero, or will be
  * zero after putting the last ref (saves one __swap_cluster_put_entry call).
@@ -2454,14 +2469,14 @@ void __swap_cluster_free_entries(struct swap_info_struct *si,
 		id_cur = __swap_cgroup_clear(ci, ci_off, 1);
 		if (batch_id != id_cur) {
 			if (batch_id)
-				mem_cgroup_uncharge_swap(batch_id, ci_off - batch_off);
+				memcg_swap_free(batch_id, ci_off - batch_off);
 			batch_id = id_cur;
 			batch_off = ci_off;
 		}
 	} while (++ci_off < ci_end);
 
 	if (batch_id)
-		mem_cgroup_uncharge_swap(batch_id, ci_off - batch_off);
+		memcg_swap_free(batch_id, ci_off - batch_off);
 
 	swap_range_free(si, ci_head + ci_start, nr_pages);
 	swap_cluster_assert_empty(ci, ci_start, nr_pages, false);

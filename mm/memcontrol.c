@@ -6012,62 +6012,99 @@ int __init mem_cgroup_init(void)
 
 #ifdef CONFIG_SWAP
 /**
- * __mem_cgroup_try_charge_swap - try charging swap space for a folio
+ * __mem_cgroup_swap_get - take the private ID refs for a folio's swap slots
  * @folio: folio being added to swap
+ * @id: out, the ID to record and later charge against
  *
- * Try to charge @folio's memcg for the swap space at folio->swap.
+ * Takes one private ID ref per page of @folio on its memcg, or on its closest
+ * online ancestor if it has been offlined. The caller records and charges
+ * against whichever ID comes back, so both land on the same memcg.
  *
- * Returns 0 on success, -ENOMEM on failure.
+ * Return: true if an owner was taken, false when there is nothing to account
+ * for. Drop the refs with __mem_cgroup_swap_put().
  */
-int __mem_cgroup_try_charge_swap(struct folio *folio)
+bool __mem_cgroup_swap_get(struct folio *folio, unsigned short *id)
 {
 	unsigned int nr_pages = folio_nr_pages(folio);
-	struct swap_cluster_info *ci;
-	struct page_counter *counter;
 	struct mem_cgroup *memcg;
 	struct obj_cgroup *objcg;
-	unsigned short private_id;
 
 	if (do_memsw_account())
-		return 0;
+		return false;
 
 	objcg = folio_objcg(folio);
 	VM_WARN_ON_ONCE_FOLIO(!objcg, folio);
 	if (!objcg)
-		return 0;
+		return false;
 
 	scoped_guard(rcu) {
 		memcg = obj_cgroup_memcg(objcg);
 		if (!folio_test_swapcache(folio)) {
 			memcg_memory_event(memcg, MEMCG_SWAP_FAIL);
-			return 0;
+			return false;
 		}
 
-		private_id = mem_cgroup_private_id_get(memcg, nr_pages);
+		*id = mem_cgroup_private_id_get(memcg, nr_pages);
+	}
 
-		if (!mem_cgroup_private_id_is_root(private_id) &&
+	return true;
+}
+
+/**
+ * __mem_cgroup_swap_charge - charge physical swap space
+ * @id: the ID the slots were recorded against
+ * @nr_pages: the amount of swap space to charge
+ *
+ * Return: 0 on success, -ENOMEM if memory.swap.max is exceeded.
+ */
+int __mem_cgroup_swap_charge(unsigned short id, unsigned int nr_pages)
+{
+	struct page_counter *counter;
+	struct mem_cgroup *memcg;
+
+	if (do_memsw_account())
+		return 0;
+
+	scoped_guard(rcu) {
+		memcg = mem_cgroup_from_private_id(id);
+		if (!memcg)
+			return 0;
+
+		if (!mem_cgroup_private_id_is_root(id) &&
 		    !page_counter_try_charge(&memcg->swap, nr_pages, &counter)) {
 			memcg_memory_event(memcg, MEMCG_SWAP_MAX);
 			memcg_memory_event(memcg, MEMCG_SWAP_FAIL);
-			mem_cgroup_private_id_put(private_id, nr_pages);
 			return -ENOMEM;
 		}
 		mod_memcg_state(memcg, MEMCG_SWAP, nr_pages);
 	}
 
-	ci = swap_cluster_get_and_lock(folio);
-	__swap_cgroup_set(ci, swp_cluster_offset(folio->swap), nr_pages, private_id);
-	swap_cluster_unlock(ci);
-
 	return 0;
 }
 
 /**
- * __mem_cgroup_uncharge_swap - uncharge swap space
- * @id: cgroup id to uncharge
- * @nr_pages: the amount of swap space to uncharge
+ * __mem_cgroup_swap_record - record the owner of a folio's swap slots
+ * @folio: folio being added to swap
+ * @id: the ID taken by __mem_cgroup_swap_get()
  */
-void __mem_cgroup_uncharge_swap(unsigned short id, unsigned int nr_pages)
+void __mem_cgroup_swap_record(struct folio *folio, unsigned short id)
+{
+	struct swap_cluster_info *ci;
+
+	ci = swap_cluster_get_and_lock(folio);
+	__swap_cgroup_set(ci, swp_cluster_offset(folio->swap),
+			  folio_nr_pages(folio), id);
+	swap_cluster_unlock(ci);
+}
+
+/**
+ * __mem_cgroup_swap_uncharge - uncharge physical swap space
+ * @id: the ID the slots were recorded against
+ * @nr_pages: the amount of swap space to uncharge
+ *
+ * The owner refs are not touched; drop them with __mem_cgroup_swap_put().
+ */
+void __mem_cgroup_swap_uncharge(unsigned short id, unsigned int nr_pages)
 {
 	struct obj_cgroup *objcg;
 	struct mem_cgroup *memcg;
@@ -6083,8 +6120,30 @@ void __mem_cgroup_uncharge_swap(unsigned short id, unsigned int nr_pages)
 				page_counter_uncharge(&memcg->swap, nr_pages);
 		}
 		mod_memcg_state(memcg, MEMCG_SWAP, -nr_pages);
-		__mem_cgroup_private_id_put(objcg, id, nr_pages);
 	}
+	rcu_read_unlock();
+}
+
+/**
+ * __mem_cgroup_swap_put - drop the private ID refs taken for swap slots
+ * @id: the ID taken by __mem_cgroup_swap_get()
+ * @nr_pages: number of refs to drop
+ *
+ * A separate step from __mem_cgroup_swap_uncharge(): a slot's owner is held
+ * from the allocation and released when the slot is freed, while the
+ * counter is charged and uncharged whenever the physical backing comes and
+ * goes.
+ */
+void __mem_cgroup_swap_put(unsigned short id, unsigned int nr_pages)
+{
+	/*
+	 * The refs are the thing being dropped, so an ID that no longer
+	 * resolves has none left and there is nothing to do.
+	 * mem_cgroup_private_id_put() would dereference the NULL instead.
+	 */
+	rcu_read_lock();
+	if (obj_cgroup_from_private_id(id))
+		mem_cgroup_private_id_put(id, nr_pages);
 	rcu_read_unlock();
 }
 
@@ -6284,8 +6343,10 @@ static struct cftype swap_files[] = {
 
 #ifdef CONFIG_ZSWAP
 /**
- * obj_cgroup_may_zswap - check if this cgroup can zswap
- * @objcg: the object cgroup
+ * mem_cgroup_may_zswap - check if this cgroup can zswap
+ * @memcg: the memcg to query
+ * @may_flush: force-flush stats for an accurate check (sleeps). Pass false
+ *             from atomic contexts; the check is then best-effort.
  *
  * Check if the hierarchical zswap limit has been reached.
  *
@@ -6295,36 +6356,38 @@ static struct cftype swap_files[] = {
  * spending cycles on compression when there is already no room left
  * or zswap is disabled altogether somewhere in the hierarchy.
  */
-bool obj_cgroup_may_zswap(struct obj_cgroup *objcg)
+bool mem_cgroup_may_zswap(struct mem_cgroup *memcg, bool may_flush)
 {
-	struct mem_cgroup *memcg, *original_memcg;
-	bool ret = true;
-
 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
 		return true;
 
-	original_memcg = get_mem_cgroup_from_objcg(objcg);
-	for (memcg = original_memcg; !mem_cgroup_is_root(memcg);
-	     memcg = parent_mem_cgroup(memcg)) {
+	for (; !mem_cgroup_is_root(memcg); memcg = parent_mem_cgroup(memcg)) {
 		unsigned long max = READ_ONCE(memcg->zswap_max);
 		unsigned long pages;
 
 		if (max == PAGE_COUNTER_MAX)
 			continue;
-		if (max == 0) {
-			ret = false;
-			break;
-		}
+		if (max == 0)
+			return false;
 
 		/* Force flush to get accurate stats for charging */
-		__mem_cgroup_flush_stats(memcg, true);
+		if (may_flush)
+			__mem_cgroup_flush_stats(memcg, true);
 		pages = memcg_page_state(memcg, MEMCG_ZSWAP_B) / PAGE_SIZE;
-		if (pages < max)
-			continue;
-		ret = false;
-		break;
+		if (pages >= max)
+			return false;
 	}
-	mem_cgroup_put(original_memcg);
+	return true;
+}
+
+bool obj_cgroup_may_zswap(struct obj_cgroup *objcg)
+{
+	struct mem_cgroup *memcg;
+	bool ret;
+
+	memcg = get_mem_cgroup_from_objcg(objcg);
+	ret = mem_cgroup_may_zswap(memcg, true);
+	mem_cgroup_put(memcg);
 	return ret;
 }
 

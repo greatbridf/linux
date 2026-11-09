@@ -371,7 +371,8 @@ void memcg1_swapin(struct folio *folio)
 	id = __swap_cgroup_clear(ci, swp_cluster_offset(folio->swap),
 				 nr_pages);
 	swap_cluster_unlock(ci);
-	mem_cgroup_uncharge_swap(id, nr_pages);
+	mem_cgroup_swap_uncharge(id, nr_pages);
+	mem_cgroup_swap_put(id, nr_pages);
 }
 #endif
 
