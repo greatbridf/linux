@@ -510,7 +510,8 @@ int shmem_writeout(struct swap_io_ctx *ctx, struct folio *folio,
 
 #ifdef CONFIG_XSWAP
 swp_entry_t xswap_slot_backend(struct swap_cluster_info *ci, unsigned int slot);
-swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order);
+swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order,
+				bool may_enter_fs);
 void xswap_backend_free(swp_entry_t entry, swp_entry_t phys, unsigned int order);
 int xswap_check_backing(struct swap_cluster_info *ci, unsigned int off,
 			unsigned int nr);
@@ -521,7 +522,8 @@ static inline swp_entry_t xswap_slot_backend(struct swap_cluster_info *ci,
 	return (swp_entry_t){};
 }
 
-static inline swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order)
+static inline swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order,
+					      bool may_enter_fs)
 {
 	return (swp_entry_t){};
 }

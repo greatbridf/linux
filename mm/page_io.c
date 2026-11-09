@@ -245,7 +245,7 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
 	 */
 	swap_zeromap_folio_clear(folio);
 
-	if (zswap_store(folio)) {
+	if (zswap_store(folio, ctx->may_enter_fs)) {
 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
 		goto out_unlock;
 	}
@@ -269,7 +269,8 @@ int swap_writeout(struct swap_io_ctx *ctx, struct folio *folio)
 		swp_entry_t phys;
 
 		/* The pool refused it: fall back to a real swap device. */
-		phys = xswap_backend_alloc(entry, folio_order(folio));
+		phys = xswap_backend_alloc(entry, folio_order(folio),
+					   ctx->may_enter_fs);
 		if (!phys.val) {
 			folio_mark_dirty(folio);
 			return AOP_WRITEPAGE_ACTIVATE;

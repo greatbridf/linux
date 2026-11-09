@@ -18,6 +18,7 @@ struct swap_iocb {
 struct swap_io_ctx {
 	struct swap_iocb	*sio;
 	struct swap_info_struct	*sis;
+	bool			may_enter_fs;	/* this context may enter the fs */
 
 	/*
 	 * Pressure window: opened by swap_read_folio() on the first folio

@@ -4724,7 +4724,7 @@ static unsigned long xswap_alloc_slot_local(struct swap_info_struct *si,
 	return offset;
 }
 
-static swp_entry_t xswap_alloc_phys_slot(unsigned int order)
+static swp_entry_t xswap_alloc_phys_slot(unsigned int order, bool may_enter_fs)
 {
 	struct swap_info_struct *devs[MAX_SWAPFILES], *si;
 	int nr = 0, i;
@@ -4737,6 +4737,9 @@ static swp_entry_t xswap_alloc_phys_slot(unsigned int order)
 	spin_lock(&swap_avail_lock);
 	plist_for_each_entry(si, &swap_avail_head, avail_list) {
 		if (si->flags & SWP_XSWAP)
+			continue;
+		/* Writing there would re-enter the fs this context is in. */
+		if (!may_enter_fs && (si->ops->flags & SWAP_OPS_F_REQUIRE_NOFS))
 			continue;
 		if (nr == MAX_SWAPFILES)
 			break;
@@ -4776,7 +4779,8 @@ static void xswap_install_rmap(swp_entry_t phys, swp_entry_t entry)
 }
 
 /* Back the range of 1 << @order slots at @entry with contiguous physical slots. */
-swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order)
+swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order,
+				bool may_enter_fs)
 {
 	struct swap_info_struct *si = __swap_entry_to_info(entry);
 	struct swap_cluster_info *ci;
@@ -4798,7 +4802,7 @@ swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order)
 	}
 	swap_cluster_unlock(ci);
 
-	phys = xswap_alloc_phys_slot(order);
+	phys = xswap_alloc_phys_slot(order, may_enter_fs);
 	if (!phys.val)
 		return phys;
 

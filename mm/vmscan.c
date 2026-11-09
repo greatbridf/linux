@@ -1062,7 +1062,9 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	unsigned int nr_reclaimed = 0, nr_demoted = 0;
 	unsigned int pgactivate = 0;
 	bool do_demote_pass;
-	struct swap_io_ctx ctx = {};
+	struct swap_io_ctx ctx = {
+		.may_enter_fs = !!(sc->gfp_mask & __GFP_FS),
+	};
 
 	folio_batch_init(&free_folios);
 	memset(stat, 0, sizeof(*stat));
