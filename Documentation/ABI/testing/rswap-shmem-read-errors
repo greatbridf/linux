@@ -1,0 +1,22 @@
+What:		MADV_WILLNEED on shmem with failed swapin entries
+Date:		November 2026
+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
+Description:
+		MADV_WILLNEED reports EIO if its shared-memory range contains
+		an existing poisoned swapin entry. It still submits read-ahead
+		for other entries in the range. It does not wait for newly
+		submitted I/O, and success does not guarantee completion.
+
+		A caller that needs to detect asynchronous read failure without
+		accessing its mapping can read the backing file with pread().
+		Shmem returns EIO on failed swapin, replaces the entry with a
+		poison marker, and releases its swap and swap-cache references.
+		A mapped access continues to report SIGBUS; missing remote data
+		is never replaced with a readable zero page.
+
+		An application that owns disposable cache contents can remove
+		the failed range with FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+		after fencing all users of it. This removes backing pages and
+		poison markers from every shared mapping. New writes allocate
+		new backing pages. Anonymous swap faults retain their existing
+		SIGBUS behavior and are not covered by this recovery contract.

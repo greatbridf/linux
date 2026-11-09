@@ -261,7 +261,7 @@ static const struct mm_walk_ops swapin_walk_ops = {
 	.walk_lock		= PGWALK_RDLOCK,
 };
 
-static void shmem_swapin_range(struct vm_area_struct *vma,
+static int shmem_swapin_range(struct vm_area_struct *vma,
 		unsigned long start, unsigned long end,
 		struct address_space *mapping)
 {
@@ -269,6 +269,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 	pgoff_t end_index = linear_page_index(vma, end) - 1;
 	struct folio *folio;
 	struct swap_io_ctx ctx = {};
+	int error = 0;
 
 	rcu_read_lock();
 	xas_for_each(&xas, folio, end_index) {
@@ -278,7 +279,11 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		if (!xa_is_value(folio))
 			continue;
 		entry = radix_to_swp_entry(folio);
-		/* There might be swapin error entries in shmem mapping. */
+		/* Report data loss without faulting the caller's mapping. */
+		if (softleaf_is_poison_marker(entry)) {
+			error = -EIO;
+			continue;
+		}
 		if (!softleaf_is_swap(entry))
 			continue;
 
@@ -296,6 +301,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 	}
 	rcu_read_unlock();
 	swap_read_submit(&ctx);
+	return error;
 }
 #endif		/* CONFIG_SWAP */
 
@@ -326,9 +332,11 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
 		return 0;
 
 	if (shmem_mapping(file->f_mapping)) {
-		shmem_swapin_range(vma, start, end, file->f_mapping);
+		int error = shmem_swapin_range(vma, start, end,
+					      file->f_mapping);
+
 		lru_add_drain(); /* Push any new pages onto the LRU now */
-		return 0;
+		return error;
 	}
 #else
 	if (!file)

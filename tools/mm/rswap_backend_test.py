@@ -96,6 +96,7 @@ typedef struct { int v; } refcount_t;
 struct workqueue_struct { int unused; };
 struct work_struct { void (*func)(struct work_struct *); };
 #define WQ_MEM_RECLAIM 0
+#define WQ_UNBOUND 0
 #define INIT_WORK(w, f) ((w)->func = (f))
 static struct workqueue_struct wq_stub;
 static bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
@@ -1431,6 +1432,19 @@ def main():
                              "the same KV backend interface as HEAD")
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[2]
+    madvise = (root / "mm/madvise.c").read_text()
+    shmem = (root / "mm/shmem.c").read_text()
+    poison_check = extract(madvise, "static int shmem_swapin_range(",
+                           "#endif", "shmem read-ahead")
+    assert "softleaf_is_poison_marker(entry)" in poison_check
+    assert "error = -EIO;" in poison_check and "return error;" in poison_check
+    cleanup = extract(shmem, "static void shmem_set_folio_swapin_error(",
+                      "static int shmem_split_large_entry(",
+                      "failed swapin cleanup")
+    assert "make_poisoned_swp_entry()" in cleanup
+    assert "folio_put_swap(folio, NULL)" in cleanup
+    assert "swap_cache_del_folio(folio)" in cleanup
+    print("PASS: poisoned shmem read-ahead reports EIO and releases swap backing")
     if args.revision:
         source = subprocess.check_output(
             ["git", "show", f"{args.revision}:mm/rswap.c"],
