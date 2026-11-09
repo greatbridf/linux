@@ -58,6 +58,9 @@ struct swap_cluster_info {
 	u8 order;
 	atomic_long_t __rcu *table;	/* Swap table entries, see mm/swap_table.h */
 	unsigned int *extend_table;	/* For large swap count, protected by ci->lock */
+#ifdef CONFIG_XSWAP
+	unsigned long *xs_table;	/* Physical backend per slot, lazily allocated */
+#endif
 #ifdef CONFIG_MEMCG
 	struct swap_memcg_table *memcg_table;	/* Swap table entries' cgroup record */
 #endif
@@ -504,5 +507,26 @@ extern const struct swap_ops swap_bdev_ops;
 
 int shmem_writeout(struct swap_io_ctx *ctx, struct folio *folio,
 		struct list_head *folio_list);
+
+#ifdef CONFIG_XSWAP
+swp_entry_t xswap_slot_backend(struct swap_cluster_info *ci, unsigned int slot);
+swp_entry_t xswap_backend_alloc(swp_entry_t entry);
+void xswap_backend_free(swp_entry_t entry, swp_entry_t phys);
+#else
+static inline swp_entry_t xswap_slot_backend(struct swap_cluster_info *ci,
+					     unsigned int slot)
+{
+	return (swp_entry_t){};
+}
+
+static inline swp_entry_t xswap_backend_alloc(swp_entry_t entry)
+{
+	return (swp_entry_t){};
+}
+
+static inline void xswap_backend_free(swp_entry_t entry, swp_entry_t phys)
+{
+}
+#endif /* CONFIG_XSWAP */
 
 #endif /* _MM_SWAP_H */

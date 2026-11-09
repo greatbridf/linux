@@ -110,6 +110,13 @@ static void xswap_unmap_clusters(struct swap_info_struct *si,
 				 unsigned long start_idx, unsigned long nr);
 static int xswap_mapped_end(pte_t *pte, unsigned long addr, void *data);
 static void xswap_try_shrink(struct swap_info_struct *si);
+static void xswap_free_phys_slot(struct swap_info_struct *si,
+				 swp_entry_t entry, swp_entry_t phys);
+static void xswap_release_slot_backend(struct swap_info_struct *si,
+				       struct swap_cluster_info *ci,
+				       unsigned int slot);
+static void xswap_free_xs_table(struct swap_info_struct *si,
+				struct swap_cluster_info *ci);
 
 static int xswap_create(int prio);
 static int xswap_destroy(u64 id);
@@ -888,6 +895,14 @@ static void swap_cluster_schedule_discard(struct swap_info_struct *si,
 static void __free_cluster(struct swap_info_struct *si, struct swap_cluster_info *ci)
 {
 	swap_cluster_assert_empty(ci, 0, SWAPFILE_CLUSTER, false);
+#ifdef CONFIG_XSWAP
+	/*
+	 * An empty cluster can still hold records. Give them back first:
+	 * swap_cluster_free_table() frees the table the owner ID comes from.
+	 */
+	if (si->flags & SWP_XSWAP)
+		xswap_free_xs_table(si, ci);
+#endif
 	swap_cluster_free_table(ci);
 	move_cluster(si, ci, &si->free_clusters, CLUSTER_FLAG_FREE);
 	ci->order = 0;
@@ -1144,6 +1159,12 @@ static bool cluster_reclaim_range(struct swap_info_struct *si,
 	spin_unlock(&ci->lock);
 	do {
 		swp_tb = swap_table_get(ci, offset % SWAPFILE_CLUSTER);
+		/*
+		 * A pointer-tagged slot backs an xswap entry, not a cached
+		 * folio, so it can't be reclaimed here. Reject the range.
+		 */
+		if (swp_tb_is_pointer(swp_tb))
+			break;
 		if (swp_tb_get_count(swp_tb))
 			break;
 		if (swp_tb_is_folio(swp_tb))
@@ -1932,6 +1953,14 @@ static void __swap_cluster_put_entry(struct swap_cluster_info *ci,
 
 	lockdep_assert_held(&ci->lock);
 	swp_tb = __swap_table_get(ci, ci_off);
+	/*
+	 * A pointer-tagged slot has no count of its own. Putting one would
+	 * corrupt the reverse mapping, so never touch it here.
+	 */
+	if (swp_tb_is_pointer(swp_tb)) {
+		VM_WARN_ON_ONCE(1);
+		return;
+	}
 	count = __swp_tb_get_count(swp_tb);
 
 	VM_WARN_ON_ONCE(count <= 0);
@@ -2040,8 +2069,8 @@ static int __swap_cluster_dup_entry(struct swap_cluster_info *ci,
 
 	lockdep_assert_held(&ci->lock);
 	swp_tb = __swap_table_get(ci, ci_off);
-	/* Bad or special slots can't be handled */
-	if (WARN_ON_ONCE(swp_tb_is_bad(swp_tb)))
+	/* Bad, pointer-tagged and other special slots can't be handled */
+	if (WARN_ON_ONCE(swp_tb_is_bad(swp_tb) || swp_tb_is_pointer(swp_tb)))
 		return -EINVAL;
 	count = __swp_tb_get_count(swp_tb);
 	/* Must be either cached or have a count already */
@@ -2379,6 +2408,11 @@ void __swap_cluster_free_entries(struct swap_info_struct *si,
 		 */
 		VM_WARN_ON(!swp_tb_is_shadow(old_tb) ||
 			   __swp_tb_get_count(old_tb) > 1);
+
+#ifdef CONFIG_XSWAP
+		if (ci->xs_table && ci->xs_table[ci_off])
+			xswap_release_slot_backend(si, ci, ci_off);
+#endif
 
 		/* Resetting the slot to NULL also clears the inline flags. */
 		__swap_table_set(ci, ci_off, null_to_swp_tb());
@@ -3292,6 +3326,71 @@ static unsigned long find_next_to_unuse(struct swap_info_struct *si,
 
 	return 0;
 }
+
+#ifdef CONFIG_XSWAP
+/*
+ * Free the physical slot @phys and clear its reverse mapping. @entry is the
+ * xswap entry that recorded @phys. The slot is only freed while it still
+ * says it belongs to @entry: our record can go stale, and @phys may by then
+ * have been handed to another xswap entry, whose data must not be dropped.
+ *
+ * free_cluster()/partial_free_cluster() require the cluster lock.
+ */
+static void xswap_free_phys_slot(struct swap_info_struct *si,
+				 swp_entry_t entry, swp_entry_t phys)
+{
+	struct swap_cluster_info *ci;
+	unsigned long swp_tb;
+	unsigned int offset = swp_offset(phys);
+
+	ci = swap_cluster_lock(si, offset);
+	if (!ci)
+		return;
+
+	swp_tb = __swap_table_get(ci, offset % SWAPFILE_CLUSTER);
+	if (!swp_tb_is_pointer(swp_tb) ||
+	    xswap_rmap_to_entry(swp_tb).val != entry.val) {
+		/* Already freed, or recycled for another xswap entry. */
+		VM_WARN_ON_ONCE(!swp_tb_is_null(swp_tb) &&
+				!swp_tb_is_pointer(swp_tb));
+		swap_cluster_unlock(ci);
+		return;
+	}
+
+	__swap_table_set(ci, offset % SWAPFILE_CLUSTER, null_to_swp_tb());
+	ci->count--;
+
+	/* The slot must not be allocatable before its invalidate hooks run. */
+	swap_range_free(si, offset, 1);
+
+	if (!ci->count)
+		free_cluster(si, ci);
+	else
+		partial_free_cluster(si, ci);
+	swap_cluster_unlock(ci);
+}
+
+/*
+ * An xswap slot being freed may still own a physical slot. Drop it, or the
+ * physical space and its reverse mapping leak. Caller holds the xswap
+ * cluster lock; the physical cluster lock is only ever taken below it.
+ */
+static void xswap_release_slot_backend(struct swap_info_struct *si,
+				       struct swap_cluster_info *ci,
+				       unsigned int slot)
+{
+	swp_entry_t entry = swp_entry(si->type, cluster_offset(si, ci) + slot);
+	struct swap_info_struct *psi;
+	swp_entry_t phys = { .val = ci->xs_table[slot] };
+
+	WRITE_ONCE(ci->xs_table[slot], 0);
+
+	psi = swap_type_to_info(swp_type(phys));
+	if (psi)
+		xswap_free_phys_slot(psi, entry, phys);
+}
+
+#endif /* CONFIG_XSWAP */
 static int try_to_unuse(unsigned int type)
 {
 	struct mm_struct *prev_mm;
@@ -4224,6 +4323,212 @@ static unsigned long read_swap_header(struct swap_info_struct *si,
 }
 
 #ifdef CONFIG_XSWAP
+/* The physical slot backing @slot, or zero. */
+swp_entry_t xswap_slot_backend(struct swap_cluster_info *ci, unsigned int slot)
+{
+	unsigned long *xs = READ_ONCE(ci->xs_table);
+
+	if (!xs || !xs[slot])
+		return (swp_entry_t){};
+
+	return (swp_entry_t){ .val = xs[slot] };
+}
+
+/* Cluster lock held. xswap never unmaps a cluster below the mapped prefix. */
+static unsigned long *xswap_xs_table_locked(struct swap_cluster_info *ci,
+					    gfp_t gfp)
+{
+	unsigned long *xs = ci->xs_table;
+
+	if (xs)
+		return xs;
+
+	/* The owning entry is pinned, so the cluster survives the relock. */
+	if (gfp & __GFP_DIRECT_RECLAIM) {
+		spin_unlock(&ci->lock);
+		xs = kcalloc(SWAPFILE_CLUSTER, sizeof(*xs), gfp);
+		spin_lock(&ci->lock);
+	} else {
+		xs = kcalloc(SWAPFILE_CLUSTER, sizeof(*xs), gfp);
+	}
+
+	if (!xs)
+		return NULL;
+	if (cmpxchg(&ci->xs_table, NULL, xs)) {
+		kfree(xs);
+		xs = ci->xs_table;
+	}
+	return xs;
+}
+
+/*
+ * 4K per cluster, and this runs in reclaim, so it has to be able to sleep.
+ */
+static bool xswap_slot_set_backend(struct swap_cluster_info *ci,
+				   unsigned int slot, swp_entry_t phys)
+{
+	unsigned long *xs = xswap_xs_table_locked(ci, GFP_KERNEL | __GFP_HIGH |
+						  __GFP_NOMEMALLOC);
+
+	if (!xs)
+		return false;
+	WRITE_ONCE(xs[slot], phys.val);
+	return true;
+}
+
+/*
+ * Drop the table of cluster @idx and every backend it still records. The
+ * cluster is going away, so nothing else will: the physical slots would stay
+ * allocated and their reverse mappings would keep pointing at an xswap entry
+ * whose cluster_info is about to be unmapped. Caller holds ci->lock.
+ */
+static void xswap_free_xs_table(struct swap_info_struct *si,
+				struct swap_cluster_info *ci)
+{
+	unsigned long *xs = ci->xs_table;
+	unsigned int slot;
+
+	if (!xs)
+		return;
+
+	for (slot = 0; slot < SWAPFILE_CLUSTER; slot++) {
+		if (xs[slot])
+			xswap_release_slot_backend(si, ci, slot);
+	}
+
+	kfree(xs);
+	ci->xs_table = NULL;
+}
+
+/* Order-0 slot from @si, no folio attached; goes through the per-CPU cache. */
+static unsigned long xswap_alloc_slot_local(struct swap_info_struct *si)
+{
+	struct swap_cluster_info *ci;
+	unsigned long pcp_offset, offset = SWAP_ENTRY_INVALID;
+
+	local_lock(&percpu_swap_cluster.lock);
+	if (this_cpu_read(percpu_swap_cluster.si[0]) == si) {
+		pcp_offset = this_cpu_read(percpu_swap_cluster.offset[0]);
+		if (pcp_offset) {
+			ci = swap_cluster_lock(si, pcp_offset);
+			if (cluster_is_usable(ci, 0))
+				offset = alloc_swap_scan_cluster(si, ci, NULL,
+								 pcp_offset);
+			else
+				swap_cluster_unlock(ci);
+		}
+	}
+	if (offset == SWAP_ENTRY_INVALID)
+		offset = cluster_alloc_swap_entry(si, NULL);
+	local_unlock(&percpu_swap_cluster.lock);
+
+	return offset;
+}
+
+static swp_entry_t xswap_alloc_phys_slot(void)
+{
+	struct swap_info_struct *devs[MAX_SWAPFILES], *si;
+	int nr = 0, i;
+
+	/*
+	 * Snapshot the candidate devices in priority order. swap_info
+	 * structs are never freed, so the pointers stay valid; liveness is
+	 * re-checked below.
+	 */
+	spin_lock(&swap_avail_lock);
+	plist_for_each_entry(si, &swap_avail_head, avail_list) {
+		if (si->flags & SWP_XSWAP)
+			continue;
+		if (nr == MAX_SWAPFILES)
+			break;
+		devs[nr++] = si;
+	}
+	spin_unlock(&swap_avail_lock);
+
+	for (i = 0; i < nr; i++) {
+		unsigned long offset;
+
+		if (!get_swap_device_info(devs[i]))
+			continue;
+		offset = xswap_alloc_slot_local(devs[i]);
+		put_swap_device(devs[i]);
+		if (offset && offset != SWAP_ENTRY_INVALID)
+			return swp_entry(devs[i]->type, offset);
+	}
+
+	return (swp_entry_t){};
+}
+
+/* Reverse mapping: record @entry as the owner of physical slot @phys. */
+static void xswap_install_rmap(swp_entry_t phys, swp_entry_t entry)
+{
+	struct swap_info_struct *si = swap_type_to_info(swp_type(phys));
+	struct swap_cluster_info *ci;
+	unsigned long off = swp_offset(phys);
+
+	if (!si)
+		return;
+	ci = swap_cluster_lock(si, off);
+	if (ci) {
+		__swap_table_set(ci, off % SWAPFILE_CLUSTER,
+				 xswap_entry_to_rmap(entry));
+		swap_cluster_unlock(ci);
+	}
+}
+
+swp_entry_t xswap_backend_alloc(swp_entry_t entry)
+{
+	struct swap_info_struct *si = __swap_entry_to_info(entry);
+	struct swap_cluster_info *ci;
+	unsigned long off = swp_offset(entry);
+	swp_entry_t phys;
+	bool recorded = false;
+
+	phys = xswap_alloc_phys_slot();
+	if (!phys.val)
+		return phys;
+
+	xswap_install_rmap(phys, entry);
+
+	ci = swap_cluster_lock(si, off);
+	if (ci) {
+		recorded = xswap_slot_set_backend(ci, off % SWAPFILE_CLUSTER, phys);
+		swap_cluster_unlock(ci);
+	}
+
+	if (!recorded) {
+		/* The backend is unrecorded, so the data would be unreachable. */
+		xswap_backend_free(entry, phys);
+		return (swp_entry_t){};
+	}
+
+	return phys;
+}
+
+/* Undo xswap_backend_alloc(): the zswap copy is still in place. */
+void xswap_backend_free(swp_entry_t entry, swp_entry_t phys)
+{
+	struct swap_info_struct *si = __swap_entry_to_info(entry);
+	struct swap_info_struct *psi;
+	struct swap_cluster_info *ci;
+	unsigned long off = swp_offset(entry);
+
+	ci = swap_cluster_lock(si, off);
+	if (ci) {
+		unsigned int slot = off % SWAPFILE_CLUSTER;
+		unsigned long *xs = ci->xs_table;
+
+		if (xs && xs[slot] == phys.val)
+			WRITE_ONCE(xs[slot], 0);
+		swap_cluster_unlock(ci);
+	}
+
+	/* xswap_free_phys_slot() clears the reverse mapping. */
+	psi = swap_type_to_info(swp_type(phys));
+	if (psi)
+		xswap_free_phys_slot(psi, entry, phys);
+}
+
 static int xswap_map_clusters(struct swap_info_struct *si,
 			      unsigned long start_idx, unsigned long nr)
 {
@@ -4458,6 +4763,18 @@ static void xswap_unmap_clusters_locked(struct swap_info_struct *si,
 	struct page **pages;
 	unsigned int noreclaim_flags;
 	unsigned long npages, idx;
+
+	/*
+	 * Give the records in the clusters that are going away back first:
+	 * the table the owner IDs come from is freed with the cluster.
+	 */
+	for (idx = start_idx; idx < start_idx + nr; idx++) {
+		struct swap_cluster_info *ci = &si->cluster_info[idx];
+
+		spin_lock(&ci->lock);
+		xswap_free_xs_table(si, ci);
+		spin_unlock(&ci->lock);
+	}
 
 	/*
 	 * Publish the smaller range before its memory goes away.  Readers
