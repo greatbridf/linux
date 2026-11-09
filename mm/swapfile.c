@@ -124,6 +124,11 @@ static void xswap_clear_cache_only(struct swap_cluster_info *ci,
 				   unsigned int start, unsigned int nr);
 static int xswap_reclaim_backing(struct swap_info_struct *si,
 				 unsigned long offset, swp_entry_t xentry);
+static unsigned short xswap_entry_id(struct swap_cluster_info *ci,
+				     unsigned long off);
+static void xswap_backend_uncharge(swp_entry_t entry, unsigned int nr);
+static void __xswap_backend_unlink(swp_entry_t entry, swp_entry_t phys,
+				   unsigned int order);
 
 static int xswap_create(int prio);
 static int xswap_destroy(u64 id);
@@ -3442,6 +3447,8 @@ static void xswap_release_slot_backend(struct swap_info_struct *si,
 	psi = swap_type_to_info(swp_type(phys));
 	if (psi)
 		xswap_free_phys_slot(psi, entry, phys);
+
+	xswap_backend_uncharge(entry, 1);
 }
 
 /*
@@ -4812,6 +4819,7 @@ swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order,
 	struct swap_cluster_info *ci;
 	unsigned long nr = 1UL << order;
 	unsigned long off = swp_offset(entry);
+	unsigned short id = 0;
 	swp_entry_t phys;
 	unsigned int i;
 
@@ -4832,6 +4840,21 @@ swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order,
 	if (!phys.val)
 		return phys;
 
+	/*
+	 * The xswap entry was only recorded at allocation, so charge the
+	 * physical swap here.  On failure, drop the physical run without
+	 * uncharging it.
+	 */
+	ci = swap_cluster_lock(si, off);
+	if (ci) {
+		id = xswap_entry_id(ci, off);
+		swap_cluster_unlock(ci);
+	}
+	if (mem_cgroup_swap_charge(id, nr)) {
+		__xswap_backend_unlink(entry, phys, order);
+		return (swp_entry_t){};
+	}
+
 	/* One IO reads a large folio, so its range has to be contiguous. */
 	VM_WARN_ON_ONCE(swp_offset(phys) % nr);
 	VM_WARN_ON_ONCE(off % SWAPFILE_CLUSTER + nr > SWAPFILE_CLUSTER);
@@ -4849,8 +4872,32 @@ swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order,
 	return phys;
 }
 
-/* Undo xswap_backend_alloc(): the zswap copy is still in place. */
-void xswap_backend_free(swp_entry_t entry, swp_entry_t phys, unsigned int order)
+/* The ID that owns an xswap entry, or 0 if it has no owner recorded. */
+static unsigned short xswap_entry_id(struct swap_cluster_info *ci,
+				     unsigned long off)
+{
+	return __swap_cgroup_get(ci, off % SWAPFILE_CLUSTER);
+}
+
+static void xswap_backend_uncharge(swp_entry_t entry, unsigned int nr)
+{
+	struct swap_info_struct *si = __swap_entry_to_info(entry);
+	struct swap_cluster_info *ci;
+	unsigned long off = swp_offset(entry);
+	unsigned short id = 0;
+
+	ci = swap_cluster_lock(si, off);
+	if (ci) {
+		id = xswap_entry_id(ci, off);
+		swap_cluster_unlock(ci);
+	}
+	if (id)
+		mem_cgroup_swap_uncharge(id, nr);
+}
+
+/* Drop the physical run and the reverse mapping, without any charging. */
+static void __xswap_backend_unlink(swp_entry_t entry, swp_entry_t phys,
+				   unsigned int order)
 {
 	struct swap_info_struct *si = __swap_entry_to_info(entry);
 	struct swap_info_struct *psi = swap_type_to_info(swp_type(phys));
@@ -4877,6 +4924,13 @@ void xswap_backend_free(swp_entry_t entry, swp_entry_t phys, unsigned int order)
 			xswap_free_phys_slot(psi, swp_entry(si->type, off + i),
 					     swp_entry(swp_type(phys), poff + i));
 	}
+}
+
+/* Undo xswap_backend_alloc(): the zswap copy is still in place. */
+void xswap_backend_free(swp_entry_t entry, swp_entry_t phys, unsigned int order)
+{
+	__xswap_backend_unlink(entry, phys, order);
+	xswap_backend_uncharge(entry, 1UL << order);
 }
 
 static int xswap_map_clusters(struct swap_info_struct *si,
