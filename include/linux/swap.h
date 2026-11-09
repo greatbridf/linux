@@ -391,6 +391,12 @@ void free_pages_and_swap_cache(struct encoded_page **, int);
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
 extern atomic_t nr_real_swapfiles;
+extern atomic_t nr_xswap_files;
+
+static inline bool xswap_enabled(void)
+{
+	return atomic_read(&nr_xswap_files) > 0;
+}
 extern long total_swap_pages;
 extern atomic_t nr_rotate_swap;
 

@@ -346,7 +346,7 @@ static unsigned int nr_swapfiles;
 atomic_long_t nr_swap_pages;
 atomic_t nr_real_swapfiles;
 /* Active xswap devices, as in nr_real_swapfiles. */
-static atomic_t nr_xswap_files;
+atomic_t nr_xswap_files;
 /*
  * Some modules use swappable objects and may try to swap them out under
  * memory pressure (via the shrinker). Before doing so, they may wish to

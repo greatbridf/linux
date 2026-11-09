@@ -6149,8 +6149,20 @@ void __mem_cgroup_swap_put(unsigned short id, unsigned int nr_pages)
 
 long mem_cgroup_get_nr_swap_pages(const struct mem_cgroup *memcg)
 {
-	long nr_swap_pages = get_nr_swap_pages();
+	long nr_swap_pages;
 
+	/*
+	 * xswap charges physical backing, not allocation, so virtual swap is
+	 * unbounded for a zswap-capable memcg and the swap.max walk below
+	 * would starve anon reclaim.  swap.max is still enforced when the
+	 * backing is charged.
+	 */
+	if (xswap_enabled() && zswap_is_enabled() &&
+	    (mem_cgroup_disabled() || do_memsw_account() ||
+	     mem_cgroup_may_zswap(memcg, false)))
+		return PAGE_COUNTER_MAX;
+
+	nr_swap_pages = get_nr_swap_pages();
 	if (!mem_cgroup_disabled() && !do_memsw_account())
 		nr_swap_pages = min(nr_swap_pages, page_counter_margin(&memcg->swap));
 
@@ -6356,13 +6368,15 @@ static struct cftype swap_files[] = {
  * spending cycles on compression when there is already no room left
  * or zswap is disabled altogether somewhere in the hierarchy.
  */
-bool mem_cgroup_may_zswap(struct mem_cgroup *memcg, bool may_flush)
+bool mem_cgroup_may_zswap(const struct mem_cgroup *memcg, bool may_flush)
 {
+	const struct mem_cgroup *pos;
+
 	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
 		return true;
 
-	for (; !mem_cgroup_is_root(memcg); memcg = parent_mem_cgroup(memcg)) {
-		unsigned long max = READ_ONCE(memcg->zswap_max);
+	for (pos = memcg; !mem_cgroup_is_root(pos); pos = parent_mem_cgroup(pos)) {
+		unsigned long max = READ_ONCE(pos->zswap_max);
 		unsigned long pages;
 
 		if (max == PAGE_COUNTER_MAX)
@@ -6370,10 +6384,13 @@ bool mem_cgroup_may_zswap(struct mem_cgroup *memcg, bool may_flush)
 		if (max == 0)
 			return false;
 
-		/* Force flush to get accurate stats for charging */
+		/*
+		 * Force flush to get accurate stats for charging. The flush
+		 * only reads the counters, but takes the memcg mutable.
+		 */
 		if (may_flush)
-			__mem_cgroup_flush_stats(memcg, true);
-		pages = memcg_page_state(memcg, MEMCG_ZSWAP_B) / PAGE_SIZE;
+			__mem_cgroup_flush_stats((struct mem_cgroup *)pos, true);
+		pages = memcg_page_state(pos, MEMCG_ZSWAP_B) / PAGE_SIZE;
 		if (pages >= max)
 			return false;
 	}
