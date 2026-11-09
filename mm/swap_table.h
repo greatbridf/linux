@@ -86,20 +86,51 @@ struct swap_memcg_table {
  * Pointer-tagged swap table entry: the reverse map from a physical slot to
  * the xswap entry it backs. Layout:
  *
- *   Pointer:  | xswap_type(8) | xswap_offset(53) |100|
+ *   Pointer:  |C| xswap_type(7) | xswap_offset(53) |100|
  *
  * The low three bits identify the entry: 0b000 is a free or bad slot, a
  * shadow entry ends in 0b01 and a cached folio in 0b10, which leaves
- * 0b100 as the only marker still free.
+ * 0b100 as the only marker still free. C is SWP_RMAP_CACHE_ONLY, the one
+ * bit left at the top.
  */
 #define SWP_TB_PTR_MARK			0b100UL
 #define SWP_TB_PTR_OFF_BITS		53
-#define SWP_TB_PTR_TYPE_BITS		8
+#define SWP_TB_PTR_TYPE_BITS		7
 #define SWP_TB_PTR_OFF_SHIFT		3
 #define SWP_TB_PTR_TYPE_SHIFT		(SWP_TB_PTR_OFF_SHIFT + \
 					 SWP_TB_PTR_OFF_BITS)
 #define SWP_TB_PTR_OFF_MASK		((1UL << SWP_TB_PTR_OFF_BITS) - 1)
 #define SWP_TB_PTR_TYPE_MASK		((1UL << SWP_TB_PTR_TYPE_BITS) - 1)
+
+/*
+ * Set when the xswap entry owning a physical slot has swap count 0 but its
+ * folio is still in the swap cache. The slot is redundant then, and the
+ * physical reclaim scanner may free it. The bit sits on the physical slot
+ * so that scanner can read it without the xswap cluster lock.
+ */
+#define SWP_RMAP_CACHE_ONLY		(1UL << (BITS_PER_LONG - 1))
+
+/* swp_type() must fit, and SWP_RMAP_CACHE_ONLY must own the top bit. */
+static_assert(BITS_PER_LONG - SWP_TYPE_SHIFT <= SWP_TB_PTR_TYPE_BITS,
+	      "xswap rmap type field is too narrow");
+static_assert(SWP_TB_PTR_TYPE_SHIFT + SWP_TB_PTR_TYPE_BITS == BITS_PER_LONG - 1,
+	      "xswap rmap fields do not pack");
+
+static inline void swap_rmap_mark_cache_only(struct swap_cluster_info *ci,
+					     unsigned int off)
+{
+	atomic_long_t *table = rcu_dereference_check(ci->table, true);
+
+	atomic_long_or(SWP_RMAP_CACHE_ONLY, &table[off]);
+}
+
+static inline void swap_rmap_clear_cache_only(struct swap_cluster_info *ci,
+					      unsigned int off)
+{
+	atomic_long_t *table = rcu_dereference_check(ci->table, true);
+
+	atomic_long_and(~SWP_RMAP_CACHE_ONLY, &table[off]);
+}
 
 static inline bool swp_tb_is_pointer(unsigned long swp_tb)
 {
