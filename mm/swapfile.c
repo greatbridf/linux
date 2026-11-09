@@ -3430,6 +3430,39 @@ static void xswap_free_phys_slot(struct swap_info_struct *si,
 }
 
 /*
+ * Give a run of backend slots back. Nothing points at them yet, so there is
+ * no reverse mapping to look up and no record to clear.
+ */
+static void xswap_drop_phys_slots(swp_entry_t phys, unsigned int nr)
+{
+	struct swap_info_struct *psi = swap_type_to_info(swp_type(phys));
+	unsigned long poff = swp_offset(phys);
+	struct swap_cluster_info *pci;
+	unsigned int i;
+
+	if (!psi)
+		return;
+
+	pci = swap_cluster_lock(psi, poff);
+	if (!pci)
+		return;
+
+	VM_WARN_ON(pci->count < nr);
+	pci->count -= nr;
+	for (i = 0; i < nr; i++)
+		__swap_table_set(pci, (poff + i) % SWAPFILE_CLUSTER,
+				 null_to_swp_tb());
+
+	if (!pci->count)
+		free_cluster(psi, pci);
+	else
+		partial_free_cluster(psi, pci);
+	swap_cluster_unlock(pci);
+
+	swap_range_free(psi, poff, nr);
+}
+
+/*
  * An xswap slot being freed may still own a physical slot. Drop it, or the
  * physical space and its reverse mapping leak. Caller holds the xswap
  * cluster lock; the physical cluster lock is only ever taken below it.
@@ -4858,7 +4891,7 @@ swp_entry_t xswap_backend_alloc(swp_entry_t entry, unsigned int order,
 		swap_cluster_unlock(ci);
 	}
 	if (mem_cgroup_swap_charge(id, nr)) {
-		__xswap_backend_unlink(entry, phys, order);
+		xswap_drop_phys_slots(phys, nr);
 		return (swp_entry_t){};
 	}
 
