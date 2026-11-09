@@ -30,7 +30,6 @@ struct swap_memcg_table {
  * PFN:      |SWAP_COUNT|Z|------ PFN -------|10| - Cached slot
  * Pointer:  |C|-- xswap type/offset --|100| - Backend slot
  * Bad:      |------------- 1 -------------|1000| - Bad slot
- * HIB:      |    0     |------- 1 -------|10000| - Hibernation slot
  *
  * COUNT is `SWP_TB_COUNT_BITS` long, Z is the `SWP_TB_ZERO_FLAG` bit,
  * and together they form the `SWP_TB_FLAGS_BITS` wide flags field.
@@ -55,11 +54,6 @@ struct swap_memcg_table {
  *   the layout in the CONFIG_XSWAP block below.
  *
  * - Bad: Swap slot is reserved, protects swap header or holes on swap devices.
- *
- * - HIB: Swap slot is reserved by hibernation for the suspend image. It is a
- *   special pin, like the swap cache pin: the allocator treats the non-NULL
- *   entry as in use, but the slot is never duplicated and never enters the
- *   swap cache. The count stays 0, so a stray put trips the underflow check.
  */
 
 /* NULL Entry, all 0 */
@@ -86,9 +80,6 @@ struct swap_memcg_table {
 
 /* Bad slot: ends with 0b1000 and rests of bits are all 1 */
 #define SWP_TB_BAD		((~0UL) << 3)
-
-/* Hibernation slot: ends with 0b10000, no count, rests of bits are all 1 */
-#define SWP_TB_HIB		(((~0UL) << 4) & ~SWP_TB_COUNT_MASK)
 
 #ifdef CONFIG_XSWAP
 /*
@@ -226,11 +217,6 @@ static inline bool swp_tb_is_shadow(unsigned long swp_tb)
 static inline bool swp_tb_is_bad(unsigned long swp_tb)
 {
 	return swp_tb == SWP_TB_BAD;
-}
-
-static inline bool swp_tb_is_hibernation(unsigned long swp_tb)
-{
-	return swp_tb == SWP_TB_HIB;
 }
 
 static inline bool swp_tb_is_countable(unsigned long swp_tb)
