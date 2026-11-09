@@ -47,6 +47,7 @@
 #include <linux/zswap.h>
 #include <linux/plist.h>
 #include <linux/debugfs.h>
+#include <linux/swap_ops.h>
 
 #include <asm/tlbflush.h>
 #include <linux/leafops.h>
@@ -3390,6 +3391,138 @@ static void xswap_release_slot_backend(struct swap_info_struct *si,
 		xswap_free_phys_slot(psi, entry, phys);
 }
 
+/*
+ * A written-back slot has no folio of its own here, so the unuse loop would
+ * skip it. Resolve it through the reverse mapping and free both sides.
+ */
+static int xswap_unuse_rmap(struct swap_info_struct *si, unsigned long offset)
+{
+	struct swap_cluster_info *pci, *xci;
+	struct swap_info_struct *xsi;
+	struct swap_io_ctx ctx = {};
+	struct mempolicy *mpol;
+	struct folio *folio;
+	unsigned int noreclaim_flags;
+	unsigned long swp_tb, xoff;
+	swp_entry_t xentry, phys;
+	bool fresh = false;
+	bool drop = false;
+	int ret = 0;
+
+	phys = swp_entry(si->type, offset);
+
+	pci = swap_cluster_lock(si, offset);
+	if (!pci)
+		return 0;
+	/*
+	 * The cluster can have emptied since find_next_to_unuse() read its
+	 * count without the lock, and freeing a cluster clears its table.
+	 */
+	if (!cluster_table_is_alloced(pci)) {
+		swap_cluster_unlock(pci);
+		return 0;
+	}
+	swp_tb = __swap_table_get(pci, offset % SWAPFILE_CLUSTER);
+	if (!swp_tb_is_pointer(swp_tb)) {
+		swap_cluster_unlock(pci);
+		return 0;
+	}
+	xentry = xswap_rmap_to_entry(swp_tb);
+	swap_cluster_unlock(pci);
+
+	xoff = swp_offset(xentry);
+
+	/*
+	 * Pin the owner before reading its cluster_info:
+	 * free_swap_cluster_info() only unmaps that after killing si->users.
+	 * No owner left means the slot is dropped below.
+	 */
+	xsi = swap_type_to_info(swp_type(xentry));
+	if (!xsi || !(xsi->flags & SWP_XSWAP) || !get_swap_device_info(xsi))
+		goto out_free;
+
+	/* Keeps the shrink, and a reclaim below, off xsi->cluster_info. */
+	noreclaim_flags = memalloc_noreclaim_save();
+	mutex_lock(&xsi->xswap_lock);
+
+	/* The shrink lowers this under the lock, so check it here. */
+	if (xoff >= READ_ONCE(xsi->nr_clusters_mapped) * SWAPFILE_CLUSTER) {
+		/* Owner gone, so the slot is an orphan and has to go. */
+		drop = true;
+		goto out_unlock;
+	}
+
+	/*
+	 * Bring the data back before the slot goes. A dirty folio is what
+	 * reclaim stores into zswap next time.
+	 */
+	folio = swap_cache_get_folio(xentry);
+	if (!folio) {
+		mpol = get_task_policy(current);
+		folio = __swap_cache_alloc_folio(xentry, GFP_HIGHUSER_MOVABLE,
+						 BIT(0), NULL, mpol,
+						 NO_INTERLEAVE_INDEX);
+		if (IS_ERR(folio)) {
+			ret = PTR_ERR(folio) == -ENOMEM ? -ENOMEM : -EAGAIN;
+			goto out_unlock;
+		}
+		swap_read_folio(&ctx, folio);
+		swap_read_submit(&ctx);
+		folio_lock(folio);
+		fresh = true;
+	} else {
+		folio_lock(folio);
+	}
+
+	if (folio_matches_swap_entry(folio, xentry)) {
+		folio_wait_writeback(folio);
+		if (unlikely(!folio_test_uptodate(folio))) {
+			/* Drop the folio so a later read can try again. */
+			swap_cache_del_folio(folio);
+			ret = -EAGAIN;
+		} else {
+			folio_mark_dirty(folio);
+			/* Reclaim cannot find a folio that is not on the LRU. */
+			if (fresh)
+				folio_add_lru(folio);
+			drop = true;
+		}
+	} else {
+		/* Taken from under us, so nothing was read back either. */
+		VM_WARN_ON_ONCE(1);
+		ret = -EAGAIN;
+	}
+	folio_unlock(folio);
+	folio_put(folio);
+
+	/* The slot is going away, so drop the record that names it. */
+	if (drop) {
+		xci = swap_cluster_lock(xsi, xoff);
+		if (xci) {
+			if (xswap_slot_backend(xci, xoff % SWAPFILE_CLUSTER).val ==
+			    phys.val)
+				WRITE_ONCE(xci->xs_table[xoff % SWAPFILE_CLUSTER],
+					   0);
+			swap_cluster_unlock(xci);
+		}
+	}
+out_unlock:
+	mutex_unlock(&xsi->xswap_lock);
+	memalloc_noreclaim_restore(noreclaim_flags);
+	put_swap_device(xsi);
+	if (!drop)
+		return ret;
+out_free:
+	/* Leaving the mapping in place would make the unuse loop spin. */
+	xswap_free_phys_slot(si, xentry, phys);
+	return 0;
+}
+#else
+static inline int xswap_unuse_rmap(struct swap_info_struct *si,
+				   unsigned long offset)
+{
+	return 0;
+}
 #endif /* CONFIG_XSWAP */
 static int try_to_unuse(unsigned int type)
 {
@@ -3449,8 +3582,20 @@ retry:
 
 		entry = swp_entry(type, i);
 		folio = swap_cache_get_folio(entry);
-		if (!folio)
+		if (!folio) {
+			/*
+			 * Only a physical backend holds pointer entries. An
+			 * xswap device's slots are shadows, and its
+			 * cluster_info is what find_next_to_unuse() reads
+			 * without the lock.
+			 */
+			if (!(si->flags & SWP_XSWAP)) {
+				retval = xswap_unuse_rmap(si, i);
+				if (retval)
+					return retval;
+			}
 			continue;
+		}
 
 		/*
 		 * It is conceivable that a racing task removed this folio from
