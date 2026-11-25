@@ -4329,11 +4329,7 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
 	int gen;
 	unsigned long birth;
 	int swappiness = get_swappiness(lruvec, sc);
-	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	DEFINE_MIN_SEQ(lruvec);
-
-	if (mem_cgroup_below_min(NULL, memcg))
-		return false;
 
 	if (!lruvec_is_sizable(lruvec, sc))
 		return false;
@@ -4342,6 +4338,15 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
 	birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
 
 	return time_is_before_jiffies(birth + min_ttl);
+}
+
+static bool memcg_is_reclaimable(struct lruvec *lruvec, struct mem_cgroup *memcg,
+				 struct scan_control *sc, unsigned long min_ttl)
+{
+	if (mem_cgroup_below_min(NULL, memcg))
+		return false;
+
+	return lruvec_is_reclaimable(lruvec, sc, min_ttl);
 }
 
 /* to protect the working set of the last N jiffies */
@@ -4364,7 +4369,7 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 		mem_cgroup_calculate_protection(NULL, memcg);
 
 		if (!reclaimable)
-			reclaimable = lruvec_is_reclaimable(lruvec, sc, min_ttl);
+			reclaimable = memcg_is_reclaimable(lruvec, memcg, sc, min_ttl);
 	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
 
 	/*
@@ -5119,6 +5124,7 @@ retry:
 static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 			     struct scan_control *sc, int swappiness)
 {
+	unsigned long min_ttl = READ_ONCE(lru_gen_min_ttl);
 	DEFINE_MIN_SEQ(lruvec);
 
 	/* have to run aging, since eviction is not possible anymore */
@@ -5127,6 +5133,10 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 
 	/* try to avoid aging, do gentle reclaim at the default priority */
 	if (sc->priority == DEF_PRIORITY)
+		return false;
+
+	/* avoid excessive aging for huge allocations */
+	if (unlikely(sc->order && !lruvec_is_reclaimable(lruvec, sc, min_ttl)))
 		return false;
 
 	/* better to run aging even though eviction is still possible */
