@@ -5136,8 +5136,11 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
 		return false;
 
 	/* avoid excessive aging for huge allocations */
-	if (unlikely(sc->order && !lruvec_is_reclaimable(lruvec, sc, min_ttl)))
-		return false;
+	if (unlikely(sc->order)) {
+		int gen = lru_gen_from_seq(max_seq);
+		unsigned long birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
+		return !time_is_before_jiffies(birth + min_ttl);
+	}
 
 	/* better to run aging even though eviction is still possible */
 	return evictable_min_seq(min_seq, swappiness) + MIN_NR_GENS == max_seq;
